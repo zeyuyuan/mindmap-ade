@@ -13,3 +13,5 @@ make run
 ```
 
 `make check` checks formatting and builds the app. `make app CONFIGURATION=release` creates a release bundle in `dist/`.
+
+Licensed under the [MIT License](LICENSE).

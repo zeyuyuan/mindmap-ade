@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "design-system": {
+      "source": "daveebbelaar/bama",
+      "sourceType": "github",
+      "skillPath": "skills/design/design-system/SKILL.md",
+      "computedHash": "aa5f291851c3bc7216d55801b1bf2b593551179b5fa026c5e23576e97549340c"
+    },
+    "mac-design": {
+      "source": "daveebbelaar/bama",
+      "sourceType": "github",
+      "skillPath": "skills/design/mac-design/SKILL.md",
+      "computedHash": "30501236d6a116cc67bddbd94b45ec6016a1b638207e4daa7ac32bdbfce96e1d"
+    },
+    "swiftui-expert-skill": {
+      "source": "AvdLee/SwiftUI-Agent-Skill",
+      "sourceType": "github",
+      "skillPath": "skills/swiftui-expert-skill/SKILL.md",
+      "computedHash": "5388cd2368b525d2906798ac313c70415e971da35670e571e98baf8a7140505f"
+    }
+  }
+}

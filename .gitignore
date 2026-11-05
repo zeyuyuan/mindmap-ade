@@ -1,0 +1,31 @@
+# Local project memory
+/MEMORY.md
+
+# Local agent workspace data
+.commandcode
+
+# macOS metadata
+.DS_Store
+._*
+
+# Swift and Xcode build output
+/.build/
+/build/
+/dist/
+/DerivedData/
+
+# Local Xcode workspace state
+/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+xcuserdata/
+*.xcuserstate
+
+# Test results, debug symbols, and profiling output
+*.xcresult/
+*.dSYM/
+*.profraw
+*.profdata
+*.trace
+
+# Python caches from skill tooling
+__pycache__/
+*.pyc

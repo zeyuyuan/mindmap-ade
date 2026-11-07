@@ -9,10 +9,17 @@ let package = Package(
         .executable(name: "MindmapADE", targets: ["MindmapADE"])
     ],
     targets: [
+        .target(name: "MindMapCore"),
         .executableTarget(
             name: "MindmapADE",
+            dependencies: ["MindMapCore"],
             swiftSettings: [.defaultIsolation(MainActor.self)]
-        )
+        ),
+        .testTarget(name: "MindMapCoreTests", dependencies: ["MindMapCore"]),
+        .testTarget(
+            name: "MindmapADETests", dependencies: ["MindmapADE", "MindMapCore"],
+            swiftSettings: [.defaultIsolation(MainActor.self)]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

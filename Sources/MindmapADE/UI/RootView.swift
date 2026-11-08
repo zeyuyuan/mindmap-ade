@@ -1,3 +1,5 @@
+import AppKit
+import MindMapCore
 import SwiftUI
 
 struct RootView: View {
@@ -10,7 +12,7 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             boardNavigation
-            workspaceNotices
+            workspaceError
         }
         .frame(minWidth: WindowLayout.minimumWidth, minHeight: WindowLayout.minimumHeight)
         .focusedSceneValue(\.editorActions, actions)
@@ -30,11 +32,17 @@ struct RootView: View {
                 actions.targetBoardID = selectedBoardID
             }
         }
-        .onChange(of: actions.requestedBoardID) { _, id in if let id { selectedBoardID = id } }
+        .onChange(of: actions.requestedBoardID) { _, id in
+            if let id {
+                selectedBoardID = id
+                actions.requestedBoardID = nil
+            }
+        }
         .onChange(of: selectedBoardID) { _, id in
             actions.targetBoardID = id
             workspace.select(id)
         }
+        .onDisappear { actions.hideTerminal() }
         .onChange(of: workspace.boards.map(\.id)) { _, ids in
             if !ids.contains(where: { $0 == selectedBoardID }) { selectedBoardID = ids.first }
         }
@@ -53,6 +61,7 @@ struct RootView: View {
                 Section("Boards") {
                     ForEach(workspace.boards) { board in
                         Label(board.name, systemImage: "rectangle.stack")
+                            .badge(workspace.activeRunCount(in: board.id))
                             .tag(board.id)
                             .contextMenu {
                                 Button("Rename…") {
@@ -61,7 +70,7 @@ struct RootView: View {
                                 }
                                 .disabled(workspace.isReadOnly)
                                 Button("Delete Board", role: .destructive) { workspace.deleteBoard(board.id) }
-                                    .disabled(workspace.isReadOnly)
+                                    .disabled(workspace.isReadOnly || workspace.hasActiveWork(in: board.id))
                             }
                     }
                     .onMove { workspace.moveBoards(from: $0, to: $1) }
@@ -100,7 +109,7 @@ struct RootView: View {
     }
 
     @ViewBuilder
-    private var workspaceNotices: some View {
+    private var workspaceError: some View {
         if let error = workspace.errorMessage {
             HStack {
                 Label(error, systemImage: "exclamationmark.triangle")
@@ -114,17 +123,6 @@ struct RootView: View {
             .background(.bar)
             .overlay(alignment: .top) { Divider() }
         }
-        if let name = workspace.deletedBoardName {
-            HStack {
-                Text("Deleted “\(name)”.")
-                Button("Undo") { workspace.undoDeleteBoard() }
-                Spacer()
-            }
-            .font(.caption)
-            .padding(CanvasStyle.statusHorizontalPadding)
-            .background(.bar)
-            .overlay(alignment: .top) { Divider() }
-        }
     }
 }
 
@@ -132,27 +130,95 @@ private struct BoardCanvasContent: View {
     let session: BoardSession
     let workspace: WorkspaceStore
     let actions: EditorActions
+    @State private var terminalWidthShare: CGFloat = 0.5
+    @State private var projectCheckoutLabels: [ProjectLocation: String] = [:]
+    @State private var activationCount = 0
+
+    private struct CheckoutRefresh: Equatable {
+        let boardID: UUID
+        let locations: [UUID: ProjectLocation]
+        let activationCount: Int
+    }
 
     var body: some View {
-        MindMapCanvas(session: session, workspace: workspace, actions: actions, revision: session.revision)
-            .navigationTitle(session.name)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                HStack {
-                    Text(actions.hint).lineLimit(1)
-                    Spacer(minLength: CanvasStyle.statusHorizontalPadding)
-                    Text(actions.zoomLabel)
-                        .monospacedDigit()
-                        .accessibilityLabel("Zoom \(actions.zoomLabel)")
-                        .help("Pinch or Command-scroll to zoom")
-                    Text("\(session.nodeCount) \(session.nodeCount == 1 ? "topic" : "topics")").monospacedDigit()
-                    Text(workspace.saveStatusText)
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                MindMapCanvas(
+                    session: session, workspace: workspace, actions: actions, revision: session.revision,
+                    runtimeDetails: runtimeDetails
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let address = actions.terminalAddress, address.boardID == session.id,
+                    let terminal = workspace.terminals[address], session.board.nodes[address.nodeID] != nil
+                {
+                    let available = max(0, geometry.size.width - CanvasStyle.terminalResizeHandleWidth)
+                    let width = boundedTerminalWidth(available * terminalWidthShare, available: available)
+                    TerminalDivider(width: width) { proposed in
+                        if available > 0 {
+                            terminalWidthShare = boundedTerminalWidth(proposed, available: available) / available
+                        }
+                    }
+                    .frame(width: CanvasStyle.terminalResizeHandleWidth)
+                    AgentTerminalPane(
+                        address: address, session: session, workspace: workspace, actions: actions, terminal: terminal
+                    )
+                    .frame(width: width)
+                    .id(address)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, CanvasStyle.statusHorizontalPadding)
-                .padding(.vertical, CanvasStyle.statusVerticalPadding)
-                .background(.bar)
-                .overlay(alignment: .top) { Divider() }
             }
+        }
+        .navigationTitle(session.name)
+        .task(
+            id: CheckoutRefresh(
+                boardID: session.id, locations: session.gitProjectLocations, activationCount: activationCount
+            )
+        ) {
+            await refreshProjectCheckoutLabels()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            activationCount += 1
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack {
+                Text(actions.hint).lineLimit(1)
+                Spacer(minLength: CanvasStyle.statusHorizontalPadding)
+                Text(actions.zoomLabel)
+                    .monospacedDigit()
+                    .accessibilityLabel("Zoom \(actions.zoomLabel)")
+                    .help("Pinch or Command-scroll to zoom")
+                Text("\(session.nodeCount) \(session.nodeCount == 1 ? "topic" : "topics")").monospacedDigit()
+                Text(workspace.saveStatusText)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, CanvasStyle.statusHorizontalPadding)
+            .padding(.vertical, CanvasStyle.statusVerticalPadding)
+            .background(.bar)
+            .overlay(alignment: .top) { Divider() }
+        }
+    }
+
+    private var runtimeDetails: [UUID: String] {
+        var details = workspace.runtimeDetails(in: session.id)
+        for (id, location) in session.gitProjectLocations where details[id] == nil {
+            details[id] = projectCheckoutLabels[location]
+        }
+        return details
+    }
+
+    private func refreshProjectCheckoutLabels() async {
+        var labels: [ProjectLocation: String] = [:]
+        for location in Set(session.gitProjectLocations.values) {
+            guard !Task.isCancelled else { return }
+            labels[location] = try? await workspace.git.checkoutLabel(for: location)
+        }
+        if !Task.isCancelled { projectCheckoutLabels = labels }
+    }
+
+    private func boundedTerminalWidth(_ proposed: CGFloat, available: CGFloat) -> CGFloat {
+        let half = available / 2
+        let minimum = min(CanvasStyle.terminalMinimumWidth, half)
+        let maximum = available - min(CanvasStyle.canvasMinimumWidth, half)
+        return min(maximum, max(minimum, proposed))
     }
 }

@@ -26,13 +26,13 @@ struct RendererRegressionTests {
     @Test func wideBranchesBatchEveryConnectorAndReusePathsWhilePanning() throws {
         _ = NSApplication.shared
         let ids = (0..<10_000).map { _ in UUID() }
-        var board = MindMapBoard(root: TextNode(id: ids[0]))
+        var board = MindMapBoard(root: MapNode(id: ids[0]))
         board.apply(
             BoardEdit(
                 nodes: ids.enumerated().map { index, id in
                     NodeReplacement(
                         id: id,
-                        node: TextNode(id: id, text: "Topic", children: index == 0 ? Array(ids.dropFirst()) : []))
+                        node: MapNode(id: id, text: "Topic", children: index == 0 ? Array(ids.dropFirst()) : []))
                 }))
         let layout = TreeLayout.make(board: board, sizes: [:])
         let host = CALayer()
@@ -62,7 +62,7 @@ struct RendererRegressionTests {
     }
 
     @Test func aConnectorCrossingTheViewportSurvivesWhenBothTopicsAreCulled() throws {
-        let parent = TextNode(text: "Parent")
+        let parent = MapNode(text: "Parent")
         var board = MindMapBoard(root: parent)
         let child = try #require(board.inserting(text: "Child", parent: parent.id))
         board.apply(child.edit)
@@ -86,5 +86,35 @@ struct RendererRegressionTests {
         renderer.render(
             board: board, layout: layout, camera: camera, viewport: viewport, selection: [], backingScale: 2)
         #expect(segmentCount(in: connectors(in: host)) == 1)
+    }
+
+    @Test func resourceIconsAreCachedAndHideWhenTheTopicLayerIsReusedForText() throws {
+        _ = NSApplication.shared
+        let project = MapNode(content: .project(ProjectTopic()))
+        var board = MindMapBoard(root: project)
+        let note = try #require(board.inserting(text: "Plain note", parent: nil, position: CGPoint(x: 2000, y: 0)))
+        board.apply(note.edit)
+        let layout = TreeLayout.make(
+            board: board,
+            sizes: [project.id: CGSize(width: MapMetrics.resourceMinimumWidth, height: MapMetrics.resourceHeight)])
+        let host = CALayer()
+        let renderer = MapRenderer(layer: host)
+        let viewport = CGRect(x: 0, y: 0, width: 300, height: 200)
+        renderer.render(
+            board: board, layout: layout, camera: MapCamera(), viewport: viewport, selection: [], backingScale: 2)
+        let trees = try #require(host.sublayers?.first?.sublayers)
+        let topic = try #require(trees.first?.sublayers?.first)
+        let icon = try #require(topic.sublayers?.first { $0.contents != nil })
+        let image = try #require(icon.contents as AnyObject?)
+        #expect(!icon.isHidden)
+        renderer.render(
+            board: board, layout: layout, camera: MapCamera(translation: CGPoint(x: 1, y: 0)),
+            viewport: viewport, selection: [], backingScale: 2)
+        #expect(icon.contents as AnyObject? === image)
+        renderer.render(
+            board: board, layout: layout, camera: MapCamera(translation: CGPoint(x: -2000, y: 0)),
+            viewport: viewport, selection: [], backingScale: 2)
+        #expect(trees.last?.sublayers?.first === topic)
+        #expect(icon.isHidden)
     }
 }

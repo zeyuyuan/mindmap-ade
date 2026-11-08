@@ -7,6 +7,7 @@ struct MindMapCanvas: NSViewRepresentable {
     let workspace: WorkspaceStore
     let actions: EditorActions
     let revision: Int
+    let runtimeDetails: [UUID: String]
 
     func makeNSView(context: Context) -> MindMapCanvasView {
         MindMapCanvasView(session: session, workspace: workspace, actions: actions)
@@ -14,6 +15,7 @@ struct MindMapCanvas: NSViewRepresentable {
 
     func updateNSView(_ view: MindMapCanvasView, context: Context) {
         view.update(session: session, revision: revision)
+        view.updateRuntimeDetails(runtimeDetails)
     }
 
     static func dismantleNSView(_ view: MindMapCanvasView, coordinator: ()) {
@@ -30,7 +32,11 @@ final class NativeNodeHostView: NSView {
     }
 }
 
-final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValidations {
+final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, NSUserInterfaceValidations,
+    NSPopoverDelegate
+{
+    private static let worktreeNameHint = "Tab uses default · Click away to create"
+
     private(set) var session: BoardSession
     private weak var workspace: WorkspaceStore?
     private weak var actions: EditorActions?
@@ -47,10 +53,22 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     private var cameraSave: DispatchWorkItem?
     private var selected = Set<UUID>()
     private var editor: TopicTextView?
+    private var worktreeNameField: NSTextField?
+    private var pendingWorktreeCreations = Set<NodeAddress>()
+    private var editingTextView: NSTextView? {
+        editor ?? (worktreeNameField?.currentEditor() as? NSTextView)
+    }
+    private var nodePopover: NSPopover?
+    private weak var nodeFormModel: NodeFormModel?
+    private var formAddress: NodeAddress?
+    private var formLease: UUID?
+    private var configureAfterLayout: UUID?
+    private var runtimeDetails: [UUID: String] = [:]
     private var editorScroll: NSScrollView?
     private var editorBackdrop: NSView?
     private var provisionalEditFrame: CGRect?
     private var revealAfterLayout: UUID?
+    private var revealAfterTerminalResize: UUID?
     private var editingID: UUID?
     private var editingToken: UUID?
     private var originalText = ""
@@ -68,6 +86,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     private var draggedBranches: [UUID] = []
     private var draggedBranchIDs = Set<UUID>()
     private var draggedRootIDs = Set<UUID>()
+    private var draggedResources: [UUID: BranchResources] = [:]
     private var dragOffset = CGSize.zero
     private var forbiddenTargets = Set<UUID>()
     private var dropTarget: DropTarget?
@@ -77,15 +96,18 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     private var accessibilityRevision = -1
     private var accessibilitySelection = Set<UUID>()
 
+    private enum EditingCompletion {
+        case blur, submit, keepDraft, cancel
+    }
+
     private enum DropTarget {
         case child(UUID)
         case sibling(UUID, after: Bool)
-        case invalid
+        case invalid(ResourcePlacementProblem?)
     }
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var undoManager: UndoManager? { session.undoManager }
 
     init(session: BoardSession, workspace: WorkspaceStore, actions: EditorActions) {
         self.session = session
@@ -112,9 +134,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
 
     func update(session: BoardSession, revision: Int) {
         if self.session !== session {
-            finishEditing(commit: true)
+            closeNodeForm()
+            configureAfterLayout = nil
+            revealAfterTerminalResize = nil
+            finishEditing(restoringFocus: false)
             persistCamera()
             self.session = session
+            actions?.hint = EditorActions.defaultHint
             appliedRevision = -1
             renderedRevision = -1
             pendingFit = false
@@ -126,6 +152,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
             accessibilityDisclosures.removeAll()
         }
         actions?.canvas = self
+        if let address = formAddress, session.board.nodes[address.nodeID] == nil { closeNodeForm() }
+        if worktreeNameField != nil, let editingID, session.board.nodes[editingID]?.worktreeCreationDraft == nil {
+            finishEditing(.cancel)
+        }
         guard appliedRevision != revision else { return }
         appliedRevision = revision
         layoutTask?.cancel()
@@ -149,6 +179,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
                     self.reveal(frame)
                 }
                 self.revealAfterLayout = nil
+                if let id = self.configureAfterLayout {
+                    self.configureAfterLayout = nil
+                    self.configureNode(id)
+                }
                 self.updateActions()
                 if self.pendingFit {
                     self.pendingFit = false
@@ -162,7 +196,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     func prepareForRemoval() {
-        finishEditing(commit: true)
+        closeNodeForm()
+        finishEditing(.keepDraft)
         persistCamera()
         layoutTask?.cancel()
         if actions?.canvas === self { actions?.canvas = nil }
@@ -172,6 +207,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         super.layout()
         nativeHost.frame = bounds
         initializeCameraIfNeeded()
+        if let id = revealAfterTerminalResize, let frame = mapLayout.nodes[id]?.frame {
+            revealAfterTerminalResize = nil
+            reveal(frame)
+        }
         render()
         positionEditor()
     }
@@ -215,25 +254,70 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
                     ? nil
                     : MapDragPreview(
                         topLevelIDs: draggedBranchIDs, rootIDs: draggedRootIDs,
-                        movedIDs: forbiddenTargets, offset: dragOffset)
+                        movedIDs: forbiddenTargets, offset: dragOffset),
+                runtimeDetails: runtimeDetails, editingTitleID: worktreeNameField == nil ? nil : editingID
             )
         }
         updateAccessibility()
+    }
+
+    func updateRuntimeDetails(_ details: [UUID: String]) {
+        guard details != runtimeDetails else { return }
+        runtimeDetails = details
+        accessibilityRevision = -1
+        render()
+        updateActions()
+    }
+
+    private var canAddProject: Bool {
+        guard !session.isReadOnly, selected.count <= 1 else { return false }
+        guard let id = selected.first else { return true }
+        return session.board.nodes[id]?.content.kind == .text && session.board.canInsertResource(.project, under: id)
+    }
+
+    private var selectedWorktreeParent: UUID? {
+        guard !session.isReadOnly, selected.count == 1, let id = selected.first,
+            let kind = session.board.nodes[id]?.content.kind, kind != .agent
+        else { return nil }
+        let parent = session.board.context(startingAt: id).worktreeID ?? id
+        return session.board.canInsertResource(.worktree, under: parent) ? parent : nil
+    }
+
+    private var canAddWorktree: Bool { selectedWorktreeParent != nil }
+
+    private var canLinkWorktree: Bool {
+        guard !session.isReadOnly, selected.count == 1, let id = selected.first,
+            let kind = session.board.nodes[id]?.content.kind, kind != .agent
+        else { return false }
+        return session.board.context(startingAt: id).worktreeID == nil
+            && session.board.canInsertResource(.worktree, under: id)
     }
 
     private func updateActions() {
         guard let actions else { return }
         actions.zoomLabel = CanvasStyle.zoomLabel(for: camera.scale)
         actions.canEdit = !selected.isEmpty && !session.isReadOnly
-        actions.canUndo = editor?.undoManager?.canUndo ?? session.undoManager.canUndo
-        actions.canRedo = editor?.undoManager?.canRedo ?? session.undoManager.canRedo
+        actions.canAddProject = canAddProject
+        actions.canAddWorktree = canAddWorktree
+        actions.canLinkWorktree = canLinkWorktree
+        let undoManager = editingTextView?.undoManager
+        actions.undoTitle = undoManager?.undoMenuItemTitle ?? session.undoTitle
+        actions.redoTitle = undoManager?.redoMenuItemTitle ?? session.redoTitle
+        actions.isEditingTopic = editingID != nil
+        actions.canUndo = undoManager?.canUndo ?? session.canUndo
+        actions.canRedo = undoManager?.canRedo ?? session.canRedo
         let node = selected.count == 1 ? selected.first.flatMap { session.board.nodes[$0] } : nil
+        actions.canDelete = actions.canEdit
         actions.canCollapse = !session.isReadOnly && node?.children.isEmpty == false
+        actions.canDeriveAgent =
+            !session.isReadOnly && node?.content.kind == .text
+            && !(editor?.string ?? node?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func changed() {
         update(session: session, revision: session.revision)
         updateActions()
+        if let error = session.editError { actions?.hint = error }
     }
 
     private func persistCamera() {
@@ -245,7 +329,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     private func cameraChanged() {
         render()
         positionEditor()
-        updateActions()
+        actions?.zoomLabel = CanvasStyle.zoomLabel(for: camera.scale)
         cameraSave?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.persistCamera() }
         cameraSave = work
@@ -259,11 +343,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         window?.makeFirstResponder(self)
         render()
         updateActions()
-        if edit { beginEditing(id) }
+        if edit { openNode(id) }
     }
 
     func insertNode(asChild: Bool) {
-        finishEditing(commit: true)
+        finishEditing()
         guard !session.isReadOnly, let current = selected.first else {
             insertRoot()
             return
@@ -288,7 +372,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     func insertRoot(at point: CGPoint? = nil) {
-        finishEditing(commit: true)
+        finishEditing()
         guard !session.isReadOnly else { return }
         let center = camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY))
         let position = point ?? CGPoint(x: center.x, y: max(center.y, mapLayout.bounds.maxY + MapMetrics.rootGap))
@@ -304,26 +388,208 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     func deleteSelection() {
-        finishEditing(commit: true)
+        finishEditing(.keepDraft)
         workspace?.commitEdits(in: session.id)
         guard !session.isReadOnly, !selected.isEmpty else { return }
         let parent = selected.first.flatMap { session.board.parents[$0] }
-        session.apply(session.board.deleting(selected), named: "Delete Topics")
-        selected = Set([parent ?? session.board.roots[0].id])
+        if session.apply(session.board.deleting(selected), named: "Delete Topics") {
+            selected = Set([parent ?? session.board.roots[0].id])
+        }
         changed()
     }
 
     func toggleCollapse() {
-        finishEditing(commit: true)
+        finishEditing()
         guard let id = selected.first else { return }
         session.apply(session.board.togglingCollapse(id), named: "Fold Branch")
         changed()
     }
 
-    func editSelection() { if let id = selected.first { beginEditing(id) } }
+    func editSelection() { if let id = selected.first { openNode(id) } }
+
+    func revealTerminalNode(_ address: NodeAddress) {
+        guard address.boardID == session.id, session.board.nodes[address.nodeID] != nil else { return }
+        selected = [address.nodeID]
+        revealAfterTerminalResize = address.nodeID
+        if renderedRevision != session.revision { revealAfterLayout = address.nodeID }
+        needsLayout = true
+        render()
+    }
+
+    private func openNode(_ id: UUID) {
+        guard let node = session.board.nodes[id] else { return }
+        if node.content.kind == .text {
+            beginEditing(id)
+        } else if node.content.kind == .agent,
+            workspace?.terminals[NodeAddress(boardID: session.id, nodeID: id)] != nil
+        {
+            actions?.showTerminal(at: NodeAddress(boardID: session.id, nodeID: id))
+        } else {
+            configureNode(id)
+        }
+    }
+
+    func configureNode(_ id: UUID) {
+        finishEditing()
+        guard let workspace, !session.isReadOnly,
+            let node = session.board.nodes[id], node.content.kind != .text
+        else { return }
+        let address = NodeAddress(boardID: session.id, nodeID: id)
+        if workspace.agentRuns[address]?.state.isActive == true {
+            actions?.showTerminal(at: address)
+            return
+        }
+        guard let frame = mapLayout.nodes[id]?.frame else {
+            configureAfterLayout = id
+            return
+        }
+        closeNodeForm()
+        workspace.formClosers[address]?.1()
+        if case .worktree(let worktree) = node.content, worktree.location == nil,
+            worktree.choice.mode != .existing || session.board.context(above: id).worktreeID != nil
+        {
+            guard !pendingWorktreeCreations.contains(address), !workspace.operations.contains(address) else { return }
+            if worktree.choice.mode == .existing {
+                workspace.updateDraft(at: address, content: .draft(.worktree))
+            }
+            beginWorktreeNameEditing(id, frame: frame, workspace: workspace)
+            return
+        }
+        reveal(frame)
+        selected = [id]
+        let lease = UUID()
+        formLease = lease
+        formAddress = address
+        workspace.formClosers[address] = (lease, { [weak self] in self?.closeNodeForm() })
+        let model = NodeFormModel(
+            address: address, session: session, workspace: workspace,
+            close: { [weak self] in
+                if self?.formLease == lease { self?.closeNodeForm() }
+            },
+            showNode: { [weak self] in self?.configureNode($0) },
+            showTerminal: { [weak self] in
+                if self?.formLease == lease { self?.actions?.showTerminal(at: address) }
+            })
+        let popover = NSPopover()
+        popover.behavior = .applicationDefined
+        popover.delegate = self
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        popover.contentViewController = NSHostingController(rootView: NodeForm(model: model))
+        nodePopover = popover
+        nodeFormModel = model
+        let anchor = viewRect(frame)
+        var edge = NSRectEdge.maxX
+        if let content = window?.contentView {
+            let windowRect = convert(anchor, to: content)
+            let right = content.bounds.maxX - windowRect.maxX
+            let left = windowRect.minX - content.bounds.minX
+            if right < CanvasStyle.formWidth + CanvasStyle.formPadding && left > right {
+                edge = .minX
+            }
+        }
+        popover.show(relativeTo: anchor, of: self, preferredEdge: edge)
+        render()
+        updateActions()
+    }
+
+    private func closeNodeForm() {
+        let popover = nodePopover
+        clearNodeForm()
+        popover?.close()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        if notification.object as? NSPopover === nodePopover { clearNodeForm() }
+    }
+
+    private func clearNodeForm() {
+        if let address = formAddress, workspace?.formClosers[address]?.0 == formLease {
+            workspace?.formClosers.removeValue(forKey: address)
+        }
+        formLease = nil
+        formAddress = nil
+        nodeFormModel = nil
+        nodePopover = nil
+    }
+
+    func insertResource(_ kind: NodeKind, at point: CGPoint? = nil, source: UUID? = nil, linkWorktree: Bool = false) {
+        guard !session.isReadOnly, kind != .text, kind != .project || canAddProject,
+            kind != .worktree || (linkWorktree ? canLinkWorktree : canAddWorktree)
+        else { return }
+        finishEditing()
+        closeNodeForm()
+        guard selected.count <= 1 else {
+            actions?.hint = "Select one topic to add a resource."
+            return
+        }
+        var parent = selected.first
+        let content: NodeContent
+        if let source, let text = session.board.nodes[source]?.text {
+            content = .agent(AgentTopic(task: text, sourceTextID: source))
+            parent = source
+        } else if kind == .worktree {
+            var worktree = WorktreeTopic()
+            if linkWorktree {
+                worktree.choice.mode = .existing
+            } else {
+                guard let worktreeParent = selectedWorktreeParent else { return }
+                parent = worktreeParent
+            }
+            content = .worktree(worktree)
+        } else {
+            content = .draft(kind)
+        }
+        let center = camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY))
+        let position = point ?? CGPoint(x: center.x, y: max(center.y, mapLayout.bounds.maxY + MapMetrics.rootGap))
+        guard
+            let result = session.board.inserting(
+                MapNode(content: content), parent: parent, position: position),
+            session.apply(result.edit, named: "Add \(kind.title)")
+        else { return }
+        selected = [result.id]
+        configureAfterLayout = result.id
+        revealAfterLayout = result.id
+        changed()
+    }
+
+    func deriveAgent() {
+        guard !session.isReadOnly, editor?.hasMarkedText() != true, selected.count == 1, let id = selected.first,
+            session.board.nodes[id]?.content.kind == .text
+        else { return }
+        finishEditing()
+        guard let source = session.board.nodes[id], !source.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+        if let draft = source.children.first(where: { child in
+            guard case .agent(let agent) = session.board.nodes[child]?.content else { return false }
+            return agent.sourceTextID == id && !agent.isConfigured
+        }) {
+            if source.isCollapsed {
+                session.apply(session.board.togglingCollapse(id), named: "Expand Branch")
+                configureAfterLayout = draft
+                changed()
+            } else {
+                configureNode(draft)
+            }
+        } else {
+            insertResource(.agent, source: id)
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 36 || event.keyCode == 76, modifiers.contains(.command),
+            modifiers.intersection([.option, .shift, .control]).isEmpty,
+            window?.firstResponder === self || (editor != nil && window?.firstResponder === editor),
+            editor?.hasMarkedText() != true, actions?.canDeriveAgent == true
+        {
+            deriveAgent()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     func moveSelection(by offset: Int) {
-        finishEditing(commit: true)
+        finishEditing()
         guard selected.count == 1, let id = selected.first, !session.isReadOnly else { return }
         let parent = session.board.parents[id]
         let siblings = parent.flatMap { session.board.nodes[$0]?.children } ?? session.board.roots.map(\.id)
@@ -342,15 +608,15 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     private func beginEditing(_ id: UUID, provisionalFrame: CGRect? = nil) {
-        finishEditing(commit: true)
+        finishEditing()
         pendingFit = false
-        guard !session.isReadOnly, session.board.nodes[id] != nil,
+        guard !session.isReadOnly, session.board.nodes[id]?.content.kind == .text,
             let frame = mapLayout.nodes[id]?.frame ?? provisionalFrame
         else {
             return
         }
         let token = workspace?.beginEditing(nodeID: id, boardID: session.id) { [weak self] in
-            self?.finishEditing(commit: true)
+            self?.finishEditing()
         }
         guard let node = session.board.nodes[id] else {
             if let token { workspace?.endEditing(nodeID: id, boardID: session.id, token: token) }
@@ -359,13 +625,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         editingToken = token
         provisionalEditFrame = frame
         selected = [id]
-        let availableWidth = max(bounds.width - CanvasStyle.fitPadding * 2, MapMetrics.minimumNodeWidth)
-        let maximumEditingScale = min(1.5, availableWidth / frame.width)
-        let editingScale = min(camera.scale < 0.75 ? 1 : camera.scale, maximumEditingScale)
-        if editingScale != camera.scale {
-            camera.zoom(to: editingScale, around: camera.viewPoint(CGPoint(x: frame.midX, y: frame.midY)))
-        }
-        reveal(frame)
+        revealForEditing(frame)
         let text = TopicTextView(usingTextLayoutManager: true)
         text.isRichText = false
         text.importsGraphics = false
@@ -410,7 +670,70 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         updateActions()
     }
 
+    private func beginWorktreeNameEditing(_ id: UUID, frame: CGRect, workspace: WorkspaceStore) {
+        let token = workspace.beginEditing(nodeID: id, boardID: session.id) { [weak self] in
+            self?.finishEditing(.keepDraft)
+        }
+        guard let node = session.board.nodes[id], let draft = node.worktreeCreationDraft,
+            let suggestion = node.worktreeNameSuggestion
+        else {
+            workspace.endEditing(nodeID: id, boardID: session.id, token: token)
+            return
+        }
+        let field = NSTextField(string: draft.choice.branch)
+        field.placeholderString = suggestion
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.cell?.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.delegate = self
+        field.setAccessibilityLabel("Worktree name")
+        field.setAccessibilityHelp(
+            "Tab accepts the suggested name. Press Return or leave the field to create the worktree.")
+
+        editingID = id
+        editingToken = token
+        originalText = draft.choice.branch
+        worktreeNameField = field
+        pendingFit = false
+        selected = [id]
+        nativeHost.addSubview(field)
+        revealForEditing(frame)
+        positionEditor()
+        field.selectText(nil)
+        actions?.hint = Self.worktreeNameHint
+        render()
+        updateActions()
+    }
+
+    private func revealForEditing(_ frame: CGRect) {
+        let availableWidth = max(bounds.width - CanvasStyle.fitPadding * 2, MapMetrics.minimumNodeWidth)
+        let maximumEditingScale = min(1.5, availableWidth / frame.width)
+        let editingScale = min(camera.scale < 0.75 ? 1 : camera.scale, maximumEditingScale)
+        if editingScale != camera.scale {
+            camera.zoom(to: editingScale, around: camera.viewPoint(CGPoint(x: frame.midX, y: frame.midY)))
+        }
+        reveal(frame)
+    }
+
     private func positionEditor() {
+        if let field = worktreeNameField, let id = editingID, let placement = mapLayout.nodes[id] {
+            let scale = camera.scale
+            let frame = viewRect(placement.frame)
+            let padding = MapMetrics.horizontalPadding * scale
+            let titleX = frame.minX + padding + MapMetrics.resourceIconInset * scale
+            let titleHeight = frame.height - (MapMetrics.resourceDetailHeight + MapMetrics.verticalPadding * 2) * scale
+            let fontSize = MapMetrics.fontSize * scale
+            if field.font?.pointSize != fontSize {
+                field.font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+            }
+            field.frame = CGRect(
+                x: titleX, y: frame.minY + MapMetrics.verticalPadding * scale,
+                width: max(1, frame.maxX - titleX - padding / 2), height: titleHeight)
+            return
+        }
         guard let editor, let scroll = editorScroll, let backdrop = editorBackdrop, let id = editingID,
             let worldFrame = mapLayout.nodes[id]?.frame ?? provisionalEditFrame
         else { return }
@@ -468,14 +791,19 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
             CGRect(origin: worldFrame.origin, size: CGSize(width: width / camera.scale, height: height / camera.scale)))
     }
 
-    private func finishEditing(commit: Bool) {
-        guard !finishingEdit, let editor, let id = editingID else { return }
+    private func finishEditing(_ completion: EditingCompletion = .blur, restoringFocus: Bool = true) {
+        guard !finishingEdit, let id = editingID else { return }
         finishingEdit = true
-        let text = editor.string
+        let commit = completion != .cancel
+        let field = worktreeNameField
+        let text = editingTextView?.string ?? field?.stringValue ?? originalText
         if commit && text != originalText { revealAfterLayout = id }
-        editor.delegate = nil
-        self.editor = nil
+        editor?.delegate = nil
+        field?.delegate = nil
+        editor = nil
+        worktreeNameField = nil
         editingID = nil
+        field?.removeFromSuperview()
         provisionalEditFrame = nil
         editorBackdrop?.removeFromSuperview()
         editorBackdrop = nil
@@ -483,12 +811,21 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         if let token = editingToken { workspace?.endEditing(nodeID: id, boardID: session.id, token: token) }
         editingToken = nil
         if commit && text != originalText {
-            session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
+            if field != nil, let node = session.board.nodes[id] {
+                let address = NodeAddress(boardID: session.id, nodeID: id)
+                workspace?.updateDraft(at: address, content: node.applyingInlineText(text).content)
+            } else {
+                session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
+            }
         }
-        window?.makeFirstResponder(self)
+        if restoringFocus { window?.makeFirstResponder(self) }
         finishingEdit = false
-        actions?.hint = "Double-click to edit · Tab to add a child · Drag the canvas to pan"
+        actions?.hint = EditorActions.defaultHint
+        if field != nil { render() }
         changed()
+        if field != nil && (completion == .blur || completion == .submit) {
+            createWorktree(id, refocusOnFailure: completion == .submit)
+        }
     }
 
     func textDidChange(_ notification: Notification) {
@@ -502,26 +839,94 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
     func textDidEndEditing(_ notification: Notification) {
         guard let source = notification.object as? NSTextView, source === editor else { return }
-        finishEditing(commit: true)
+        finishEditing()
     }
 
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard textView === editor, !textView.hasMarkedText() else { return false }
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
             if NSApp.currentEvent?.modifierFlags.intersection([.option, .shift]).isEmpty == false { return false }
-            finishEditing(commit: true)
+            finishEditing()
             return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            finishEditing(commit: false)
+            finishEditing(.cancel)
             return true
         }
         if commandSelector == #selector(NSResponder.insertTab(_:)) {
-            finishEditing(commit: true)
+            finishEditing()
             insertNode(asChild: true)
             return true
         }
         return false
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === worktreeNameField,
+            let id = editingID, let token = editingToken, editingTextView?.hasMarkedText() != true
+        else { return }
+        workspace?.rememberDraft(
+            editingTextView?.string ?? field.stringValue, nodeID: id, boardID: session.id, token: token)
+        actions?.hint = Self.worktreeNameHint
+        updateActions()
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === worktreeNameField else { return }
+        finishEditing(restoringFocus: false)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
+        guard let field = worktreeNameField, control === field, !textView.hasMarkedText() else { return false }
+        switch command {
+        case #selector(NSResponder.insertTab(_:)):
+            if textView.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                let suggestion = field.placeholderString
+            {
+                let range = NSRange(location: 0, length: textView.string.utf16.count)
+                textView.insertText(suggestion, replacementRange: range)
+                textView.selectAll(nil)
+            }
+        case #selector(NSResponder.insertNewline(_:)):
+            if NSApp.currentEvent?.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty != false {
+                finishEditing(.submit)
+            }
+        case #selector(NSResponder.cancelOperation(_:)):
+            finishEditing(.cancel)
+        default:
+            return false
+        }
+        return true
+    }
+
+    private func createWorktree(_ id: UUID, refocusOnFailure: Bool) {
+        guard let workspace, let draft = session.board.nodes[id]?.worktreeCreationDraft else { return }
+        let address = NodeAddress(boardID: session.id, nodeID: id)
+        guard !workspace.operations.contains(address), pendingWorktreeCreations.insert(address).inserted else { return }
+        let progress = "Creating Worktree…"
+        actions?.hint = progress
+        Task { [weak self] in
+            let failure: String?
+            do {
+                try await workspace.saveWorktree(draft, at: address)
+                failure = nil
+            } catch {
+                failure = error.localizedDescription
+            }
+            guard let self else { return }
+            self.pendingWorktreeCreations.remove(address)
+            guard self.session.id == address.boardID, self.editingID == nil else { return }
+            if let failure {
+                if refocusOnFailure, self.selected == [id], self.nodePopover == nil,
+                    self.session.board.nodes[id]?.worktreeCreationDraft != nil
+                {
+                    self.configureNode(id)
+                }
+                self.actions?.hint = failure
+            } else if self.actions?.hint == progress {
+                self.actions?.hint = EditorActions.defaultHint
+            }
+        }
     }
 
     private func reveal(_ frame: CGRect) {
@@ -556,14 +961,15 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
 
     func zoom(by factor: CGFloat) { setZoom(camera.scale * factor) }
     func setZoom(_ scale: CGFloat) {
-        finishEditing(commit: true)
+        closeNodeForm()
+        finishEditing()
         camera.zoom(to: scale, around: CGPoint(x: bounds.midX, y: bounds.midY))
         hasCamera = true
         cameraChanged()
     }
 
     func fitContent() {
-        finishEditing(commit: true)
+        finishEditing()
         guard !mapLayout.nodes.isEmpty, renderedRevision == session.revision else {
             pendingFit = true
             return
@@ -574,8 +980,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     override func scrollWheel(with event: NSEvent) {
+        closeNodeForm()
         actions?.activateTarget()
-        finishEditing(commit: true)
+        finishEditing()
         if event.modifierFlags.contains(.command) {
             camera.zoom(to: camera.scale * exp(event.scrollingDeltaY * 0.01), around: localPoint(event))
         } else {
@@ -588,16 +995,18 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     override func magnify(with event: NSEvent) {
+        closeNodeForm()
         actions?.activateTarget()
-        finishEditing(commit: true)
+        finishEditing()
         camera.zoom(to: camera.scale * (1 + event.magnification), around: localPoint(event))
         hasCamera = true
         cameraChanged()
     }
 
     override func mouseDown(with event: NSEvent) {
+        closeNodeForm()
         actions?.activateTarget()
-        finishEditing(commit: true)
+        finishEditing()
         window?.makeFirstResponder(self)
         let point = localPoint(event)
         let world = camera.worldPoint(point)
@@ -648,6 +1057,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
                 draggedBranches = session.board.topLevelSelection(selected)
                 draggedBranchIDs = Set(draggedBranches)
                 draggedRootIDs = draggedBranchIDs.intersection(session.board.roots.map(\.id))
+                draggedResources = session.board.resources(in: draggedBranches)
                 forbiddenTargets = []
                 for branch in draggedBranches { forbiddenTargets.formUnion(session.board.descendants(of: branch)) }
             }
@@ -678,22 +1088,25 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         dropTarget = nil
         guard let id = mapLayout.hitTest(world), let target = mapLayout.nodes[id] else {
             renderer.showDropTarget(nil)
-            NSCursor.arrow.set()
+            if allowsDrop(under: nil) { NSCursor.arrow.set() }
             return
         }
         if forbiddenTargets.contains(id) {
             if !draggedBranchIDs.contains(id) {
-                dropTarget = .invalid
+                dropTarget = .invalid(nil)
                 NSCursor.operationNotAllowed.set()
-            } else {
+            } else if allowsDrop(under: nil) {
                 NSCursor.arrow.set()
             }
             renderer.showDropTarget(nil)
             return
         }
-        NSCursor.arrow.set()
         let relativeY = (world.y - target.frame.minY) / target.frame.height
-        if relativeY < 0.25 || relativeY > 0.75 {
+        let isSibling = relativeY < 0.25 || relativeY > 0.75
+        let parent = isSibling ? session.board.parents[id] : id
+        guard allowsDrop(under: parent) else { return }
+        NSCursor.arrow.set()
+        if isSibling {
             dropTarget = .sibling(id, after: relativeY > 0.75)
             var line = viewRect(target.frame)
             line.origin.y = relativeY > 0.75 ? line.maxY + 8 : line.minY - 8
@@ -705,6 +1118,14 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         }
     }
 
+    private func allowsDrop(under parent: UUID?) -> Bool {
+        guard let problem = session.board.resourceMoveProblem(for: draggedResources, to: parent) else { return true }
+        dropTarget = .invalid(problem)
+        renderer.showDropTarget(nil)
+        NSCursor.operationNotAllowed.set()
+        return false
+    }
+
     override func mouseUp(with event: NSEvent) {
         defer {
             dragStart = nil
@@ -713,6 +1134,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
             draggedBranches = []
             draggedBranchIDs = []
             draggedRootIDs = []
+            draggedResources = [:]
             forbiddenTargets = []
             dragStarted = false
             dragOffset = .zero
@@ -741,12 +1163,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
             let filtered = siblings.filter { !draggedBranchIDs.contains($0) }
             let index = (filtered.firstIndex(of: target) ?? filtered.count) + (after ? 1 : 0)
             edit = session.board.movingBranches(draggedBranchIDs, to: parent, at: index, positions: positions)
-        case .invalid:
+        case .invalid(let problem):
+            if let problem { actions?.hint = problem.message }
             return
         case nil:
             edit = session.board.movingBranches(draggedBranchIDs, to: nil, positions: positions)
         }
-        session.apply(edit, named: "Move Branch")
+        if session.apply(edit, named: "Move Branch") { actions?.hint = EditorActions.defaultHint }
         changed()
     }
 
@@ -775,6 +1198,29 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     override func keyDown(with event: NSEvent) {
+        if let form = nodeFormModel, form.content.kind == .worktree {
+            // Nonediting popover controls may leave the canvas as first responder.
+            switch event.keyCode {
+            case 36, 76:
+                if event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty {
+                    form.submitWorktree()
+                }
+            case 53:
+                closeNodeForm()
+            case 48:
+                if let popoverWindow = nodePopover?.contentViewController?.view.window {
+                    popoverWindow.makeKey()
+                    if event.modifierFlags.contains(.shift) {
+                        popoverWindow.selectPreviousKeyView(nil)
+                    } else {
+                        popoverWindow.selectNextKeyView(nil)
+                    }
+                }
+            default:
+                super.keyDown(with: event)
+            }
+            return
+        }
         actions?.activateTarget()
         if event.keyCode == 49 {
             isSpaceDown = true
@@ -783,7 +1229,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         }
         switch event.keyCode {
         case 48: insertNode(asChild: true)
-        case 36, 76: insertNode(asChild: false)
+        case 36, 76:
+            if selected.count == 1, let id = selected.first, session.board.nodes[id]?.worktreeCreationDraft != nil {
+                configureNode(id)
+            } else {
+                insertNode(asChild: false)
+            }
         case 51, 117: deleteSelection()
         case 53: window?.makeFirstResponder(self)
         case 120: editSelection()
@@ -807,7 +1258,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     override func insertText(_ insertString: Any) {
-        guard !session.isReadOnly, let id = selected.first else { return }
+        guard !session.isReadOnly, let id = selected.first, session.board.nodes[id]?.content.kind == .text else {
+            return
+        }
         beginEditing(id)
         editor?.selectAll(nil)
         if let text = insertString as? String {
@@ -836,28 +1289,28 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     func undoCommand() {
-        if let editor {
+        if let editor = editingTextView {
             editor.undoManager?.undo()
             updateActions()
             return
         }
         workspace?.commitEdits(in: session.id)
-        session.undoManager.undo()
+        session.undo()
         changed()
     }
     func redoCommand() {
-        if let editor {
+        if let editor = editingTextView {
             editor.undoManager?.redo()
             updateActions()
             return
         }
         workspace?.commitEdits(in: session.id)
-        session.undoManager.redo()
+        session.redo()
         changed()
     }
 
     @objc func copy(_ sender: Any?) {
-        let text = mapLayout.orderedIDs.filter { selected.contains($0) }.compactMap { session.board.nodes[$0]?.text }
+        let text = mapLayout.orderedIDs.filter { selected.contains($0) }.compactMap { session.board.nodes[$0]?.title }
             .joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -867,7 +1320,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         guard !session.isReadOnly, let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
             return
         }
-        finishEditing(commit: true)
+        finishEditing()
         let parent = selected.first
         guard
             let result = session.board.inserting(
@@ -883,15 +1336,32 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         render()
         updateActions()
     }
+    @objc private func addResourceAction(_ item: NSMenuItem) {
+        guard let raw = item.representedObject as? String, let kind = NodeKind(rawValue: raw) else { return }
+        insertResource(kind, at: contextPoint)
+    }
+    @objc private func deriveAgentAction(_ sender: Any?) { deriveAgent() }
+    @objc private func linkWorktreeAction(_ sender: Any?) { insertResource(.worktree, linkWorktree: true) }
+    @objc private func configureResourceAction(_ sender: Any?) {
+        if let id = selected.first { configureNode(id) }
+    }
+    @objc private func showLocationAction(_ sender: Any?) {
+        guard let id = selected.first, let node = session.board.nodes[id] else { return }
+        let path: String?
+        switch node.content {
+        case .project(let project): path = project.location?.directory
+        case .worktree(let tree): path = tree.location?.directory
+        case .agent: path = session.board.context(above: id).worktree?.directory
+        case .text, .branch: path = nil
+        }
+        if let path { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
+    }
+
     @objc private func addChildAction(_ sender: Any?) { insertNode(asChild: true) }
     @objc private func addSiblingAction(_ sender: Any?) { insertNode(asChild: false) }
     @objc private func addRootAction(_ sender: Any?) { insertRoot(at: contextPoint) }
     @objc private func editAction(_ sender: Any?) { editSelection() }
     @objc private func deleteAction(_ sender: Any?) { deleteSelection() }
-    @objc private func foldAction(_ sender: Any?) { toggleCollapse() }
-    @objc private func moveUpAction(_ sender: Any?) { moveSelection(by: -1) }
-    @objc private func moveDownAction(_ sender: Any?) { moveSelection(by: 1) }
-    @objc private func actualSizeAction(_ sender: Any?) { setZoom(1) }
     @objc private func fitContentAction(_ sender: Any?) { fitContent() }
     @objc private func detachAction(_ sender: Any?) {
         guard let id = selected.first, let frame = mapLayout.nodes[id]?.frame else { return }
@@ -900,43 +1370,93 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
-        finishEditing(commit: true)
+        finishEditing()
         contextPoint = camera.worldPoint(localPoint(event))
-        if let id = mapLayout.hitTest(contextPoint) {
-            select(id)
+        let node = mapLayout.hitTest(contextPoint).flatMap { session.board.nodes[$0] }
+        if let node {
+            select(node.id)
         } else {
             selected.removeAll()
             updateActions()
         }
         let menu = NSMenu()
-        func add(_ title: String, _ action: Selector) {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        func add(
+            _ title: String, _ action: Selector, symbol: String, key: String = "",
+            modifiers: NSEvent.ModifierFlags = [], resource: NodeKind? = nil
+        ) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = modifiers
+            item.image = CanvasStyle.contextMenuImage(named: symbol)
+            #if compiler(>=6.4)
+                if #available(macOS 27.0, *) { item.preferredImageVisibility = .visible }
+            #endif
+            item.representedObject = resource?.rawValue
             item.target = self
             menu.addItem(item)
         }
-        add("Add Root", #selector(addRootAction(_:)))
-        if selected.isEmpty {
-            menu.addItem(.separator())
-            add("Actual Size", #selector(actualSizeAction(_:)))
-            add("Fit Content", #selector(fitContentAction(_:)))
+        func addResource(_ kind: NodeKind) {
+            add("Add \(kind.title)", #selector(addResourceAction(_:)), symbol: kind.symbol, resource: kind)
+        }
+
+        if node == nil {
+            add(
+                "Add Root", #selector(addRootAction(_:)), symbol: "plus.square", key: "r",
+                modifiers: [.command, .shift])
         } else {
-            add("Add Child", #selector(addChildAction(_:)))
-            add("Add Sibling", #selector(addSiblingAction(_:)))
-            menu.addItem(.separator())
-            add("Edit Text", #selector(editAction(_:)))
-            if let id = selected.first, session.board.nodes[id]?.children.isEmpty == false {
-                add(
-                    session.board.nodes[id]?.isCollapsed == true ? "Expand Branch" : "Collapse Branch",
-                    #selector(foldAction(_:)))
+            add("Add Child", #selector(addChildAction(_:)), symbol: "arrow.turn.down.right", key: "\t")
+            add("Add Sibling", #selector(addSiblingAction(_:)), symbol: "plus", key: "\r")
+        }
+        if canAddProject { addResource(.project) }
+        if canAddWorktree { addResource(.worktree) }
+        if canLinkWorktree { add("Link Existing Worktree…", #selector(linkWorktreeAction(_:)), symbol: "link") }
+        if let node, node.content.kind == .text, !node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            add(
+                "New Agent from Text", #selector(deriveAgentAction(_:)), symbol: NodeKind.agent.symbol, key: "\r",
+                modifiers: .command)
+        } else {
+            addResource(.agent)
+        }
+        menu.addItem(.separator())
+        if let node {
+            let kind = node.content.kind
+            let editKey = String(UnicodeScalar(NSEvent.SpecialKey.f2.rawValue)!)
+            if kind == .text {
+                add("Edit Text", #selector(editAction(_:)), symbol: "pencil", key: editKey)
+            } else if node.worktreeCreationDraft != nil {
+                add("Edit Worktree Name", #selector(editAction(_:)), symbol: "pencil", key: editKey)
+            } else {
+                let address = NodeAddress(boardID: session.id, nodeID: node.id)
+                let opensTerminal = kind == .agent && workspace?.terminals[address] != nil
+                if opensTerminal {
+                    add("Open Terminal", #selector(editAction(_:)), symbol: NodeKind.agent.symbol, key: editKey)
+                }
+                if kind != .agent || workspace?.agentRuns[address]?.state.isActive != true {
+                    add(
+                        "Configure \(kind.title)…",
+                        #selector(configureResourceAction(_:)),
+                        symbol: "gearshape",
+                        key: opensTerminal ? "" : editKey)
+                }
+                if !node.content.isDraft {
+                    add("Show in Finder", #selector(showLocationAction(_:)), symbol: "arrow.up.right.square")
+                }
             }
-            if let id = selected.first, session.board.parents[id] != nil {
-                add("Make Root", #selector(detachAction(_:)))
+            if session.board.parents[node.id] != nil,
+                session.board.resourceMoveProblem(for: session.board.resources(in: [node.id]), to: nil) == nil
+            {
+                add("Make Root", #selector(detachAction(_:)), symbol: "arrow.up.to.line")
             }
-            add("Move Up", #selector(moveUpAction(_:)))
-            add("Move Down", #selector(moveDownAction(_:)))
             menu.addItem(.separator())
-            add("Copy Text", #selector(copy(_:)))
-            add("Delete", #selector(deleteAction(_:)))
+            if kind == .text {
+                add("Copy Text", #selector(copy(_:)), symbol: "doc.on.doc", key: "c", modifiers: .command)
+            }
+            add(
+                "Delete", #selector(deleteAction(_:)), symbol: "trash",
+                key: String(UnicodeScalar(NSBackspaceCharacter)!))
+        } else {
+            add(
+                "Fit Content", #selector(fitContentAction(_:)), symbol: "viewfinder", key: "0",
+                modifiers: [.command, .shift])
         }
         return menu
     }
@@ -944,9 +1464,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
     func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
         if item.action == #selector(copy(_:)) { return !selected.isEmpty }
         if item.action == #selector(selectAll(_:)) { return !mapLayout.nodes.isEmpty }
-        if item.action == #selector(actualSizeAction(_:)) || item.action == #selector(fitContentAction(_:)) {
-            return true
-        }
+        if item.action == #selector(fitContentAction(_:)) { return true }
         return !session.isReadOnly
     }
 
@@ -969,18 +1487,21 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
         for id in visible {
             guard let node = session.board.nodes[id] else { continue }
             let element = accessibilityNodes[id] ?? TopicAccessibilityElement(id: id, canvas: self)
-            element.setAccessibilityLabel(node.text.isEmpty ? "New topic" : node.text)
-            element.setAccessibilityValue(
+            element.setAccessibilityLabel(node.title)
+            element.setAccessibilityRoleDescription(node.content.kind == .project ? "project topic" : "mind map topic")
+            let children =
                 node.isCollapsed
-                    ? "Collapsed, \(mapLayout.nodes[id]?.descendantCount ?? 0) hidden topics"
-                    : "\(node.children.count) children")
+                ? "Collapsed, \(mapLayout.nodes[id]?.descendantCount ?? 0) hidden topics"
+                : "\(node.children.count) children"
+            let detail = runtimeDetails[id] ?? node.detail
+            element.setAccessibilityValue(detail.map { "\($0), \(children)" } ?? children)
             element.setAccessibilitySelected(selected.contains(id))
             element.setAccessibilityEnabled(!session.isReadOnly)
             accessibilityNodes[id] = element
             if !node.children.isEmpty {
                 let disclosure =
                     accessibilityDisclosures[id] ?? TopicDisclosureAccessibilityElement(id: id, canvas: self)
-                let title = node.text.isEmpty ? "New topic" : node.text
+                let title = node.title
                 disclosure.setAccessibilityLabel(
                     node.isCollapsed
                         ? "Expand \(title), \(mapLayout.nodes[id]?.descendantCount ?? 0) hidden topics"
@@ -1001,6 +1522,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSUserInterfaceValida
             }
             return [topic]
         }
+        if let field = worktreeNameField { return elements + [field] }
         return editor.map { elements + [$0] } ?? elements
     }
 
@@ -1060,7 +1582,6 @@ nonisolated final class TopicAccessibilityElement: NSAccessibilityElement {
         self.canvas = canvas
         super.init()
         setAccessibilityRole(.button)
-        setAccessibilityRoleDescription("mind map topic")
         setAccessibilityParent(canvas)
     }
 

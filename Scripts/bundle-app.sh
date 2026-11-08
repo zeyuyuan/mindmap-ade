@@ -23,9 +23,10 @@ staging_directory="$(mktemp -d "$distribution_directory/.MindmapADE.XXXXXX")"
 trap 'rm -rf "$staging_directory"' EXIT
 
 staged_bundle="$staging_directory/MindmapADE.app"
-mkdir -p "$staged_bundle/Contents/MacOS"
+mkdir -p "$staged_bundle/Contents/MacOS" "$staged_bundle/Contents/Resources"
 install -m 755 "$executable" "$staged_bundle/Contents/MacOS/MindmapADE"
 cp "$project_root/Resources/Info.plist" "$staged_bundle/Contents/Info.plist"
+cp "$project_root/THIRD-PARTY-NOTICES.md" "$staged_bundle/Contents/Resources/"
 plutil -lint "$staged_bundle/Contents/Info.plist"
 codesign --force --sign "${CODE_SIGN_IDENTITY:--}" --timestamp=none "$staged_bundle"
 codesign --verify --strict "$staged_bundle"

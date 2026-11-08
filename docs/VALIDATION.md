@@ -76,3 +76,14 @@ Validated on November 7, 2026:
 ## Deferred Validation
 
 Embedded Ghostty terminals and other node types are outside this version. Real IME composition, VoiceOver navigation, and sustained GPU/frame-time profiling need dedicated testing before broader distribution.
+
+## Resource Nodes and Agent Sessions
+
+Validated November 7–9, 2026, with macOS 27.0.1 and Xcode 26.6. Native checks used a separate workspace and scratch Git repositories.
+
+- `make check` passed 38 tests. Coverage includes legacy workspace loading, resource placement during moves, Worktree creation and recovery after a failed save, command deadlines, PTY working directories, and child process shutdown.
+- The native Project form bound a linked checkout. The Worktree picker listed linked and detached checkouts and could reuse an existing directory. Command-Return on a text topic opened an Agent draft with the text as its task. Starting an Agent without an inherited Worktree inserted one Worktree node above it.
+- Command Code and Codex started in their bound Worktrees and discovered the map tools. The integration tests cover branch permissions, duplicate operation IDs, registering another Worktree, and revoking map access after Stop.
+- The Agent form kept the conversation name visible and the focus rings intact. Its CLI selection survived restart. The terminal opened to the right of the canvas; hiding it or switching boards preserved a live conversation.
+
+The terminal backend is SwiftTerm. The workspace keeps the latest run record. Terminal scrollback is available during the current app session. A future backend can supply a libghostty surface through the terminal session boundary.

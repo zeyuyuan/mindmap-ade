@@ -1,6 +1,16 @@
 import SwiftUI
 
 @main
+enum MindmapEntryPoint {
+    static func main() {
+        if CommandLine.arguments.dropFirst().first == "--mindmap-mcp" {
+            MCPStdioBridge.run()
+        } else {
+            MindmapADEApp.main()
+        }
+    }
+}
+
 struct MindmapADEApp: App {
     @NSApplicationDelegateAdaptor(MindmapAppDelegate.self) private var delegate
     @State private var workspace = WorkspaceStore()
@@ -37,16 +47,34 @@ final class MindmapAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        sender.keyWindow?.makeFirstResponder(nil)
         guard let workspace else { return .terminateNow }
+        if !workspace.operations.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "A workspace operation is still running."
+            alert.informativeText = "Wait for the node to finish preparing, then quit again."
+            alert.addButton(withTitle: "Keep Open")
+            alert.runModal()
+            return .terminateCancel
+        }
+        if workspace.hasActiveWork() {
+            let alert = NSAlert()
+            alert.messageText = "Stop Agent conversations and quit?"
+            alert.informativeText = "Active CLI processes will stop. Their worktree files will remain on disk."
+            alert.addButton(withTitle: "Stop and Quit")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
         workspace.commitEdits()
+        sender.keyWindow?.makeFirstResponder(nil)
         Task {
             do {
                 try await workspace.flush()
+                if workspace.hasActiveWork() || workspace.mcpListener != nil { try await workspace.stopAllAgents() }
+                if workspace.saveState != .saved { try await workspace.flush() }
                 sender.reply(toApplicationShouldTerminate: true)
             } catch {
                 let alert = NSAlert()
-                alert.messageText = "The workspace could not be saved."
+                alert.messageText = "Mindmap ADE could not quit."
                 alert.informativeText = error.localizedDescription
                 alert.addButton(withTitle: "Keep Open")
                 alert.runModal()

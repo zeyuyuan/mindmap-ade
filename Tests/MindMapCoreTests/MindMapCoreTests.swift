@@ -113,20 +113,20 @@ import Testing
     #expect(throws: BoardValidationError.self) { try invalid.validated() }
     var cycle = board
     let id = board.roots[0].id
-    cycle.apply(BoardEdit(nodes: [NodeReplacement(id: id, node: TextNode(id: id, children: [id]))]))
+    cycle.apply(BoardEdit(nodes: [NodeReplacement(id: id, node: MapNode(id: id, children: [id]))]))
     #expect(throws: BoardValidationError.self) { try cycle.validated() }
     var future = archive
-    future.schemaVersion = 2
+    future.schemaVersion += 1
     #expect(throws: BoardValidationError.self) { try future.validated() }
 }
 
 @Test func tenThousandDeepNodesUseIterativeLayout() throws {
     let ids = (0..<10_000).map { _ in UUID() }
-    var board = MindMapBoard(root: TextNode(id: ids[0]))
+    var board = MindMapBoard(root: MapNode(id: ids[0]))
     let changes = ids.enumerated().map { index, id in
         NodeReplacement(
             id: id,
-            node: TextNode(id: id, text: "Topic \(index)", children: index + 1 < ids.count ? [ids[index + 1]] : []))
+            node: MapNode(id: id, text: "Topic \(index)", children: index + 1 < ids.count ? [ids[index + 1]] : []))
     }
     board.apply(BoardEdit(nodes: changes))
     _ = try board.validated()
@@ -161,11 +161,11 @@ import Testing
 
 @Test func subtreeCullingMatchesGeometryAcrossAThousandNodes() throws {
     let ids = (0..<1000).map { _ in UUID() }
-    var board = MindMapBoard(root: TextNode(id: ids[0]))
+    var board = MindMapBoard(root: MapNode(id: ids[0]))
     board.apply(
         BoardEdit(
             nodes: ids.enumerated().map { index, id in
-                NodeReplacement(id: id, node: TextNode(id: id, children: Array(ids.dropFirst(index * 4 + 1).prefix(4))))
+                NodeReplacement(id: id, node: MapNode(id: id, children: Array(ids.dropFirst(index * 4 + 1).prefix(4))))
             }))
     let secondRoot = try #require(board.inserting(parent: nil, position: CGPoint(x: -800, y: -1200)))
     board.apply(secondRoot.edit)

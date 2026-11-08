@@ -5,11 +5,15 @@ import Testing
 @testable import MindmapADE
 
 actor MemoryWorkspaceDisk: WorkspacePersistence {
-    nonisolated let directory = URL(fileURLWithPath: "/tmp/MindmapADE-tests-\(UUID())")
+    nonisolated let directory: URL
     private var archive: WorkspaceArchive
     private var fails = false
 
-    init(board: MindMapBoard = MindMapBoard(root: TextNode(text: "Original"))) {
+    init(
+        board: MindMapBoard = MindMapBoard(root: MapNode(text: "Original")),
+        directory: URL = URL(fileURLWithPath: "/tmp/MindmapADE-tests-\(UUID())")
+    ) {
+        self.directory = directory
         archive = WorkspaceArchive(boards: [board])
     }
 
@@ -49,6 +53,14 @@ private final class CanvasFixture {
 
     var editor: NSTextView? { view.accessibilityChildren()?.compactMap { $0 as? NSTextView }.first }
 
+    func worktreeNameField() async throws -> NSTextField {
+        for _ in 0..<100 {
+            if let field = view.accessibilityChildren()?.compactMap({ $0 as? NSTextField }).first { return field }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw CocoaError(.coderReadCorrupt)
+    }
+
     func type(_ text: String) throws {
         let textView = try #require(editor)
         textView.string = text
@@ -83,6 +95,151 @@ private final class CanvasFixture {
 @Suite(.serialized)
 @MainActor
 struct CanvasRegressionTests {
+    @Test func resourceMenusAndCommandsRespectProjectAndWorktreePlacement() async throws {
+        var project = ProjectTopic()
+        project.location = ProjectLocation(directory: "/project", gitCommonDirectory: "/project/.git")
+        let root = MapNode(content: .project(project))
+        var board = MindMapBoard(root: root)
+        func insert(_ node: MapNode, under parent: UUID?, y: CGFloat = 0) throws {
+            board.apply(try #require(board.inserting(node, parent: parent, position: CGPoint(x: 0, y: y))).edit)
+        }
+
+        let group = MapNode(text: "Features")
+        let task = MapNode(text: "Login")
+        try insert(group, under: root.id)
+        try insert(task, under: group.id)
+        let worktree = MapNode(content: .worktree(WorktreeTopic()))
+        try insert(worktree, under: root.id)
+        try insert(MapNode(text: "Inside Draft"), under: worktree.id)
+        let location = WorktreeLocation(
+            directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "feature/test", commit: "abc",
+            isPrimary: false)
+        let ready = MapNode(content: .worktree(WorktreeTopic(location: location)))
+        try insert(ready, under: root.id)
+        try insert(MapNode(text: "Inside Worktree"), under: ready.id)
+        var folder = ProjectTopic()
+        folder.location = ProjectLocation(directory: "/folder")
+        let nonGit = MapNode(content: .project(folder))
+        try insert(nonGit, under: nil, y: 192)
+        try insert(MapNode(text: "Inside Folder"), under: nonGit.id)
+        try insert(MapNode(content: .project(ProjectTopic())), under: nil, y: 280)
+        try insert(MapNode(text: "Loose Topic"), under: nil, y: 360)
+
+        let disk = MemoryWorkspaceDisk(board: board)
+        let workspace = WorkspaceStore(disk: disk)
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.fitContent()
+
+        func menuTitles(on title: String?) throws -> [String] {
+            var point = CGPoint(x: 8, y: 8)
+            if let title {
+                let element = try #require(
+                    canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }
+                        .first { $0.accessibilityLabel() == title })
+                let frame = canvas.view.convert(
+                    canvas.window.convertFromScreen(element.accessibilityFrame()), from: nil)
+                point = CGPoint(x: frame.midX, y: frame.midY)
+            }
+            let event = try canvas.event(.rightMouseDown, at: point)
+            return canvas.view.menu(for: event)?.items.map(\.title) ?? []
+        }
+
+        let blocked: [String?] = [
+            nil, "Loose Topic", "Choose a project", nonGit.title, "Inside Folder", worktree.title, "Inside Draft",
+        ]
+        for title in blocked {
+            let menu = try menuTitles(on: title)
+            let canAddProject = title == nil || title == "Loose Topic"
+            #expect(menu.contains("Add Project") == canAddProject)
+            #expect(canvas.actions.canAddProject == canAddProject)
+            #expect(!menu.contains("Add Worktree"))
+            #expect(!canvas.actions.canAddWorktree)
+            #expect(!menu.contains("Link Existing Worktree…"))
+            #expect(!canvas.actions.canLinkWorktree)
+            if !canAddProject { canvas.actions.add(.project) }
+            canvas.actions.add(.worktree)
+            #expect(session.board == board)
+        }
+        for title in [root.title, task.title, ready.title, "Inside Worktree"] {
+            let menu = try menuTitles(on: title)
+            #expect(menu.contains("Add Worktree"))
+            #expect(!menu.contains("Add Project"))
+            #expect(canvas.actions.canAddWorktree)
+            let canLink = title == root.title || title == task.title
+            #expect(menu.contains("Link Existing Worktree…") == canLink)
+            #expect(canvas.actions.canLinkWorktree == canLink)
+            canvas.actions.add(.project)
+            #expect(session.board == board)
+        }
+        canvas.actions.add(.worktree)
+        let child = try #require(session.board.nodes[ready.id]?.children.last)
+        #expect(session.board.nodes[child]?.content == .worktree(WorktreeTopic()))
+
+        let field = try await canvas.worktreeNameField()
+        let fieldEditor = try #require(field.currentEditor() as? NSTextView)
+        let suggestion = try #require(field.placeholderString)
+        #expect(canvas.window.firstResponder === fieldEditor)
+        #expect(fieldEditor.string.isEmpty)
+        #expect(suggestion.hasPrefix("mindmap/worktree-"))
+        #expect(canvas.view.control(field, textView: fieldEditor, doCommandBy: #selector(NSResponder.insertTab(_:))))
+        #expect(fieldEditor.string == suggestion)
+        #expect(fieldEditor.selectedRange().length == suggestion.utf16.count)
+        try await workspace.flush()
+        #expect(await disk.snapshot().boards.first?.nodes[child]?.worktreeCreationDraft?.choice.branch == suggestion)
+        #expect(
+            canvas.view.control(field, textView: fieldEditor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+
+        _ = try menuTitles(on: task.title)
+        canvas.actions.linkWorktree()
+        let linked = try #require(session.board.nodes[task.id]?.children.first)
+        var linkDraft = WorktreeTopic()
+        linkDraft.choice.mode = .existing
+        #expect(session.board.nodes[linked]?.content == .worktree(linkDraft))
+    }
+
+    @Test func clickingAwayFromAnEmptyWorktreeNameCreatesTheSuggestedCheckout() async throws {
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let workspaceGit = GitWorkspace()
+        let location = try await workspaceGit.project(at: fixture.repository.path)
+        var project = ProjectTopic()
+        project.location = location
+        let root = MapNode(content: .project(project))
+        let workspace = WorkspaceStore(
+            disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root), directory: fixture.data))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.actions.add(.worktree)
+        let draft = try #require(session.board.nodes[root.id]?.children.first)
+        let field = try await canvas.worktreeNameField()
+        let suggestion = try #require(field.placeholderString)
+        #expect(field.stringValue.isEmpty)
+
+        try canvas.click(CGPoint(x: 8, y: 8))
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        let address = NodeAddress(boardID: session.id, nodeID: draft)
+        while session.board.nodes[draft]?.worktreeCreationDraft != nil || workspace.operations.contains(address) {
+            guard ContinuousClock.now < deadline else {
+                Issue.record("The worktree did not finish creating after the canvas click.")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let checkout = try #require(session.board.context(startingAt: draft).worktree)
+        #expect(checkout.branch == suggestion)
+        #expect(session.board.parents[draft] == root.id)
+        #expect(try await workspace.git.worktrees(for: location).contains(checkout))
+        #expect(canvas.view.accessibilityChildren()?.contains { $0 is NSTextField } == false)
+    }
+
     @Test func aNewWindowTakesOverEditingWithoutCancelRevertingAnotherCommit() async throws {
         let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
         await workspace.loadIfNeeded()
@@ -165,6 +322,33 @@ struct CanvasRegressionTests {
         #expect(session.board.nodes[root]?.text == "Pending edit")
     }
 
+    @Test func undoRestoresADeletedBoardAfterUndoingNewerMapEdits() async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let original = try #require(workspace.boards.first)
+        let id = try #require(workspace.createBoard())
+        let session = try #require(workspace.board(id))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        canvas.actions.workspace = workspace
+        canvas.actions.targetBoardID = id
+
+        let root = session.board.roots[0].id
+        #expect(session.apply(session.board.replacingText(root, with: "Before deletion"), named: "Edit Text"))
+        workspace.deleteBoard(original.id)
+        #expect(canvas.actions.shouldUndoBoardDeletion)
+        #expect(session.apply(session.board.replacingText(root, with: "After deletion"), named: "Edit Text"))
+
+        canvas.actions.undo()
+        #expect(session.board.nodes[root]?.text == "Before deletion")
+        #expect(workspace.board(original.id) == nil)
+
+        canvas.actions.undo()
+        #expect(workspace.boards.first === original)
+        #expect(canvas.actions.requestedBoardID == original.id)
+        #expect(session.board.nodes[root]?.text == "Before deletion")
+    }
+
     @Test func autosaveFailureRemainsFailedUntilAWriteSucceeds() async throws {
         let disk = MemoryWorkspaceDisk()
         let workspace = WorkspaceStore(disk: disk)
@@ -190,7 +374,7 @@ struct CanvasRegressionTests {
     }
 
     @Test func multiSelectionDragMovesBothRootsAndUndoesAsOneOperation() async throws {
-        var board = MindMapBoard(root: TextNode(text: "Root A"))
+        var board = MindMapBoard(root: MapNode(text: "Root A"))
         let rootA = board.roots[0].id
         let second = try #require(board.inserting(text: "Root B", parent: nil, position: CGPoint(x: 0, y: 170)))
         board.apply(second.edit)
@@ -211,13 +395,13 @@ struct CanvasRegressionTests {
         #expect(selected == 2)
         canvas.view.undoCommand()
         #expect(session.board == board)
-        #expect(!session.undoManager.canUndo)
+        #expect(!session.canUndo)
         canvas.view.redoCommand()
         #expect(session.board.roots[1].position == CGPoint(x: 30, y: 195))
     }
 
     @Test func droppingABranchOnItsDescendantDoesNotDetachIt() async throws {
-        var board = MindMapBoard(root: TextNode(text: "Root"))
+        var board = MindMapBoard(root: MapNode(text: "Root"))
         let root = board.roots[0].id
         let branch = try #require(board.inserting(text: "Branch", parent: root))
         board.apply(branch.edit)
@@ -233,6 +417,6 @@ struct CanvasRegressionTests {
         try canvas.drag(from: CGPoint(x: 308, y: 118), to: CGPoint(x: 468, y: 118))
         #expect(session.board == board)
         #expect(session.board.parents[branch.id] == root)
-        #expect(!session.undoManager.canUndo)
+        #expect(!session.canUndo)
     }
 }

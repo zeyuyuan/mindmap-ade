@@ -6,6 +6,12 @@ public enum MapMetrics {
     public static let minimumNodeWidth: CGFloat = 96
     public static let maximumTextWidth: CGFloat = 220
     public static let minimumNodeHeight: CGFloat = 36
+    public static let resourceMinimumWidth: CGFloat = 204
+    public static let resourceHeight: CGFloat = 52
+    public static let resourceDetailHeight: CGFloat = 16
+    public static let resourceIconSize: CGFloat = 28
+    public static let resourceIconGap: CGFloat = 8
+    public static let resourceIconInset = resourceIconSize + resourceIconGap
     public static let maximumTextHeight: CGFloat = 144
     public static let horizontalPadding: CGFloat = 12
     public static let verticalPadding: CGFloat = 8

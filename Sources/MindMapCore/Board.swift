@@ -1,18 +1,72 @@
 import CoreGraphics
 import Foundation
 
-public struct TextNode: Identifiable, Codable, Equatable, Sendable {
+public struct MapNode: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var text: String
     public var children: [UUID]
     public var isCollapsed: Bool
+    public var content: NodeContent
 
-    public init(id: UUID = UUID(), text: String = "", children: [UUID] = [], isCollapsed: Bool = false) {
+    public init(
+        id: UUID = UUID(), text: String = "", children: [UUID] = [], isCollapsed: Bool = false,
+        content: NodeContent = .text
+    ) {
         self.id = id
         self.text = text
         self.children = children
         self.isCollapsed = isCollapsed
+        self.content = content
     }
+
+    private enum CodingKeys: String, CodingKey { case id, text, children, isCollapsed, content }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        text = try values.decode(String.self, forKey: .text)
+        children = try values.decode([UUID].self, forKey: .children)
+        isCollapsed = try values.decode(Bool.self, forKey: .isCollapsed)
+        content = try values.decodeIfPresent(NodeContent.self, forKey: .content) ?? .text
+    }
+
+    public var title: String {
+        switch content {
+        case .text:
+            return text.isEmpty ? "New topic" : text
+        case .project(let value):
+            let name = value.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { return name }
+            let directory = value.location?.directory ?? value.directory
+            return directory.isEmpty ? "Choose a project" : URL(fileURLWithPath: directory).lastPathComponent
+        case .branch(let value):
+            return value.name.isEmpty ? "Choose a branch" : value.name
+        case .worktree(let value):
+            if let location = value.location { return location.revisionLabel }
+            if value.choice.mode == .existing { return "Choose a worktree" }
+            let branch = value.choice.branch.trimmingCharacters(in: .whitespacesAndNewlines)
+            return branch.isEmpty ? "New Worktree" : branch
+        case .agent(let value):
+            let name = value.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { return name }
+            let line = value.task.split(whereSeparator: \.isNewline).first?.trimmingCharacters(in: .whitespaces)
+            return line.flatMap { $0.isEmpty ? nil : String($0.prefix(100)) } ?? "New conversation"
+        }
+    }
+
+    public var detail: String? {
+        switch content {
+        case .text, .branch: nil
+        case .project(let value):
+            value.location == nil ? "Draft" : nil
+        case .worktree(let value):
+            value.location.map { $0.isPrimary ? "Main worktree · \($0.name)" : "Worktree · \($0.name)" }
+                ?? "Worktree · Draft"
+        case .agent(let value):
+            value.isConfigured ? "Agent · \(value.cli.title)" : "Agent · Draft"
+        }
+    }
+
 }
 
 public struct RootPlacement: Identifiable, Codable, Equatable, Sendable {
@@ -27,9 +81,9 @@ public struct RootPlacement: Identifiable, Codable, Equatable, Sendable {
 
 public struct NodeReplacement: Sendable {
     public let id: UUID
-    public let node: TextNode?
+    public let node: MapNode?
 
-    public init(id: UUID, node: TextNode?) {
+    public init(id: UUID, node: MapNode?) {
         self.id = id
         self.node = node
     }
@@ -56,12 +110,12 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var name: String
     public private(set) var roots: [RootPlacement]
-    public private(set) var nodes: [UUID: TextNode]
+    public private(set) var nodes: [UUID: MapNode]
     private var parentIndex: [UUID: UUID] = [:]
 
     private enum CodingKeys: String, CodingKey { case id, name, roots, nodes }
 
-    public init(id: UUID = UUID(), name: String = "Untitled", root: TextNode = TextNode()) {
+    public init(id: UUID = UUID(), name: String = "Untitled", root: MapNode = MapNode()) {
         self.id = id
         self.name = name
         roots = [RootPlacement(id: root.id)]
@@ -74,7 +128,7 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
         id = try container.decode(UUID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
         roots = try container.decode([RootPlacement].self, forKey: .roots)
-        nodes = try container.decode([UUID: TextNode].self, forKey: .nodes)
+        nodes = try container.decode([UUID: MapNode].self, forKey: .nodes)
         for node in nodes.values {
             for child in node.children { parentIndex[child] = node.id }
         }
@@ -134,7 +188,15 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
     public func inserting(
         text: String = "", parent: UUID?, after sibling: UUID? = nil, position: CGPoint = .zero
     ) -> (edit: BoardEdit, id: UUID)? {
-        let node = TextNode(text: text)
+        inserting(MapNode(text: text), parent: parent, after: sibling, position: position)
+    }
+
+    public func inserting(
+        _ node: MapNode, parent: UUID?, after sibling: UUID? = nil, position: CGPoint = .zero
+    ) -> (edit: BoardEdit, id: UUID)? {
+        guard nodes[node.id] == nil, node.children.isEmpty, permitsResource(node.content, under: parent) else {
+            return nil
+        }
         var changes = [NodeReplacement(id: node.id, node: node)]
         if let parent {
             guard var owner = nodes[parent] else { return nil }
@@ -151,9 +213,37 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func replacingText(_ id: UUID, with text: String) -> BoardEdit? {
-        guard var node = nodes[id], node.text != text else { return nil }
+        guard var node = nodes[id], node.content.kind == .text, node.text != text else { return nil }
         node.text = text
         return BoardEdit(nodes: [NodeReplacement(id: id, node: node)])
+    }
+
+    public func replacingContent(_ id: UUID, with content: NodeContent) -> BoardEdit? {
+        guard var node = nodes[id], node.content.kind == content.kind, node.content != content else { return nil }
+        node.content = content
+        return BoardEdit(nodes: [NodeReplacement(id: id, node: node)])
+    }
+
+    /// Insert a configured resource in the child's existing slot, including root placement.
+    public func insertingParent(_ parent: MapNode, above childID: UUID) -> BoardEdit? {
+        guard nodes[parent.id] == nil, parent.children.isEmpty,
+            canInsertResourceParent(parent.content, above: childID)
+        else { return nil }
+        var parent = parent
+        parent.children = [childID]
+        parent.isCollapsed = false
+        var changes = [NodeReplacement(id: parent.id, node: parent)]
+        if let ownerID = parents[childID], var owner = nodes[ownerID],
+            let index = owner.children.firstIndex(of: childID)
+        {
+            owner.children[index] = parent.id
+            changes.append(NodeReplacement(id: ownerID, node: owner))
+            return BoardEdit(nodes: changes)
+        }
+        guard let index = roots.firstIndex(where: { $0.id == childID }) else { return nil }
+        var placements = roots
+        placements[index].id = parent.id
+        return BoardEdit(nodes: changes, roots: placements)
     }
 
     public func togglingCollapse(_ id: UUID) -> BoardEdit? {
@@ -185,7 +275,7 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
         }
         var nextRoots = roots.filter { !removed.contains($0.id) }
         if nextRoots.isEmpty {
-            let root = TextNode()
+            let root = MapNode()
             changes.append(NodeReplacement(id: root.id, node: root))
             nextRoots = [RootPlacement(id: root.id, position: roots.first?.position ?? .zero)]
         }
@@ -199,7 +289,10 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
             guard nodes[parent] != nil, !descendants(of: id).contains(parent) else { return nil }
         }
         let oldParent = parents[id]
-        var changed: [UUID: TextNode] = [:]
+        guard oldParent == parent || resourceMoveProblem(for: resources(in: [id]), to: parent) == nil else {
+            return nil
+        }
+        var changed: [UUID: MapNode] = [:]
         if let oldParent, var node = nodes[oldParent] {
             node.children.removeAll { $0 == id }
             changed[oldParent] = node
@@ -260,8 +353,10 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
                 ancestor = parentIndex[current]
             }
         }
+        let reparented = ids.filter { parentIndex[$0] != parent }
+        guard resourceMoveProblem(for: resources(in: reparented), to: parent) == nil else { return nil }
         let oldParents = Set(ids.compactMap { parentIndex[$0] })
-        var replacements: [UUID: TextNode] = [:]
+        var replacements: [UUID: MapNode] = [:]
         for id in oldParents {
             guard var node = nodes[id] else { continue }
             node.children.removeAll { moving.contains($0) }

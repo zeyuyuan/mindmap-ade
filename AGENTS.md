@@ -51,6 +51,7 @@ When rules conflict, follow the rule with the highest priority.
 - `make run` builds, bundles, and launches a fresh app instance.
 - `make check` validates first-party Swift formatting and builds the executable.
 - `make app CONFIGURATION=release` produces `dist/MindmapADE.app`.
+- After completing and validating app changes, restart Mindmap ADE unless the user asks to skip it. Quit the previous instance normally and launch the new build with the same workspace data directory, including any `--data-directory` override.
 - `make format` formats first-party Swift files. Preserve upstream skill formatting.
 - Keep app lifecycle code in `Sources/MindmapADE/App/` and UI in `Sources/MindmapADE/UI/`.
 - Introduce feature modules, dependencies, and tests when real behavior requires them.

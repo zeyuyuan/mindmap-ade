@@ -32,7 +32,10 @@ Defined in `Sources/MindMapCore/Layout.swift`, in `MapMetrics`. Sizes are world-
 | `fontSize` | 13 pt | System body text; semibold for roots |
 | `minimumNodeWidth` | 96 pt | Minimum topic width |
 | `maximumTextWidth` | 220 pt | Text wrapping width |
-| `minimumNodeHeight` | 36 pt | Minimum topic height |
+| `minimumNodeHeight` | 36 pt | Minimum text topic height |
+| `resourceMinimumWidth` / `resourceHeight` | 204 / 52 pt | Resource cards with an icon, title, and type or status |
+| `resourceDetailHeight` | 16 pt | Secondary line for a resource card |
+| `resourceIconSize` / `resourceIconGap` | 28 / 8 pt | Leading resource icon tile and space between the tile and the text |
 | `maximumTextHeight` | 144 pt | Maximum nonediting text preview height |
 | `horizontalPadding` / `verticalPadding` | 12 / 8 pt | Topic content insets |
 | `horizontalGap` / `verticalGap` | 64 / 16 pt | Parent-to-child and sibling-subtree separation |
@@ -53,6 +56,13 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 | `fitPadding` | 64 pt | Space around content when fitting or revealing a topic |
 | `dragThreshold` | 4 pt | Pointer travel before starting a drag |
 | `selectionOpacity` | 0.08 | Accent fill for selection and drop overlays |
+| `resourceIconPointSize` | 16 pt | Symbol inside the resource icon tile |
+| `formWidth` / `formMaximumBodyHeight` | 384 / 344 pt | Native node popover and its scrollable form body |
+| `formPadding` / `formSpacing` / `formGroupSpacing` | 16 / 8 / 16 pt | Node form insets, related controls, and group spacing |
+| `formFocusInset` | 8 pt | Room for system focus rings inside the form scroll clip |
+| `formCompactSpacing` | 4 pt | Space between a label and its supporting text |
+| `canvasMinimumWidth` / `terminalMinimumWidth` | 160 / 192 pt | Minimum pane widths when the board has room for both |
+| `terminalResizeHandleWidth` / `terminalResizeStep` | 8 / 32 pt | Divider drag area and accessibility adjustment step |
 | `editorMinimumHeight` / `editorMaximumHeight` | 36 / 240 pt | Inline text editor height range; the minimum matches a topic at actual size |
 | `sidebarMinimumWidth` / `sidebarIdealWidth` / `sidebarMaximumWidth` | 180 / 208 / 280 pt | Native board sidebar sizing |
 | `statusHorizontalPadding` / `statusVerticalPadding` | 16 / 8 pt | Bottom status and save feedback |
@@ -66,11 +76,15 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 
 Selection uses the system accent outline; the card keeps its semantic content background. Do not add custom glass or shadows to map content. Disable implicit layer animations during pointer manipulation.
 
-The status bar distinguishes loading, saving, saved, failed, and read-only states. Place workspace notices below the split view so an error does not cover the canvas status or sidebar controls.
+The status bar distinguishes loading, saving, saved, failed, and read-only states. Place workspace errors below the split view so they do not cover the canvas status or sidebar controls. Undo a board deletion from the Edit menu without adding a footer.
 
 Branch controls sit outside the card: minus collapses, a numeric badge expands. A collapsed branch shows its total descendants, including descendants below other folded nodes, and excludes the topic itself. The badge widens for multiple digits without changing card width. Counts are derived once per layout snapshot and reused during camera movement. Hide controls below `textDetailScale`, matching the text detail level. Use the same geometry for drawing, pointer hit testing, and accessibility frames.
 
+Resource cards use a leading SF Symbol on a tertiary system fill. Use the folder, branching arrows, and terminal symbols for projects, worktrees, and agents. A Git Project shows its current branch beneath its name. A bound folder without Git shows its name centered beside the icon. An unbound Project keeps its Draft label. Worktree cards show their branch and directory name. The enclosing Project or parent Worktree identifies a new checkout’s source. Hide the symbols with the text at overview zoom. Keep the popover anchored to the node at system control size. Close or Keep Draft keeps a new draft available to complete later. A new Worktree has a focused name field inside its card, with the generated branch name as the placeholder. Tab accepts the name. Return or leaving the field creates the checkout. Keep the terminal at its own text size inside the board window.
+
 The native text editor centers its text container using the laid-out glyph bounds. Empty and trailing lines retain space for the insertion point. Once the text requires scrolling, use normal top and bottom padding. Keep native caret, selection, and input-method geometry in the same text-container coordinate system.
+
+The Agent terminal opens to the right of the canvas at half the board width. Keep its controls in the pane header, with icon buttons and help labels so they fit at the minimum window size. The divider adjusts the two pane widths without changing the terminal font size.
 
 ## Spacing
 

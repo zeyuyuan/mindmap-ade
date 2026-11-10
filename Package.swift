@@ -8,11 +8,14 @@ let package = Package(
     products: [
         .executable(name: "MindmapADE", targets: ["MindmapADE"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.99.3")
+    ],
     targets: [
         .target(name: "MindMapCore"),
         .executableTarget(
             name: "MindmapADE",
-            dependencies: ["MindMapCore"],
+            dependencies: ["MindMapCore", .product(name: "SwiftTerm", package: "SwiftTerm")],
             swiftSettings: [.defaultIsolation(MainActor.self)]
         ),
         .testTarget(name: "MindMapCoreTests", dependencies: ["MindMapCore"]),

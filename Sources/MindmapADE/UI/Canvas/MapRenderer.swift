@@ -12,6 +12,11 @@ struct MapDragPreview {
 final class TopicLayer {
     let layer = CALayer()
     private let text = TopicTextRenderer()
+    private var iconLayer: CALayer?
+    private var detailRenderer: TopicTextRenderer?
+    private var previousDetail: String?
+    private var previousDetailColor: CGColor?
+    private var attributedDetail = NSAttributedString(string: "")
     private let disclosureLayer = CAShapeLayer()
     private let disclosureGlyph = CAShapeLayer()
     private let disclosureCount = TopicTextRenderer()
@@ -37,26 +42,66 @@ final class TopicLayer {
     }
 
     func configure(
-        node: TextNode, descendantCount: Int, root: Bool, selected: Bool, scale: CGFloat, backingScale: CGFloat
+        node: MapNode, descendantCount: Int, root: Bool, selected: Bool, scale: CGFloat, contentsScale: CGFloat,
+        runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool
     ) {
-        let title = node.text.isEmpty ? "New topic" : node.text
-        let foreground = (node.text.isEmpty ? NSColor.secondaryLabelColor : .labelColor).cgColor
-        if previousText != title || previousRoot != root || previousColor != foreground {
+        let title = node.title
+        let detail = runtimeDetail ?? node.detail
+        let isResource = node.content.kind != .text
+        let emphasizesTitle = root || isResource
+        let foreground = (node.text.isEmpty && !isResource ? NSColor.secondaryLabelColor : .labelColor).cgColor
+        if previousText != title || previousRoot != emphasizesTitle || previousColor != foreground {
             attributedTitle = NSAttributedString(
                 string: title,
                 attributes: [
-                    .font: CanvasStyle.font(root: root), .foregroundColor: NSColor(cgColor: foreground) ?? .labelColor,
+                    .font: CanvasStyle.font(root: emphasizesTitle),
+                    .foregroundColor: NSColor(cgColor: foreground) ?? .labelColor,
                 ])
             previousText = title
-            previousRoot = root
+            previousRoot = emphasizesTitle
             previousColor = foreground
         }
         let bounds = layer.bounds
-        text.layer.isHidden = scale < CanvasStyle.textDetailScale
+        let textX = MapMetrics.horizontalPadding + (isResource ? MapMetrics.resourceIconInset : 0)
+        let textWidth = bounds.width - textX - MapMetrics.horizontalPadding
+        let titleHeight =
+            isResource
+            ? bounds.height - MapMetrics.resourceDetailHeight - MapMetrics.verticalPadding * 2 : bounds.height
+        let titlePadding = CGSize(width: textX, height: isResource ? 0 : MapMetrics.verticalPadding)
         text.configure(
-            attributedTitle,
-            size: CGSize(width: bounds.width - MapMetrics.horizontalPadding * 2, height: bounds.height),
-            contentsScale: backingScale * max(1, ceil(scale)))
+            attributedTitle, size: CGSize(width: textWidth, height: titleHeight),
+            contentsScale: contentsScale, padding: titlePadding)
+        let hidesText = scale < CanvasStyle.textDetailScale
+        text.layer.isHidden = hidesText || isEditingTitle
+        configureIcon(resourceIcon)
+        if isResource {
+            text.layer.frame.origin.y = detail == nil ? (bounds.height - titleHeight) / 2 : MapMetrics.verticalPadding
+        }
+        if let detail {
+            let renderer = detailRenderer ?? TopicTextRenderer()
+            if detailRenderer == nil {
+                layer.addSublayer(renderer.layer)
+                detailRenderer = renderer
+            }
+            let color = NSColor.secondaryLabelColor.cgColor
+            if previousDetail != detail || previousDetailColor != color {
+                attributedDetail = NSAttributedString(
+                    string: detail,
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 11),
+                        .foregroundColor: NSColor(cgColor: color) ?? .secondaryLabelColor,
+                    ])
+                previousDetail = detail
+                previousDetailColor = color
+            }
+            renderer.configure(
+                attributedDetail, size: CGSize(width: textWidth, height: MapMetrics.resourceDetailHeight),
+                contentsScale: contentsScale, padding: CGSize(width: textX, height: 0))
+            renderer.layer.frame.origin.y = MapMetrics.verticalPadding + titleHeight
+            renderer.layer.isHidden = hidesText
+        } else {
+            detailRenderer?.layer.isHidden = true
+        }
         layer.backgroundColor = NSColor.controlBackgroundColor.cgColor
         layer.borderColor =
             (selected ? NSColor.controlAccentColor : root ? NSColor.secondaryLabelColor : .separatorColor).cgColor
@@ -98,11 +143,30 @@ final class TopicLayer {
                 disclosureCount.configure(
                     attributedCount,
                     size: CGSize(width: frame.width - CanvasStyle.disclosureCountPadding * 2, height: frame.height),
-                    contentsScale: backingScale * max(1, ceil(scale)),
+                    contentsScale: contentsScale,
                     padding: CGSize(width: CanvasStyle.disclosureCountPadding, height: 0))
             }
             disclosureGlyph.path = path
         }
+    }
+
+    private func configureIcon(_ image: CGImage?) {
+        guard let image else {
+            iconLayer?.isHidden = true
+            return
+        }
+        let icon = iconLayer ?? CALayer()
+        if iconLayer == nil {
+            icon.cornerRadius = CanvasStyle.nodeRadius
+            layer.addSublayer(icon)
+            iconLayer = icon
+        }
+        let size = MapMetrics.resourceIconSize
+        icon.frame = CGRect(
+            x: MapMetrics.horizontalPadding, y: (layer.bounds.height - size) / 2, width: size, height: size)
+        icon.backgroundColor = NSColor.tertiarySystemFill.cgColor
+        if icon.contents as AnyObject? !== image { icon.contents = image }
+        icon.isHidden = false
     }
 }
 
@@ -146,6 +210,9 @@ final class MapRenderer {
     private var topics: [UUID: TopicLayer] = [:]
     private var connectorBatches: [BatchKey: ConnectorBatch] = [:]
     private var reusableTopics: [TopicLayer] = []
+    private var resourceIconImages: [NodeKind: CGImage] = [:]
+    private var resourceIconScale: CGFloat = 0
+    private var resourceIconColor: CGColor?
 
     init(layer: CALayer) {
         world.anchorPoint = .zero
@@ -159,9 +226,24 @@ final class MapRenderer {
         dropIndicator.lineDashPattern = [4, 3]
     }
 
+    private func resourceIcons(contentsScale: CGFloat) -> [NodeKind: CGImage] {
+        let color = NSColor.labelColor.cgColor
+        if resourceIconScale != contentsScale || resourceIconColor != color {
+            resourceIconScale = contentsScale
+            resourceIconColor = color
+            resourceIconImages.removeAll(keepingCapacity: true)
+            for kind in NodeKind.allCases where kind != .text {
+                resourceIconImages[kind] = CanvasStyle.resourceIcon(
+                    named: kind.symbol, color: NSColor(cgColor: color) ?? .labelColor, contentsScale: contentsScale)
+            }
+        }
+        return resourceIconImages
+    }
+
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
-        selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil
+        selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
+        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil
     ) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -208,6 +290,8 @@ final class MapRenderer {
         for id in Array(trees.keys) where rootIndex[id] == nil {
             trees.removeValue(forKey: id)?.removeFromSuperlayer()
         }
+        let contentsScale = backingScale * max(1, ceil(camera.scale))
+        var icons: [NodeKind: CGImage]?
         for id in visible {
             guard let placement = layout.nodes[id], let node = board.nodes[id],
                 let tree = trees[placement.rootID], let origin = rootIndex[placement.rootID]
@@ -224,10 +308,15 @@ final class MapRenderer {
             }
             topic.layer.frame = frame
             topic.layer.opacity = drag?.topLevelIDs.contains(id) == true && drag?.rootIDs.contains(id) != true ? 0.7 : 1
+            let kind = node.content.kind
+            if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
+                icons = resourceIcons(contentsScale: contentsScale)
+            }
             topic.configure(
                 node: node, descendantCount: placement.descendantCount, root: placement.depth == 0,
                 selected: selection.contains(id),
-                scale: camera.scale, backingScale: backingScale
+                scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
+                resourceIcon: icons?[kind], isEditingTitle: editingTitleID == id
             )
         }
 

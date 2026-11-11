@@ -21,7 +21,7 @@ import Testing
         }
         """
     let archive = try JSONDecoder().decode(WorkspaceArchive.self, from: Data(legacy.utf8)).validated()
-    #expect(archive.schemaVersion == 6)
+    #expect(archive.schemaVersion == 7)
     #expect(archive.boards.first?.nodes[root]?.content == .text)
     #expect(archive.boards.first?.nodes[root]?.text == "Original text")
     #expect(archive.boards.first?.roots.first?.position == CGPoint(x: 30, y: 60))
@@ -62,7 +62,7 @@ import Testing
 
     let migrated = try JSONDecoder().decode(WorkspaceArchive.self, from: JSONEncoder().encode(archive)).validated()
     let result = try #require(migrated.boards.first)
-    #expect(migrated.schemaVersion == 6)
+    #expect(migrated.schemaVersion == 7)
     #expect(migrated.selectedBoardID == board.id)
     #expect(migrated.cameras[board.id] == camera)
     #expect(result.roots == board.roots)

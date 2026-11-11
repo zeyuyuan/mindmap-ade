@@ -178,13 +178,19 @@ final class WorkspaceStore {
     private var deletedBoard: BoardDeletion?
     var lastBoardDeletionTime: ContinuousClock.Instant? { deletedBoard?.time }
     @ObservationIgnored var cameras: [UUID: MapCamera] = [:]
+    @ObservationIgnored private(set) var selections: [UUID: Set<UUID>] = [:]
     @ObservationIgnored var lastSelectedBoardID: UUID?
+    @ObservationIgnored private var agentPane: AgentPaneState?
+    @ObservationIgnored private var agentPaneWindowID: UUID?
     var dataDirectory: URL { disk.directory }
     let git = GitWorkspace()
+    let agentFiles: AgentRunFiles
     var agentRuns: [NodeAddress: AgentRun] = [:]
+    var recoveryIssues: [NodeAddress: AgentRecoveryIssue] = [:]
     var terminals: [NodeAddress: AgentTerminal] = [:]
     var connectedMapRuns: Set<UUID> = []
     var operations: Set<NodeAddress> = []
+    @ObservationIgnored var isQuitting = false
     @ObservationIgnored var mcpListener: MCPListener?
     @ObservationIgnored var mcpGrants: [String: MCPGrant] = [:]
     let commandCodeConnection: CommandCodeConnection
@@ -197,6 +203,7 @@ final class WorkspaceStore {
 
     init(disk: any WorkspacePersistence) {
         self.disk = disk
+        agentFiles = AgentRunFiles(workspace: disk.directory)
         commandCodeConnection = CommandCodeConnection(directory: disk.directory)
     }
 
@@ -219,18 +226,29 @@ final class WorkspaceStore {
         loadStarted = true
         do {
             let (archive, writable) = try await disk.load()
-            isReadOnly = !writable
             let value = archive ?? WorkspaceArchive(boards: [MindMapBoard()])
-            cameras = value.cameras
-            lastSelectedBoardID = value.selectedBoardID
-            boards = value.boards.map(makeSession)
+            var restoredRuns: [NodeAddress: AgentRun] = [:]
             for var run in value.agentRuns ?? [] {
+                if run.cli == .commandCode, run.checkout != nil, run.conversationID == nil {
+                    run.conversationID = await agentFiles.commandCodeSession(for: run.id)
+                }
                 if run.state.isActive {
-                    run.state = .interrupted
+                    run.state = run.state == .stopping ? .stopped : .interrupted
                     run.finishedAt = .now
                 }
-                agentRuns[run.address] = run
+                restoredRuns[run.address] = run
             }
+            if writable {
+                let kept = restoredRuns.values.flatMap { run in [run.id, run.previousSnapshotID].compactMap { $0 } }
+                await agentFiles.removeUnreferencedFiles(keeping: Set(kept))
+            }
+            isReadOnly = !writable
+            cameras = value.cameras
+            selections = value.selections ?? [:]
+            lastSelectedBoardID = value.selectedBoardID
+            boards = value.boards.map(makeSession)
+            agentPane = value.agentPane
+            agentRuns = restoredRuns
             saveState = .saved
             if !writable { errorMessage = "This workspace is open in another app instance. Changes are disabled." }
         } catch {
@@ -291,7 +309,35 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
+    func rememberSelection(_ selection: Set<UUID>, for id: UUID) {
+        guard selections[id] != selection else { return }
+        selections[id] = selection
+        scheduleSave()
+    }
+
+    func restoreAgentPane(for windowID: UUID) -> AgentPaneState? {
+        guard agentPaneWindowID == nil, let agentPane,
+            agentPane.widthShare.isFinite, (0...1).contains(agentPane.widthShare),
+            canOpenAgent(at: agentPane.address)
+        else { return nil }
+        agentPaneWindowID = windowID
+        return agentPane
+    }
+
+    func rememberAgentPane(_ pane: AgentPaneState?, from windowID: UUID) {
+        guard pane != nil || agentPaneWindowID == windowID else { return }
+        agentPaneWindowID = windowID
+        guard agentPane != pane else { return }
+        agentPane = pane
+        scheduleSave()
+    }
+
+    func releaseAgentPane(from windowID: UUID) {
+        if agentPaneWindowID == windowID { agentPaneWindowID = nil }
+    }
+
     func select(_ id: UUID?) {
+        guard lastSelectedBoardID != id else { return }
         lastSelectedBoardID = id
         scheduleSave()
     }
@@ -370,10 +416,12 @@ final class WorkspaceStore {
             return board
         }
         let runs = agentRuns.values.filter { run in
-            boards.contains { $0.id == run.address.boardID && $0.board.nodes[run.address.nodeID] != nil }
+            board(run.address.boardID)?.board.nodes[run.address.nodeID]?.content.kind == .agent
         }
         return WorkspaceArchive(
-            boards: snapshots, cameras: cameras, selectedBoardID: lastSelectedBoardID, agentRuns: Array(runs))
+            boards: snapshots, cameras: cameras, selectedBoardID: lastSelectedBoardID, agentRuns: Array(runs),
+            selections: selections.filter { board($0.key) != nil },
+            agentPane: agentPane.flatMap { canOpenAgent(at: $0.address) ? $0 : nil })
     }
 
     func scheduleSave() {

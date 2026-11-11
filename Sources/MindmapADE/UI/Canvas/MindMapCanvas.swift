@@ -50,7 +50,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private let nativeHost = NativeNodeHostView()
     private var camera = MapCamera()
     private var hasCamera = false
-    private var cameraSave: DispatchWorkItem?
     private var selected = Set<UUID>()
     private var editor: TopicTextView?
     private var worktreeNameField: NSTextField?
@@ -80,6 +79,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var lastDrag: CGPoint?
     private var pressedNode: UUID?
     private var dragStarted = false
+    private var terminalClick: TerminalClick?
     private var isMarquee = false
     private var isPanning = false
     private var selectionBeforeMarquee = Set<UUID>()
@@ -100,6 +100,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         case blur, submit, keepDraft, cancel
     }
 
+    private enum TerminalClick {
+        case pressed, shown
+    }
+
     private enum DropTarget {
         case child(UUID)
         case sibling(UUID, after: Bool)
@@ -115,6 +119,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         self.actions = actions
         super.init(frame: .zero)
         wantsLayer = true
+        layer?.masksToBounds = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
         layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
         renderer = MapRenderer(layer: layer!)
@@ -123,7 +128,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             camera = saved
             hasCamera = true
         }
-        selected = Set(session.board.roots.prefix(1).map(\.id))
+        selected = workspace.selections[session.id] ?? Set(session.board.roots.prefix(1).map(\.id))
         actions.canvas = self
         setAccessibilityRole(.group)
         setAccessibilityLabel("Mind map canvas")
@@ -147,7 +152,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             mapLayout = .empty
             camera = workspace?.cameras[session.id] ?? MapCamera()
             hasCamera = workspace?.cameras[session.id] != nil
-            selected = Set(session.board.roots.prefix(1).map(\.id))
+            selected = workspace?.selections[session.id] ?? Set(session.board.roots.prefix(1).map(\.id))
             accessibilityNodes.removeAll()
             accessibilityDisclosures.removeAll()
         }
@@ -170,8 +175,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 else { return }
                 self.mapLayout = result
                 self.renderedRevision = revision
-                self.selected.formIntersection(result.nodes.keys)
-                if self.selected.isEmpty, let first = board.roots.first { self.selected = [first.id] }
+                if !self.selected.isEmpty {
+                    self.selected.formIntersection(result.nodes.keys)
+                    if self.selected.isEmpty, let first = board.roots.first { self.selected = [first.id] }
+                }
                 self.initializeCameraIfNeeded()
                 self.render()
                 self.positionEditor()
@@ -294,6 +301,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private func updateActions() {
+        workspace?.rememberSelection(selected, for: session.id)
         guard let actions else { return }
         actions.zoomLabel = CanvasStyle.zoomLabel(for: camera.scale)
         actions.canEdit = !selected.isEmpty && !session.isReadOnly
@@ -322,7 +330,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private func persistCamera() {
         guard hasCamera else { return }
-        cameraSave?.cancel()
         workspace?.rememberCamera(camera, for: session.id)
     }
 
@@ -330,10 +337,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         render()
         positionEditor()
         actions?.zoomLabel = CanvasStyle.zoomLabel(for: camera.scale)
-        cameraSave?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.persistCamera() }
-        cameraSave = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+        persistCamera()
     }
 
     private func localPoint(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
@@ -420,9 +424,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard let node = session.board.nodes[id] else { return }
         if node.content.kind == .text {
             beginEditing(id)
-        } else if node.content.kind == .agent,
-            workspace?.terminals[NodeAddress(boardID: session.id, nodeID: id)] != nil
-        {
+        } else if workspace?.canOpenAgent(at: NodeAddress(boardID: session.id, nodeID: id)) == true {
             actions?.showTerminal(at: NodeAddress(boardID: session.id, nodeID: id))
         } else {
             configureNode(id)
@@ -1004,6 +1006,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     override func mouseDown(with event: NSEvent) {
+        let terminalWasShown = terminalClick == .shown
+        terminalClick = nil
+        // Opening the pane can move the topic out from under the second click.
+        if terminalWasShown && event.clickCount == 2 && isUnmodifiedLeftButton(event) { return }
+
         closeNodeForm()
         actions?.activateTarget()
         finishEditing()
@@ -1027,6 +1034,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         dragStarted = false
         isPanning = isSpaceDown || event.buttonNumber == 2 || (id == nil && !event.modifierFlags.contains(.shift))
         isMarquee = id == nil && event.modifierFlags.contains(.shift)
+        if id != nil, !isPanning, event.clickCount == 1, isUnmodifiedLeftButton(event) {
+            terminalClick = .pressed
+        }
         selectionBeforeMarquee = selected
         if let id, !isPanning {
             if event.modifierFlags.contains(.command) {
@@ -1127,6 +1137,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     override func mouseUp(with event: NSEvent) {
+        let isTerminalClick = terminalClick == .pressed
+        terminalClick = nil
         defer {
             dragStart = nil
             lastDrag = nil
@@ -1145,7 +1157,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             render()
             updateActions()
         }
-        guard dragStarted, !draggedBranches.isEmpty else { return }
+        guard dragStarted else {
+            if isTerminalClick { showTerminalForClick(event) }
+            return
+        }
+        guard !draggedBranches.isEmpty else { return }
         let positions = Dictionary(
             uniqueKeysWithValues: draggedBranches.compactMap { id -> (UUID, CGPoint)? in
                 guard let placement = mapLayout.nodes[id] else { return nil }
@@ -1171,6 +1187,32 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         }
         if session.apply(edit, named: "Move Branch") { actions?.hint = EditorActions.defaultHint }
         changed()
+    }
+
+    private func isUnmodifiedLeftButton(_ event: NSEvent) -> Bool {
+        event.buttonNumber == 0 && event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+    }
+
+    private func showTerminalForClick(_ event: NSEvent) {
+        guard isUnmodifiedLeftButton(event), !isSpaceDown, let id = pressedNode, selected == [id],
+            session.board.nodes[id]?.content.kind == .agent, let start = dragStart, let workspace, let actions
+        else { return }
+        let point = localPoint(event)
+        guard hypot(point.x - start.x, point.y - start.y) < CanvasStyle.dragThreshold,
+            mapLayout.hitTest(camera.worldPoint(point)) == id
+        else { return }
+
+        let address = NodeAddress(boardID: session.id, nodeID: id)
+        guard workspace.canOpenAgent(at: address),
+            actions.terminalAddress != address
+                || workspace.terminals[address].map({ $0.owner != actions.windowID }) == true
+        else { return }
+        let paneIsVisible =
+            actions.terminalAddress.map { current in
+                current.boardID == session.id && workspace.canOpenAgent(at: current)
+            } ?? false
+        actions.showTerminal(at: address, revealNode: !paneIsVisible)
+        terminalClick = .shown
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -1426,7 +1468,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 add("Edit Worktree Name", #selector(editAction(_:)), symbol: "pencil", key: editKey)
             } else {
                 let address = NodeAddress(boardID: session.id, nodeID: node.id)
-                let opensTerminal = kind == .agent && workspace?.terminals[address] != nil
+                let opensTerminal = workspace?.canOpenAgent(at: address) == true
                 if opensTerminal {
                     add("Open Terminal", #selector(editAction(_:)), symbol: NodeKind.agent.symbol, key: editKey)
                 }

@@ -5,6 +5,7 @@ nonisolated enum AgentCLI {
     struct Executable: Sendable {
         let path: String
         var supportsNoDaemon = false
+        var supportsSessionIntegration = false
     }
 
     static func unavailable(_ cli: AgentCLIKind) -> String {
@@ -22,16 +23,22 @@ nonisolated enum AgentCLI {
             let path = file.deletingLastPathComponent().resolvingSymlinksInPath()
                 .appendingPathComponent(file.lastPathComponent).path
             guard visited.insert(path).inserted, isExecutableFile(path) else { continue }
-            if cli == .commandCode { return Executable(path: path) }
-
             // An executable npm shim can survive after its platform binary is removed.
             guard
                 let result = try? LocalCommand.run(
                     executable: path, arguments: ["--help"], directory: "/",
                     environment: environment(executable: path), timeout: .seconds(3)),
-                result.status == 0, result.output.contains("Codex CLI")
+                result.status == 0
             else { continue }
-            return Executable(path: path, supportsNoDaemon: result.output.contains("--no-daemon"))
+            let help = result.output
+            if cli == .commandCode {
+                return Executable(
+                    path: path, supportsSessionIntegration: help.contains("--mod") && help.contains("--session"))
+            }
+            guard help.contains("Codex CLI") else { continue }
+            return Executable(
+                path: path, supportsNoDaemon: help.contains("--no-daemon"),
+                supportsSessionIntegration: help.contains("app-server") && help.contains("resume"))
         }
         return nil
     }
@@ -54,16 +61,20 @@ nonisolated enum AgentCLI {
         values["LANG"] = values["LANG"] ?? "en_US.UTF-8"
         values.removeValue(forKey: "MINDMAP_MCP_SOCKET")
         values.removeValue(forKey: "MINDMAP_MCP_TOKEN")
+        values.removeValue(forKey: "MINDMAP_AGENT_SESSION_FILE")
         return values
     }
 
-    static func arguments(for topic: AgentTopic, executable: Executable, context: String, mcpBridge: String) throws
-        -> [String]
-    {
+    static func arguments(
+        for topic: AgentTopic, executable: Executable, context: String, mcpBridge: String,
+        conversationID: UUID?, isResuming: Bool, commandCodeMod: String?
+    ) throws -> [String] {
         var arguments: [String]
         switch topic.cli {
         case .commandCode:
             arguments = ["--no-auto-update"]
+            if let commandCodeMod { arguments += ["--mod", commandCodeMod] }
+            if let conversationID { arguments += ["--session", conversationID.uuidString.lowercased()] }
         case .codex:
             let encoder = JSONEncoder()
             encoder.outputFormatting = .withoutEscapingSlashes
@@ -72,8 +83,9 @@ nonisolated enum AgentCLI {
             arguments = ["-c", "mcp_servers.mindmap_ade={command=\(command),\(transport)}"]
             // The map grant is in this process's environment, not the shared daemon's.
             if executable.supportsNoDaemon { arguments.append("--no-daemon") }
+            if let conversationID { arguments += ["resume", conversationID.uuidString.lowercased()] }
         }
-        if !topic.task.isEmpty { arguments += ["--", context + topic.task] }
+        if !isResuming, !topic.task.isEmpty { arguments += ["--", context + topic.task] }
         guard arguments.allSatisfy({ !$0.contains("\0") }), arguments.reduce(0, { $0 + $1.utf8.count }) < 96_000
         else { throw WorkspaceIssue("The CLI arguments contain an invalid character or are too long.") }
         return arguments

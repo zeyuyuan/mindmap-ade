@@ -1,23 +1,27 @@
 import Foundation
 
 public struct WorkspaceArchive: Codable, Sendable {
-    private static let currentVersion = 6
+    private static let currentVersion = 7
 
     public var schemaVersion: Int
     public var boards: [MindMapBoard]
     public var cameras: [UUID: MapCamera]
     public var selectedBoardID: UUID?
     public var agentRuns: [AgentRun]?
+    public var selections: [UUID: Set<UUID>]?
+    public var agentPane: AgentPaneState?
 
     public init(
         boards: [MindMapBoard], cameras: [UUID: MapCamera] = [:], selectedBoardID: UUID? = nil,
-        agentRuns: [AgentRun] = []
+        agentRuns: [AgentRun] = [], selections: [UUID: Set<UUID>] = [:], agentPane: AgentPaneState? = nil
     ) {
         schemaVersion = Self.currentVersion
         self.boards = boards
         self.cameras = cameras
         self.selectedBoardID = selectedBoardID
         self.agentRuns = agentRuns
+        self.selections = selections
+        self.agentPane = agentPane
     }
 
     public func validated() throws -> Self {
@@ -32,7 +36,7 @@ public struct WorkspaceArchive: Codable, Sendable {
             })
         else { throw BoardValidationError.invalidStructure }
         var migrated = self
-        if schemaVersion < Self.currentVersion {
+        if schemaVersion < 6 {
             migrated.boards = boards.map { original in
                 var board = schemaVersion < 4 ? original.removingLegacyBranchNodes() : original
                 board.flattenProjectCheckouts()

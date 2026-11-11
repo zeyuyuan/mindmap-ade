@@ -5,6 +5,7 @@ import SwiftUI
 struct RootView: View {
     let workspace: WorkspaceStore
     @State private var selectedBoardID: UUID?
+    @State private var didRestoreWorkspace = false
     @State private var actions = EditorActions()
     @State private var renamingID: UUID?
     @State private var boardName = ""
@@ -27,10 +28,14 @@ struct RootView: View {
         .task {
             actions.workspace = workspace
             await workspace.loadIfNeeded()
-            if selectedBoardID == nil {
-                selectedBoardID = workspace.board(workspace.lastSelectedBoardID)?.id ?? workspace.boards.first?.id
-                actions.targetBoardID = selectedBoardID
-            }
+        }
+        .onChange(of: workspace.isLoading, initial: true) { _, isLoading in
+            guard !isLoading, !didRestoreWorkspace else { return }
+            actions.workspace = workspace
+            selectedBoardID = workspace.board(workspace.lastSelectedBoardID)?.id ?? workspace.boards.first?.id
+            actions.targetBoardID = selectedBoardID
+            actions.restoreTerminalPane()
+            didRestoreWorkspace = true
         }
         .onChange(of: actions.requestedBoardID) { _, id in
             if let id {
@@ -42,8 +47,12 @@ struct RootView: View {
             actions.targetBoardID = id
             workspace.select(id)
         }
-        .onDisappear { actions.hideTerminal() }
+        .onDisappear {
+            actions.detachTerminal()
+            workspace.releaseAgentPane(from: actions.windowID)
+        }
         .onChange(of: workspace.boards.map(\.id)) { _, ids in
+            guard didRestoreWorkspace else { return }
             if !ids.contains(where: { $0 == selectedBoardID }) { selectedBoardID = ids.first }
         }
     }
@@ -130,7 +139,6 @@ private struct BoardCanvasContent: View {
     let session: BoardSession
     let workspace: WorkspaceStore
     let actions: EditorActions
-    @State private var terminalWidthShare: CGFloat = 0.5
     @State private var projectCheckoutLabels: [ProjectLocation: String] = [:]
     @State private var activationCount = 0
 
@@ -149,21 +157,19 @@ private struct BoardCanvasContent: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let address = actions.terminalAddress, address.boardID == session.id,
-                    let terminal = workspace.terminals[address], session.board.nodes[address.nodeID] != nil
+                    workspace.canOpenAgent(at: address)
                 {
                     let available = max(0, geometry.size.width - CanvasStyle.terminalResizeHandleWidth)
-                    let width = boundedTerminalWidth(available * terminalWidthShare, available: available)
+                    let width = boundedTerminalWidth(available * actions.terminalWidthShare, available: available)
                     TerminalDivider(width: width) { proposed in
                         if available > 0 {
-                            terminalWidthShare = boundedTerminalWidth(proposed, available: available) / available
+                            actions.resizeTerminal(to: boundedTerminalWidth(proposed, available: available) / available)
                         }
                     }
                     .frame(width: CanvasStyle.terminalResizeHandleWidth)
-                    AgentTerminalPane(
-                        address: address, session: session, workspace: workspace, actions: actions, terminal: terminal
-                    )
-                    .frame(width: width)
-                    .id(address)
+                    AgentTerminalPane(address: address, session: session, workspace: workspace, actions: actions)
+                        .frame(width: width)
+                        .id(address)
                 }
             }
         }

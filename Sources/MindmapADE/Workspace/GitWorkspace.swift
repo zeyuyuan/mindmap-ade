@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import MindMapCore
 
@@ -10,6 +11,11 @@ struct WorkspaceIssue: LocalizedError, Sendable {
 
 /// All Git operations for a workspace run away from the UI, including checkout.
 actor GitWorkspace {
+    struct AgentCheckout: Sendable {
+        let location: WorktreeLocation
+        let identity: String
+    }
+
     func project(at path: String) throws -> ProjectLocation {
         let directory = try availableDirectory(path)
         let root: String
@@ -59,6 +65,15 @@ actor GitWorkspace {
             try self.project(at: directory).gitCommonDirectory == tree.gitCommonDirectory
         else { throw WorkspaceIssue("Choose a worktree registered with this repository.") }
         return tree
+    }
+
+    func agentCheckout(_ path: String, in project: ProjectLocation) throws -> AgentCheckout {
+        let location = try existing(path, in: project)
+        let gitDirectory = try git(["rev-parse", "--absolute-git-dir"], in: location.directory)
+        // Git can reuse both paths when a checkout is removed and created again.
+        let folderIdentity = try directoryIdentity(location.directory)
+        let gitIdentity = try directoryIdentity(gitDirectory)
+        return AgentCheckout(location: location, identity: "\(folderIdentity):\(gitIdentity)")
     }
 
     func plan(
@@ -184,6 +199,15 @@ actor GitWorkspace {
             directory.boolValue, FileManager.default.isReadableFile(atPath: path)
         else { throw WorkspaceIssue("The selected folder is unavailable or unreadable.") }
         return canonical(path)
+    }
+
+    private func directoryIdentity(_ path: String) throws -> String {
+        var info = stat()
+        guard stat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
+            throw WorkspaceIssue("The original worktree or its Git directory is unavailable.")
+        }
+        let birth = info.st_birthtimespec
+        return "\(info.st_ino)/\(birth.tv_sec)/\(birth.tv_nsec)"
     }
 
     private func pathExists(_ path: String) -> Bool {

@@ -376,7 +376,7 @@ struct AgentWorkspaceTests {
         #expect(try toolResult(register)["draftAgentId"] != nil)
         #expect(session.board.context(above: agent.id).worktree?.directory == location.directory)
         #expect(await disk.snapshot().boards[0].nodes.count == 6)
-        try await workspace.stopAllAgents()
+        try await workspace.interruptAllAgents()
         let ended = try await request(connection, token: token, method: "tools/list")
         #expect(ended["error"] != nil)
         #expect(
@@ -391,10 +391,28 @@ struct AgentWorkspaceTests {
             "test-codex",
             #"""
             #!/bin/sh
+            id=0189aaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa
+            if [ "$1" = app-server ]; then
+                transcript="$PWD/codex-session.jsonl"
+                while IFS= read -r line; do
+                    case "$line" in
+                        *'"initialize"'*) printf '{"id":1,"result":{}}\n' ;;
+                        *'"thread/start"'*)
+                            printf '{"id":2,"result":{"thread":{"id":"%s","path":"%s"}}}\n' "$id" "$transcript"
+                            ;;
+                        *'"thread/name/set"'*) touch "$transcript"; printf '{"id":3,"result":{}}\n' ;;
+                        *'"thread/read"'*)
+                            printf '{"id":2,"result":{"thread":{"id":"%s","path":"%s"}}}\n' "$id" "$transcript"
+                            ;;
+                    esac
+                done
+                exit 0
+            fi
             test -t 0 || exit 21
             [ -S "$MINDMAP_MCP_SOCKET" ] && [ -n "$MINDMAP_MCP_TOKEN" ] || exit 22
             [ "$1" = -c ] && [ "$3" = --no-daemon ] || exit 23
             case "$2" in mcp_servers.mindmap_ade=*--mindmap-mcp*) ;; *) exit 24 ;; esac
+            [ "$4" = resume ] && [ "$5" = "$id" ] || exit 25
             pwd -P > codex-directory
             exec /bin/sleep 30
             """#)
@@ -416,11 +434,10 @@ struct AgentWorkspaceTests {
         await workspace.loadIfNeeded()
         let address = NodeAddress(boardID: board.id, nodeID: agent.id)
 
-        try await workspace.launchAgent(
-            topic, at: address,
-            detectCLI: { cli in
-                cli == .codex ? .init(path: executable.path, supportsNoDaemon: true) : nil
-            })
+        let detectCLI: @MainActor (AgentCLIKind) async -> AgentCLI.Executable? = { cli in
+            cli == .codex ? .init(path: executable.path, supportsNoDaemon: true, supportsSessionIntegration: true) : nil
+        }
+        try await workspace.launchAgent(topic, at: address, detectCLI: detectCLI)
         defer { workspace.stopAgent(at: address) }
         let marker = checkout.appendingPathComponent("codex-directory")
         try await waitUntil { FileManager.default.fileExists(atPath: marker.path) }
@@ -430,7 +447,7 @@ struct AgentWorkspaceTests {
         let connection = try #require(workspace.mcpListener).path
         let tools = try await request(connection, token: token, method: "tools/list")
         #expect(tools["result"] != nil)
-        try await workspace.stopAllAgents()
+        try await workspace.interruptAllAgents()
         let ended = try await request(connection, token: token, method: "tools/list")
         #expect(ended["error"] != nil)
 
@@ -442,7 +459,175 @@ struct AgentWorkspaceTests {
             return
         }
         #expect(saved.cli == .codex)
-        #expect(archive.agentRuns?.first?.cli == .codex)
+        let run = try #require(archive.agentRuns?.first)
+        #expect(run.cli == .codex)
+        #expect(run.state == .interrupted)
+        #expect(run.conversationID == UUID(uuidString: "0189aaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"))
+        try FileManager.default.removeItem(at: marker)
+        let restored = WorkspaceStore(disk: disk)
+        await restored.loadIfNeeded()
+        try await restored.resumeAgent(at: address, detectCLI: detectCLI)
+        defer { restored.stopAgent(at: address) }
+        try await waitUntil { FileManager.default.fileExists(atPath: marker.path) }
+        #expect(restored.agentRuns[address]?.conversationID == run.conversationID)
+        #expect(restored.agentRuns[address]?.id != run.id)
+        try await restored.interruptAllAgents()
+    }
+
+    @Test func agentRecoveryRestoresThePaneAndRequiresConfirmationAfterASwitch() async throws {
+        _ = NSApplication.shared
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let id = try #require(UUID(uuidString: "4f371e83-3a27-4474-b85d-2fd93212a841"))
+        let executable = try fixture.commandCodeStub(
+            #"""
+            id=4f371e83-3a27-4474-b85d-2fd93212a841
+            printf '%s' "$id" > "$MINDMAP_AGENT_SESSION_FILE"
+            if [ "$4" = --session ]; then
+                [ "$5" = "$id" ] && [ "$#" = 5 ] || exit 25
+                echo "Original conversation resumed"
+                echo "$id" > resumed
+            else
+                [ "$4" = -- ] && [ "$#" = 5 ] || exit 26
+                echo "Output from the original terminal"
+                echo "$id" > started
+            fi
+            exec /bin/sleep 30
+            """#)
+        let git = GitWorkspace()
+        var project = ProjectTopic()
+        let binding = try await git.project(at: fixture.repository.path)
+        project.location = binding
+        let root = MapNode(content: .project(project))
+        let checkout = fixture.home.appendingPathComponent("Recoverable Worktree")
+        try fixture.git(["worktree", "add", "-b", "recovery", checkout.path, "HEAD"])
+        let location = try await git.existing(checkout.path, in: binding)
+        let tree = MapNode(content: .worktree(WorktreeTopic(location: location)))
+        let topic = AgentTopic(task: "Initial prompt")
+        let node = MapNode(content: .agent(topic))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(tree, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(node, parent: tree.id)).edit)
+
+        let disk = LaunchTestDisk(directory: fixture.data, board: board)
+        let workspace = WorkspaceStore(disk: disk)
+        await workspace.loadIfNeeded()
+        let address = NodeAddress(boardID: board.id, nodeID: node.id)
+        let detectCLI: @MainActor (AgentCLIKind) async -> AgentCLI.Executable? = { _ in
+            .init(path: executable.path, supportsSessionIntegration: true)
+        }
+        try await workspace.launchAgent(topic, at: address, detectCLI: detectCLI)
+        defer { workspace.stopAgent(at: address) }
+        try await waitUntil { FileManager.default.fileExists(atPath: checkout.appendingPathComponent("started").path) }
+        let camera = MapCamera(scale: 1.5, translation: CGPoint(x: 24, y: 52))
+        workspace.rememberCamera(camera, for: board.id)
+        workspace.rememberSelection([node.id], for: board.id)
+        workspace.select(board.id)
+        let actions = EditorActions()
+        actions.workspace = workspace
+        actions.showTerminal(at: address)
+        actions.resizeTerminal(to: 0.43)
+        try await workspace.interruptAllAgents()
+        try await workspace.flush()
+
+        let obsoleteRunID = UUID()
+        try await workspace.agentFiles.saveSnapshot(Data("Obsolete output".utf8), for: obsoleteRunID)
+        let restored = WorkspaceStore(disk: disk)
+        await restored.loadIfNeeded()
+        let restoredActions = EditorActions()
+        restoredActions.workspace = restored
+        restoredActions.restoreTerminalPane()
+        #expect(restored.lastSelectedBoardID == board.id)
+        #expect(restored.cameras[board.id] == camera)
+        #expect(restored.selections[board.id] == [node.id])
+        #expect(restoredActions.terminalAddress == address)
+        #expect(restoredActions.terminalWidthShare == 0.43)
+        let run = try #require(restored.agentRuns[address])
+        #expect(run.state == .interrupted)
+        #expect(run.conversationID == id)
+        #expect(await restored.agentFiles.snapshot(for: run.id) == "Output from the original terminal")
+        #expect(await restored.agentFiles.snapshot(for: obsoleteRunID) == nil)
+
+        let secondWindow = EditorActions()
+        secondWindow.workspace = restored
+        secondWindow.restoreTerminalPane()
+        #expect(secondWindow.terminalAddress == nil)
+        restoredActions.detachTerminal()
+        restored.releaseAgentPane(from: restoredActions.windowID)
+        secondWindow.restoreTerminalPane()
+        #expect(secondWindow.terminalAddress == address)
+        #expect(secondWindow.terminalWidthShare == 0.43)
+
+        await disk.rejectLaunchSave(true)
+        await #expect(throws: CocoaError.self) {
+            try await restored.launchAgent(topic, at: address, detectCLI: detectCLI)
+        }
+        await disk.rejectLaunchSave(false)
+        #expect(restored.agentRuns[address] == run)
+        #expect(await restored.agentFiles.snapshot(for: run.id) == "Output from the original terminal")
+
+        try fixture.git(["-C", checkout.path, "switch", "-c", "switched"])
+        let switched = "refs/heads/switched"
+        await #expect(throws: AgentRecoveryIssue.checkoutChanged(previous: "refs/heads/recovery", current: switched)) {
+            try await restored.resumeAgent(at: address, detectCLI: detectCLI)
+        }
+        #expect(restored.terminals[address] == nil)
+        try await restored.resumeAgent(at: address, confirmedCheckout: switched, detectCLI: detectCLI)
+        defer { restored.stopAgent(at: address) }
+        let marker = checkout.appendingPathComponent("resumed")
+        try await waitUntil { FileManager.default.fileExists(atPath: marker.path) }
+        #expect(restored.agentRuns[address]?.conversationID == id)
+        #expect(restored.agentRuns[address]?.previousSnapshotID == run.id)
+        #expect(restored.agentRuns[address]?.checkout == switched)
+
+        restored.stopAgent(at: address)
+        try await restored.interruptAllAgents()
+        try await restored.flush()
+        let stopped = WorkspaceStore(disk: disk)
+        await stopped.loadIfNeeded()
+        defer { stopped.stopAgent(at: address) }
+        let stoppedRun = try #require(stopped.agentRuns[address])
+        stopped.requestAgentResume(at: address, owner: UUID(), automatically: true)
+        #expect(stopped.agentRuns[address]?.state == .stopped)
+        #expect(stopped.terminals[address] == nil)
+        #expect(await stopped.agentFiles.snapshot(for: stoppedRun.id) == "Original conversation resumed")
+
+        try fixture.git(["worktree", "remove", "--force", checkout.path])
+        await #expect(throws: WorkspaceIssue.self) {
+            try await stopped.resumeAgent(at: address, detectCLI: detectCLI)
+        }
+        #expect(stopped.agentRuns[address]?.id == stoppedRun.id)
+        #expect(await stopped.agentFiles.snapshot(for: stoppedRun.id) == "Original conversation resumed")
+
+        try fixture.git(["worktree", "add", checkout.path, "switched"])
+        let replacement = try await git.agentCheckout(checkout.path, in: binding)
+        #expect(replacement.location.directory == stoppedRun.directory)
+        #expect(replacement.location.branch == "switched")
+        #expect(replacement.identity != stoppedRun.worktreeIdentity)
+        await #expect(throws: WorkspaceIssue.self) {
+            try await stopped.resumeAgent(at: address, detectCLI: detectCLI)
+        }
+        #expect(stopped.agentRuns[address]?.id == stoppedRun.id)
+        #expect(stopped.terminals[address] == nil)
+    }
+
+    @Test func terminalOutputRemainsPendingUntilWritten() async throws {
+        _ = NSApplication.shared
+        let terminal = AgentTerminal()
+        try terminal.start(
+            executable: "/bin/sh", arguments: ["-c", "echo 'Pending output'; exec /bin/sleep 30"],
+            environment: AgentCLI.environment(executable: "/bin/sh"), directory: "/")
+        defer { terminal.stop() }
+        var output: Data?
+        try await waitUntil {
+            output = terminal.snapshotToSave()
+            return output != nil
+        }
+        let snapshot = try #require(output)
+        #expect(String(decoding: snapshot, as: UTF8.self) == "Pending output")
+        #expect(terminal.snapshotToSave() == snapshot)
+        terminal.didSaveSnapshot(snapshot)
+        #expect(terminal.snapshotToSave() == nil)
     }
 
     private func waitUntil(_ condition: () -> Bool) async throws {

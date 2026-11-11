@@ -7,36 +7,145 @@ struct AgentTerminalPane: View {
     let session: BoardSession
     let workspace: WorkspaceStore
     let actions: EditorActions
-    let terminal: AgentTerminal
+    @State private var output: String?
+    @State private var previousOutput: String?
+    @State private var showsPreviousOutput = false
+
+    private var run: AgentRun? { workspace.agentRuns[address] }
+    private var recoveryIssue: AgentRecoveryIssue? { workspace.recoveryIssues[address] }
+    private var hasSavedConversation: Bool { workspace.savedConversation(at: address) != nil }
+    private var isOpening: Bool {
+        workspace.operations.contains(address) && (run?.state.isActive != true || run?.state == .starting)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            if terminal.owner == actions.windowID {
-                TerminalAttachment(terminal: terminal)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .layoutPriority(1)
+            if let terminal = workspace.terminals[address], !showsPreviousOutput {
+                liveTerminal(terminal)
             } else {
-                VStack(spacing: CanvasStyle.formSpacing) {
-                    Text(
-                        terminal.owner == nil
-                            ? "Open this conversation's terminal here." : "The terminal is open in another window."
-                    )
-                    .multilineTextAlignment(.center)
-                    Button("Open Here") { terminal.owner = actions.windowID }
+                if run?.state.isActive != true || isOpening {
+                    recoveryActions
+                    Divider()
                 }
-                .padding(CanvasStyle.formSpacing)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                transcript
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .task {
+            workspace.requestAgentResume(at: address, owner: actions.windowID, automatically: true)
+        }
+        .task(id: run) {
+            guard let run else { return }
+            let latest = await workspace.agentFiles.snapshot(for: run.id)
+            let earlier =
+                if let id = run.previousSnapshotID { await workspace.agentFiles.snapshot(for: id) } else {
+                    nil as String?
+                }
+            guard !Task.isCancelled else { return }
+            output = latest
+            previousOutput = earlier
+            if earlier == nil { showsPreviousOutput = false }
+        }
+    }
+
+    @ViewBuilder
+    private func liveTerminal(_ terminal: AgentTerminal) -> some View {
+        if terminal.owner == actions.windowID {
+            TerminalAttachment(terminal: terminal)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+        } else {
+            VStack(spacing: CanvasStyle.formSpacing) {
+                Text(
+                    terminal.owner == nil
+                        ? "Open this conversation’s terminal here." : "The terminal is open in another window."
+                )
+                .multilineTextAlignment(.center)
+                Button("Open Here") { actions.showTerminal(at: address, revealNode: false) }
+            }
+            .padding(CanvasStyle.formSpacing)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var transcript: some View {
+        if let text = showsPreviousOutput ? previousOutput : (output ?? previousOutput) {
+            ScrollView {
+                Text(verbatim: text)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(CanvasStyle.statusHorizontalPadding)
+            }
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .accessibilityLabel("Terminal output")
+        } else if !isOpening {
+            Text("No terminal output was saved.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var recoveryActions: some View {
+        VStack(alignment: .leading, spacing: CanvasStyle.formCompactSpacing) {
+            if isOpening {
+                HStack(spacing: CanvasStyle.formSpacing) {
+                    ProgressView().controlSize(.small)
+                    Text("Opening conversation…")
+                }
+            } else if let run {
+                if let message = recoveryIssue?.errorDescription ?? run.error {
+                    Label(message, systemImage: "exclamationmark.triangle")
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if !hasSavedConversation {
+                    Text("There is no saved conversation for this Agent configuration.")
+                        .foregroundStyle(.secondary)
+                }
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: CanvasStyle.formSpacing) {
+                        recoveryButtons(for: run)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    VStack(alignment: .leading, spacing: CanvasStyle.formSpacing) {
+                        recoveryButtons(for: run)
+                    }
+                }
+                .disabled(workspace.isReadOnly)
+            }
+        }
+        .font(.callout)
+        .controlSize(.small)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, CanvasStyle.statusHorizontalPadding)
+        .padding(.vertical, CanvasStyle.statusVerticalPadding)
+    }
+
+    @ViewBuilder
+    private func recoveryButtons(for run: AgentRun) -> some View {
+        if hasSavedConversation {
+            Button(recoveryTitle(for: run)) {
+                showsPreviousOutput = false
+                workspace.requestAgentResume(at: address, owner: actions.windowID)
+            }
+        }
+        if !hasSavedConversation || recoveryIssue != nil || run.state == .failed {
+            Button("New Conversation…") { actions.canvas?.configureNode(address.nodeID) }
+        }
+    }
+
+    private func recoveryTitle(for run: AgentRun) -> String {
+        if recoveryIssue?.checkoutToConfirm != nil { return "Continue on This Branch" }
+        if recoveryIssue != nil || run.state == .failed { return "Try Again" }
+        return run.state == .stopped ? "Restart Terminal" : "Continue Conversation"
     }
 
     private var header: some View {
         let node = session.board.nodes[address.nodeID]
         let title = node?.title ?? "Agent"
-        let run = workspace.agentRuns[address]
         return VStack(alignment: .leading, spacing: CanvasStyle.formCompactSpacing) {
             HStack(spacing: CanvasStyle.formSpacing) {
                 Label(title, systemImage: "terminal")
@@ -73,17 +182,19 @@ struct AgentTerminalPane: View {
                     .labelStyle(.iconOnly)
                     .help("Copy the initial task")
                 }
+                if previousOutput != nil {
+                    Button(
+                        showsPreviousOutput ? "Show Latest Output" : "Show Previous Output",
+                        systemImage: showsPreviousOutput ? "terminal" : "clock.arrow.circlepath"
+                    ) { showsPreviousOutput.toggle() }
+                    .labelStyle(.iconOnly)
+                    .help(showsPreviousOutput ? "Show Latest Output" : "Show Previous Output")
+                }
                 if run?.state.isActive == true {
                     Button("Stop", systemImage: "stop.circle") { workspace.stopAgent(at: address) }
                         .labelStyle(.iconOnly)
                         .help("Stop Conversation")
                         .disabled(run?.state != .running)
-                } else {
-                    Button("Start Again", systemImage: "arrow.clockwise") {
-                        actions.canvas?.configureNode(address.nodeID)
-                    }
-                    .labelStyle(.iconOnly)
-                    .help("Start Again")
                 }
             }
         }

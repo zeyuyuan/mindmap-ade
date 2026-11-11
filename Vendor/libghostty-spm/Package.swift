@@ -1,0 +1,58 @@
+// swift-tools-version: 6.2
+import PackageDescription
+
+// Swift 6.2's upcoming features, on for every target so the package builds
+// the same under a host that enables them.
+let swiftSettings: [SwiftSetting] = [
+    .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+    .enableUpcomingFeature("InferIsolatedConformances"),
+    .enableUpcomingFeature("MemberImportVisibility"),
+    .enableUpcomingFeature("ExistentialAny"),
+]
+
+let package = Package(
+    name: "GhosttyKit",
+    defaultLocalization: "en",
+    platforms: [
+        .iOS(.v15),
+        .macOS(.v13),
+        .macCatalyst(.v15),
+        .visionOS(.v1),
+    ],
+    products: [
+        .library(name: "GhosttyKit", targets: ["GhosttyKit"]),
+        .library(name: "GhosttyTerminal", targets: ["GhosttyTerminal"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/Lakr233/DisplayLink.git", from: "3.0.1"),
+    ],
+    targets: [
+        .target(
+            name: "GhosttyKit",
+            dependencies: ["libghostty"],
+            path: "Sources/GhosttyKit",
+            swiftSettings: swiftSettings,
+            linkerSettings: [
+                .linkedLibrary("c++"),
+                .linkedFramework("Carbon", .when(platforms: [.macOS])),
+            ]
+        ),
+        .target(
+            name: "GhosttyTerminal",
+            dependencies: ["GhosttyKit", "DisplayLink"],
+            path: "Sources/GhosttyTerminal",
+            resources: [
+                .copy("Resources/Ghostty"),
+                .copy("Resources/terminfo"),
+                .process("Resources/Localization"),
+            ],
+            swiftSettings: swiftSettings
+        ),
+        .binaryTarget(
+            name: "libghostty",
+            url: "https://github.com/Lakr233/libghostty-spm/releases/download/upstream.042b16b6146a/GhosttyKit.xcframework.zip",
+            checksum: "1f5cd5cebcca5181ea5aaea008252a2b622ba1e94471601cf896ee125e9a5902"
+        ),
+    ],
+    swiftLanguageModes: [.v6]
+)

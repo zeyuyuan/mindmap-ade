@@ -48,6 +48,7 @@ final class MindmapAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let workspace else { return .terminateNow }
+        guard !workspace.isQuitting else { return .terminateLater }
         if !workspace.operations.isEmpty {
             let alert = NSAlert()
             alert.messageText = "A workspace operation is still running."
@@ -56,23 +57,19 @@ final class MindmapAppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
             return .terminateCancel
         }
-        if workspace.hasActiveWork() {
-            let alert = NSAlert()
-            alert.messageText = "Stop Agent conversations and quit?"
-            alert.informativeText = "Active CLI processes will stop. Their worktree files will remain on disk."
-            alert.addButton(withTitle: "Stop and Quit")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
-        }
+        workspace.isQuitting = true
         workspace.commitEdits()
         sender.keyWindow?.makeFirstResponder(nil)
         Task {
             do {
                 try await workspace.flush()
-                if workspace.hasActiveWork() || workspace.mcpListener != nil { try await workspace.stopAllAgents() }
+                if workspace.hasActiveWork() || workspace.mcpListener != nil {
+                    try await workspace.interruptAllAgents()
+                }
                 if workspace.saveState != .saved { try await workspace.flush() }
                 sender.reply(toApplicationShouldTerminate: true)
             } catch {
+                workspace.isQuitting = false
                 let alert = NSAlert()
                 alert.messageText = "Mindmap ADE could not quit."
                 alert.informativeText = error.localizedDescription

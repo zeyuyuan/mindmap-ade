@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import Observation
 import SwiftTerm
+import os
 
 @Observable
 final class AgentTerminal: NSObject, LocalProcessTerminalViewDelegate {
@@ -37,6 +38,10 @@ final class AgentTerminal: NSObject, LocalProcessTerminalViewDelegate {
     @ObservationIgnored let view: LocalProcessTerminalView
     var owner: UUID?
     @ObservationIgnored var didExit: ((Int32?, String?) -> Void)?
+    @ObservationIgnored var recording: Task<Void, Never>?
+    @ObservationIgnored private var savedSnapshot: Data?
+    @ObservationIgnored private var pendingSnapshot: Data?
+    @ObservationIgnored private let outputChanged = OSAllocatedUnfairLock(initialState: false)
     @ObservationIgnored private var stopTargets: StopTargets?
     @ObservationIgnored private var escalation: Task<Void, Never>?
 
@@ -48,6 +53,7 @@ final class AgentTerminal: NSObject, LocalProcessTerminalViewDelegate {
         super.init()
         view.processDelegate = self
         view.setAccessibilityLabel("Agent terminal")
+        view.setProcessOutputHandler { [outputChanged] in outputChanged.withLock { $0 = true } }
     }
 
     func start(executable: String, arguments: [String], environment: [String: String], directory: String) throws {
@@ -76,6 +82,29 @@ final class AgentTerminal: NSObject, LocalProcessTerminalViewDelegate {
             guard !Task.isCancelled else { return }
             self?.forceStop()
         }
+    }
+
+    func snapshotToSave() -> Data? {
+        let changed = outputChanged.withLock { value in
+            let changed = value
+            value = false
+            return changed
+        }
+        if changed {
+            let bytes = view.getBufferAsData()
+            let text = String(decoding: bytes.suffix(AgentRunFiles.maximumSnapshotBytes), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                let snapshot = Data(text.utf8.suffix(AgentRunFiles.maximumSnapshotBytes))
+                pendingSnapshot = snapshot == savedSnapshot ? nil : snapshot
+            }
+        }
+        return pendingSnapshot
+    }
+
+    func didSaveSnapshot(_ snapshot: Data) {
+        savedSnapshot = snapshot
+        pendingSnapshot = nil
     }
 
     private func forceStop() {

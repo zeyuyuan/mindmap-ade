@@ -165,80 +165,41 @@ extension WorkspaceStore {
         agent.isConfigured = true
         let location = prepared.location
         try bindAgent(agent, to: location, creationCommit: prepared.creationCommit, address: address, session: session)
-        let run = AgentRun(address: address, worktree: location, cli: agent.cli, executable: executable.path)
-        agentRuns[address] = run
-        do {
-            try await flush()
-            var environment = AgentCLI.environment(executable: executable.path)
-            let connection = try await prepareMCP(for: run, environment: environment)
-            environment.merge(connection.environment) { _, new in new }
-            let current = try await git.existing(location.directory, in: project)
-            guard current.gitCommonDirectory == run.gitCommonDirectory else {
-                throw WorkspaceIssue("The worktree changed during startup.")
-            }
-            let arguments = try AgentCLI.arguments(
-                for: agent, executable: executable, context: promptContext(for: run, in: session),
-                mcpBridge: connection.bridge)
-            let terminal = AgentTerminal()
-            terminal.didExit = { [weak self] status, error in
-                self?.finishAgent(run, exitCode: status, error: error)
-            }
-            terminals[address] = terminal
-            try terminal.start(
-                executable: executable.path, arguments: arguments, environment: environment, directory: run.directory)
-            if agentRuns[address]?.state == .starting {
-                agentRuns[address]?.state = .running
-                scheduleSave()
-            }
-        } catch {
-            finishAgent(run, exitCode: nil, error: error.localizedDescription)
-            throw error
+        let checkout = try await git.agentCheckout(location.directory, in: project)
+        try await startAgentProcess(
+            agent, at: address, in: session, checkout: checkout, project: project, executable: executable)
+    }
+
+    func resumeAgent(
+        at address: NodeAddress, owner: UUID? = nil, confirmedCheckout: String? = nil,
+        detectCLI: @MainActor (AgentCLIKind) async -> AgentCLI.Executable? = { await AgentCLI.detected($0) }
+    ) async throws {
+        let session = try beginOperation(address)
+        defer { operations.remove(address) }
+        let original = try node(at: address, in: session)
+        guard let previous = savedConversation(at: address), case .agent(let agent) = original.content
+        else { throw WorkspaceIssue("This Agent has no saved conversation to continue.") }
+        let context = session.board.context(above: address.nodeID)
+        let project = try validProject(in: context)
+        guard let inherited = context.worktree, inherited.directory == previous.directory,
+            inherited.gitCommonDirectory == previous.gitCommonDirectory
+        else { throw WorkspaceIssue("The original worktree is no longer linked to this Agent.") }
+
+        let checkout = try await git.agentCheckout(inherited.directory, in: project)
+        try validateAgentCheckout(checkout, for: previous, confirmedCheckout: confirmedCheckout)
+        guard let executable = await detectCLI(agent.cli), AgentCLI.isExecutableFile(executable.path) else {
+            throw WorkspaceIssue(AgentCLI.unavailable(agent.cli))
         }
-    }
-
-    func stopAgent(at address: NodeAddress) {
-        guard agentRuns[address]?.state == .running else { return }
-        agentRuns[address]?.state = .stopping
-        terminals[address]?.stop()
-        scheduleSave()
-    }
-
-    func stopAllAgents() async throws {
-        for (address, run) in agentRuns where run.state == .running { stopAgent(at: address) }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(4))
-        while agentRuns.values.contains(where: { $0.state.isActive }) {
-            guard ContinuousClock.now < deadline else {
-                throw WorkspaceIssue("An Agent is still stopping. Try quitting again after it exits.")
-            }
-            try await Task.sleep(for: .milliseconds(40))
-        }
-        await commandCodeConnection.removeAll()
-    }
-
-    private func finishAgent(_ run: AgentRun, exitCode: Int32?, error: String?) {
-        guard var current = agentRuns[run.address], current.id == run.id, current.state.isActive else { return }
-        current.state = current.state == .stopping ? .stopped : (error != nil || exitCode != 0 ? .failed : .exited)
-        current.exitCode = exitCode
-        current.error = error
-        current.finishedAt = .now
-        agentRuns[run.address] = current
-        releaseMCP(for: run)
-        scheduleSave()
-    }
-
-    private func promptContext(for run: AgentRun, in session: BoardSession) -> String {
-        let scope = session.board.context(above: run.address.nodeID)
-        var parts = ["Working directory: \(run.directory)"]
-        if let id = scope.projectID, let node = session.board.nodes[id], case .project(let project) = node.content {
-            parts.append("Project: \(node.title)")
-            if !project.details.isEmpty { parts.append("Project notes:\n\(project.details)") }
-        }
-        parts.append("Mindmap ADE MCP tools can read this conversation's context and update its map branch.")
-        return parts.joined(separator: "\n") + "\n\nTask:\n"
+        try checkUnchanged(original, address: address, session: session, context: context)
+        try await startAgentProcess(
+            agent, at: address, in: session, checkout: checkout, project: project, executable: executable,
+            previous: previous, owner: owner)
     }
 
     private func beginOperation(_ address: NodeAddress) throws -> BoardSession {
-        guard !isReadOnly, let session = board(address.boardID), session.board.nodes[address.nodeID] != nil else {
+        guard !isReadOnly, !isQuitting, let session = board(address.boardID),
+            session.board.nodes[address.nodeID] != nil
+        else {
             throw WorkspaceIssue("This node is no longer available for editing.")
         }
         guard agentRuns[address]?.state.isActive != true, operations.insert(address).inserted else {

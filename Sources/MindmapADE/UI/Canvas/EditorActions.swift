@@ -11,7 +11,8 @@ final class EditorActions {
     @ObservationIgnored weak var workspace: WorkspaceStore?
     var targetBoardID: UUID?
     let windowID = UUID()
-    var terminalAddress: NodeAddress?
+    private(set) var terminalAddress: NodeAddress?
+    private(set) var terminalWidthShare: CGFloat = 0.5
     var requestedBoardID: UUID?
     var canAddProject = false
     var canAddWorktree = false
@@ -43,18 +44,41 @@ final class EditorActions {
         requestedBoardID = targetBoardID
     }
     func showTerminal(at address: NodeAddress, revealNode: Bool = true) {
-        guard let terminal = workspace?.terminals[address] else { return }
-        if terminalAddress != address { hideTerminal() }
+        guard let workspace, workspace.canOpenAgent(at: address) else { return }
+        if terminalAddress != address { detachTerminal() }
         terminalAddress = address
-        terminal.owner = windowID
+        workspace.terminals[address]?.owner = windowID
+        saveTerminalPane()
         if revealNode { canvas?.revealTerminalNode(address) }
     }
 
     func hideTerminal() {
+        detachTerminal()
+        saveTerminalPane()
+    }
+
+    func detachTerminal() {
         if let address = terminalAddress, workspace?.terminals[address]?.owner == windowID {
             workspace?.terminals[address]?.owner = nil
         }
         terminalAddress = nil
+    }
+
+    func restoreTerminalPane() {
+        guard let state = workspace?.restoreAgentPane(for: windowID) else { return }
+        terminalWidthShare = state.widthShare
+        showTerminal(at: state.address, revealNode: false)
+    }
+
+    func resizeTerminal(to share: CGFloat) {
+        guard terminalWidthShare != share else { return }
+        terminalWidthShare = share
+        saveTerminalPane()
+    }
+
+    private func saveTerminalPane() {
+        let state = terminalAddress.map { AgentPaneState(address: $0, widthShare: terminalWidthShare) }
+        workspace?.rememberAgentPane(state, from: windowID)
     }
 
     func add(_ kind: NodeKind) { activeCanvas?.insertResource(kind) }

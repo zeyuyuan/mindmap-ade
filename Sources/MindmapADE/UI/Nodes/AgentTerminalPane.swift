@@ -1,4 +1,5 @@
 import AppKit
+import GhosttyTerminal
 import MindMapCore
 import SwiftUI
 
@@ -53,7 +54,7 @@ struct AgentTerminalPane: View {
     @ViewBuilder
     private func liveTerminal(_ terminal: AgentTerminal) -> some View {
         if terminal.owner == actions.windowID {
-            TerminalAttachment(terminal: terminal)
+            TerminalAttachment(terminal: terminal, windowID: actions.windowID)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
         } else {
@@ -206,21 +207,52 @@ struct AgentTerminalPane: View {
     }
 }
 
+final class AgentTerminalView: AppTerminalView {
+    private static let appKeys: Set<String> = ["h", "m", "n", "q", "w"]
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if let key = event.charactersIgnoringModifiers?.lowercased(),
+            (modifiers == .command && Self.appKeys.contains(key))
+                || (modifiers == [.command, .shift] && key == "n")
+        {
+            // The AppKit menu owns window and application commands.
+            return false
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 private struct TerminalAttachment: NSViewRepresentable {
     let terminal: AgentTerminal
+    let windowID: UUID
 
-    func makeNSView(context: Context) -> NSView { NSView() }
-
-    func updateNSView(_ container: NSView, context: Context) {
-        guard terminal.view.superview !== container else { return }
-        terminal.view.removeFromSuperview()
-        terminal.view.frame = container.bounds
-        terminal.view.autoresizingMask = [.width, .height]
-        container.addSubview(terminal.view)
+    func makeNSView(context: Context) -> Host {
+        let host = Host()
+        host.wantsLayer = true
+        host.layer?.masksToBounds = true
+        return host
     }
 
-    static func dismantleNSView(_ view: NSView, coordinator: ()) {
-        for child in view.subviews { child.removeFromSuperview() }
+    func updateNSView(_ host: Host, context: Context) {
+        if host.terminal !== terminal { host.detach() }
+        guard terminal.owner == windowID else { return }
+        host.terminal = terminal
+        terminal.attach(to: host)
+    }
+
+    static func dismantleNSView(_ view: Host, coordinator: ()) {
+        view.detach()
+    }
+
+    final class Host: NSView {
+        weak var terminal: AgentTerminal?
+
+        func detach() {
+            // The previous host can be dismantled after a transfer to another window.
+            if let terminal, terminal.view.superview === self { terminal.park() }
+            terminal = nil
+        }
     }
 }
 

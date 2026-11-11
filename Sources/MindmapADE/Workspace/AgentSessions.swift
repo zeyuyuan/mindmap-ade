@@ -123,16 +123,16 @@ extension WorkspaceStore {
                 commandCodeMod: commandCodeMod)
             let terminal = AgentTerminal()
             terminal.owner = owner
-            let runID = run.id
-            terminal.didExit = { [weak self] status, error in
-                Task { await self?.finishAgent(at: address, runID: runID, exitCode: status, error: error) }
-            }
-            try terminal.start(
+            try await terminal.start(
                 executable: executable.path, arguments: arguments, environment: environment, directory: run.directory)
             terminals[address] = terminal
             agentRuns[address]?.state = .running
             recordOutput(of: terminal, for: run)
             scheduleSave()
+            let runID = run.id
+            terminal.didExit = { [weak self] status, error in
+                Task { await self?.finishAgent(at: address, runID: runID, exitCode: status, error: error) }
+            }
         } catch {
             if let lastRun {
                 agentRuns[address] = lastRun
@@ -183,7 +183,7 @@ extension WorkspaceStore {
 
     private func saveOutput(of terminal: AgentTerminal, for run: AgentRun) async {
         guard agentRuns[run.address]?.id == run.id else { return }
-        if let snapshot = terminal.snapshotToSave() {
+        if let snapshot = await terminal.snapshotToSave() {
             do {
                 try await agentFiles.saveSnapshot(snapshot, for: run.id)
                 terminal.didSaveSnapshot(snapshot)

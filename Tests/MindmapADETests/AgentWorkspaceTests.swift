@@ -147,6 +147,7 @@ struct AgentWorkspaceTests {
             #"""
             test -t 0 && pwd -P > actual-directory
             printf '%s' "$3" > actual-task
+            set -m
             /bin/sh -c 'trap "" TERM HUP; echo $$ > child-pid.tmp; mv child-pid.tmp child-pid; exec /bin/sleep 99' &
             wait
             """#)
@@ -183,6 +184,7 @@ struct AgentWorkspaceTests {
         let childPID = try #require(
             Int32(String(contentsOf: childMarker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         let childSession = getsid(childPID)
+        #expect(getpgid(childPID) != childSession)
         defer {
             if childSession > 0, getsid(childPID) == childSession { _ = kill(childPID, SIGKILL) }
         }
@@ -614,25 +616,25 @@ struct AgentWorkspaceTests {
     @Test func terminalOutputRemainsPendingUntilWritten() async throws {
         _ = NSApplication.shared
         let terminal = AgentTerminal()
-        try terminal.start(
+        try await terminal.start(
             executable: "/bin/sh", arguments: ["-c", "echo 'Pending output'; exec /bin/sleep 30"],
             environment: AgentCLI.environment(executable: "/bin/sh"), directory: "/")
         defer { terminal.stop() }
         var output: Data?
         try await waitUntil {
-            output = terminal.snapshotToSave()
+            output = await terminal.snapshotToSave()
             return output != nil
         }
         let snapshot = try #require(output)
         #expect(String(decoding: snapshot, as: UTF8.self) == "Pending output")
-        #expect(terminal.snapshotToSave() == snapshot)
+        #expect(await terminal.snapshotToSave() == snapshot)
         terminal.didSaveSnapshot(snapshot)
-        #expect(terminal.snapshotToSave() == nil)
+        #expect(await terminal.snapshotToSave() == nil)
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
+    private func waitUntil(_ condition: () async -> Bool) async throws {
         for _ in 0..<200 {
-            if condition() { return }
+            if await condition() { return }
             try await Task.sleep(for: .milliseconds(10))
         }
         throw WorkspaceIssue("Timed out waiting for the test process.")

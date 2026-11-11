@@ -41,6 +41,6 @@ Debug builds also accept `--appearance light` or `--appearance dark`, and `--min
 
 ## Architecture
 
-SwiftUI provides the native shell. An AppKit canvas owns high-frequency interaction and a culled Core Animation scene; a reusable TextKit 2 editor provides native text input. The independent `MindMapCore` target contains the tree model, reversible edits, layout, camera, and archive validation. A native SwiftTerm pane hosts interactive CLI sessions. Git preparation, run lifecycle, and the local MCP bridge live behind the workspace model.
+SwiftUI provides the native shell. An AppKit canvas owns high-frequency interaction and a culled Core Animation scene; a reusable TextKit 2 editor provides native text input. The independent `MindMapCore` target contains the tree model, reversible edits, layout, camera, and archive validation. A Ghostty Metal surface hosts each interactive CLI session through a native PTY. Git preparation, run lifecycle, and the local MCP bridge live behind the workspace model.
 
 Licensed under the [MIT License](LICENSE).

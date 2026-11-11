@@ -42,12 +42,12 @@ final class EditorActions {
         targetBoardID = workspace?.createBoard()
         requestedBoardID = targetBoardID
     }
-    func showTerminal(at address: NodeAddress) {
+    func showTerminal(at address: NodeAddress, revealNode: Bool = true) {
         guard let terminal = workspace?.terminals[address] else { return }
         if terminalAddress != address { hideTerminal() }
         terminalAddress = address
         terminal.owner = windowID
-        canvas?.revealTerminalNode(address)
+        if revealNode { canvas?.revealTerminalNode(address) }
     }
 
     func hideTerminal() {

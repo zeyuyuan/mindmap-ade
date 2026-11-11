@@ -80,6 +80,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var lastDrag: CGPoint?
     private var pressedNode: UUID?
     private var dragStarted = false
+    private var terminalClick: TerminalClick?
     private var isMarquee = false
     private var isPanning = false
     private var selectionBeforeMarquee = Set<UUID>()
@@ -98,6 +99,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private enum EditingCompletion {
         case blur, submit, keepDraft, cancel
+    }
+
+    private enum TerminalClick {
+        case pressed, shown
     }
 
     private enum DropTarget {
@@ -1004,6 +1009,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     override func mouseDown(with event: NSEvent) {
+        let terminalWasShown = terminalClick == .shown
+        terminalClick = nil
+        // Opening the pane can move the topic out from under the second click.
+        if terminalWasShown && event.clickCount == 2 && isUnmodifiedLeftButton(event) { return }
+
         closeNodeForm()
         actions?.activateTarget()
         finishEditing()
@@ -1027,6 +1037,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         dragStarted = false
         isPanning = isSpaceDown || event.buttonNumber == 2 || (id == nil && !event.modifierFlags.contains(.shift))
         isMarquee = id == nil && event.modifierFlags.contains(.shift)
+        if id != nil, !isPanning, event.clickCount == 1, isUnmodifiedLeftButton(event) {
+            terminalClick = .pressed
+        }
         selectionBeforeMarquee = selected
         if let id, !isPanning {
             if event.modifierFlags.contains(.command) {
@@ -1127,6 +1140,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     override func mouseUp(with event: NSEvent) {
+        let isTerminalClick = terminalClick == .pressed
+        terminalClick = nil
         defer {
             dragStart = nil
             lastDrag = nil
@@ -1145,7 +1160,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             render()
             updateActions()
         }
-        guard dragStarted, !draggedBranches.isEmpty else { return }
+        guard dragStarted else {
+            if isTerminalClick { showTerminalForClick(event) }
+            return
+        }
+        guard !draggedBranches.isEmpty else { return }
         let positions = Dictionary(
             uniqueKeysWithValues: draggedBranches.compactMap { id -> (UUID, CGPoint)? in
                 guard let placement = mapLayout.nodes[id] else { return nil }
@@ -1171,6 +1190,32 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         }
         if session.apply(edit, named: "Move Branch") { actions?.hint = EditorActions.defaultHint }
         changed()
+    }
+
+    private func isUnmodifiedLeftButton(_ event: NSEvent) -> Bool {
+        event.buttonNumber == 0 && event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+    }
+
+    private func showTerminalForClick(_ event: NSEvent) {
+        guard isUnmodifiedLeftButton(event), !isSpaceDown, let id = pressedNode, selected == [id],
+            session.board.nodes[id]?.content.kind == .agent, let start = dragStart, let workspace, let actions
+        else { return }
+        let point = localPoint(event)
+        guard hypot(point.x - start.x, point.y - start.y) < CanvasStyle.dragThreshold,
+            mapLayout.hitTest(camera.worldPoint(point)) == id
+        else { return }
+
+        let address = NodeAddress(boardID: session.id, nodeID: id)
+        guard let terminal = workspace.terminals[address],
+            actions.terminalAddress != address || terminal.owner != actions.windowID
+        else { return }
+        let paneIsVisible =
+            actions.terminalAddress.map { current in
+                current.boardID == session.id && session.board.nodes[current.nodeID] != nil
+                    && workspace.terminals[current] != nil
+            } ?? false
+        actions.showTerminal(at: address, revealNode: !paneIsVisible)
+        terminalClick = .shown
     }
 
     override func mouseMoved(with event: NSEvent) {

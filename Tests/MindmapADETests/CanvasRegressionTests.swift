@@ -72,12 +72,14 @@ private final class CanvasFixture {
         window.close()
     }
 
-    func event(_ kind: NSEvent.EventType, at point: CGPoint, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
+    func event(
+        _ kind: NSEvent.EventType, at point: CGPoint, modifiers: NSEvent.ModifierFlags = [], clickCount: Int = 1
+    ) throws -> NSEvent {
         try #require(
             NSEvent.mouseEvent(
                 with: kind, location: view.convert(point, to: nil),
                 modifierFlags: modifiers, timestamp: 0, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+                context: nil, eventNumber: 0, clickCount: clickCount, pressure: 1))
     }
 
     func click(_ point: CGPoint, modifiers: NSEvent.ModifierFlags = []) throws {
@@ -371,6 +373,72 @@ struct CanvasRegressionTests {
         #expect(workspace.saveStatusText == "Saved locally")
         #expect(workspace.errorMessage == nil)
         #expect(await disk.snapshot().boards[0].nodes[root]?.text == "Unsaved edit")
+    }
+
+    @Test func plainAgentClicksShowTerminalsWithoutInterruptingCanvasGestures() async throws {
+        let root = MapNode(text: "Tasks")
+        let first = MapNode(content: .agent(AgentTopic(task: "First session")))
+        let second = MapNode(content: .agent(AgentTopic(task: "Second session")))
+        let draft = MapNode(content: .agent(AgentTopic(task: "Draft")))
+        var board = MindMapBoard(root: root)
+        for node in [first, second, draft] {
+            board.apply(try #require(board.inserting(node, parent: root.id)).edit)
+        }
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let firstAddress = NodeAddress(boardID: session.id, nodeID: first.id)
+        let secondAddress = NodeAddress(boardID: session.id, nodeID: second.id)
+        workspace.terminals[firstAddress] = AgentTerminal()
+        workspace.terminals[secondAddress] = AgentTerminal()
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        canvas.actions.workspace = workspace
+        try await canvas.ready()
+        canvas.view.fitContent()
+
+        func center(of node: MapNode) throws -> CGPoint {
+            let element = try #require(
+                canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }
+                    .first { $0.accessibilityLabel() == node.title })
+            let frame = canvas.view.convert(canvas.window.convertFromScreen(element.accessibilityFrame()), from: nil)
+            return CGPoint(x: frame.midX, y: frame.midY)
+        }
+
+        let firstPoint = try center(of: first)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: firstPoint))
+        #expect(canvas.actions.terminalAddress == nil)
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: firstPoint))
+        #expect(canvas.actions.terminalAddress == firstAddress)
+        #expect(canvas.window.firstResponder === canvas.view)
+
+        // A second click from the same double click can land on blank space after the pane opens.
+        let blank = CGPoint(x: 8, y: 8)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: blank, clickCount: 2))
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: blank, clickCount: 2))
+        #expect(session.board == board)
+
+        let secondPoint = try center(of: second)
+        try canvas.click(secondPoint, modifiers: .command)
+        try canvas.click(secondPoint)
+        #expect(canvas.actions.terminalAddress == firstAddress)
+
+        try canvas.click(try center(of: root))
+        #expect(canvas.actions.terminalAddress == firstAddress)
+        try canvas.click(secondPoint)
+        #expect(canvas.actions.terminalAddress == secondAddress)
+        #expect(canvas.window.firstResponder === canvas.view)
+        _ = canvas.view.menu(for: try canvas.event(.rightMouseDown, at: try center(of: first)))
+        try canvas.click(try center(of: draft))
+        try canvas.click(blank)
+        #expect(canvas.actions.terminalAddress == secondAddress)
+
+        let dragStart = try center(of: first)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: dragStart))
+        let dragged = CGPoint(x: dragStart.x + 8, y: dragStart.y)
+        canvas.view.mouseDragged(with: try canvas.event(.leftMouseDragged, at: dragged))
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: dragStart))
+        #expect(canvas.actions.terminalAddress == secondAddress)
     }
 
     @Test func multiSelectionDragMovesBothRootsAndUndoesAsOneOperation() async throws {

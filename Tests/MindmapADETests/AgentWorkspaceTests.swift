@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Darwin
 import Foundation
 import Testing
@@ -598,6 +599,9 @@ struct AgentWorkspaceTests {
         await #expect(throws: WorkspaceIssue.self) {
             try await stopped.resumeAgent(at: address, detectCLI: detectCLI)
         }
+        await #expect(throws: WorkspaceIssue.self) {
+            try await stopped.openAgentShell(at: address, owner: UUID())
+        }
         #expect(stopped.agentRuns[address]?.id == stoppedRun.id)
         #expect(await stopped.agentFiles.snapshot(for: stoppedRun.id) == "Original conversation resumed")
 
@@ -630,6 +634,101 @@ struct AgentWorkspaceTests {
         #expect(await terminal.snapshotToSave() == snapshot)
         terminal.didSaveSnapshot(snapshot)
         #expect(await terminal.snapshotToSave() == nil)
+    }
+
+    @Test(arguments: [false, true])
+    func controlCReturnsToAnInteractiveShellInTheSameWorktree(alternateScreen: Bool) async throws {
+        _ = NSApplication.shared
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let cli = try fixture.commandCodeStub(
+            #"""
+            printf '%s' 4f371e83-3a27-4474-b85d-2fd93212a841 > "$MINDMAP_AGENT_SESSION_FILE"
+            if [ "$4" = --session ]; then
+                touch conversation-resumed
+                exec /bin/sleep 30
+            fi
+            trap 'exit 0' INT
+            printf 'Original terminal output\nMore terminal output\nFinal terminal output\n'
+            if \#(alternateScreen ? "true" : "false"); then printf '\033[?1049h'; fi
+            printf '\033[?2004h'
+            touch agent-ready
+            while IFS= read -r line; do :; done
+            """#)
+        let shell = try fixture.cliStub(
+            "test-shell",
+            #"""
+            #!/bin/sh
+            test "$1" = -i && test -t 0 || exit 40
+            test -z "$MINDMAP_MCP_TOKEN$MINDMAP_MCP_SOCKET$MINDMAP_AGENT_SESSION_FILE" || exit 41
+            PS1='Mindmap test shell$ ' ENV=/dev/null exec /bin/sh "$@"
+            """#)
+        var project = ProjectTopic()
+        project.location = try await GitWorkspace().project(at: fixture.repository.path)
+        let root = MapNode(content: .project(project))
+        let topic = AgentTopic()
+        let node = MapNode(content: .agent(topic))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(node, parent: root.id)).edit)
+        let disk = LaunchTestDisk(directory: fixture.data, board: board)
+        let workspace = WorkspaceStore(disk: disk, interactiveShell: shell.path)
+        await workspace.loadIfNeeded()
+        let address = NodeAddress(boardID: board.id, nodeID: node.id)
+        let detectCLI: @MainActor (AgentCLIKind) async -> AgentCLI.Executable? = { _ in
+            .init(path: cli.path, supportsSessionIntegration: true)
+        }
+        try await workspace.launchAgent(topic, at: address, detectCLI: detectCLI)
+        let terminal = try #require(workspace.terminals[address])
+        defer {
+            terminal.stop()
+            workspace.terminals[address]?.stop()
+        }
+        let run = try #require(workspace.agentRuns[address])
+        let directory = URL(fileURLWithPath: run.directory)
+        try await waitUntil {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("agent-ready").path)
+        }
+        #expect(terminal.view.sendKey(.c, modifiers: [.ctrl]))
+
+        try await waitUntil { workspace.agentRuns[address]?.state == .exited && terminal.isShell }
+        #expect(workspace.terminals[address] === terminal)
+        #expect(workspace.agentRuns[address]?.exitCode == 0)
+        #expect(workspace.mcpGrants.isEmpty)
+        #expect(workspace.savedConversation(at: address) != nil)
+        try await waitUntil {
+            guard let snapshot = await terminal.snapshotToSave() else { return false }
+            let text = String(decoding: snapshot, as: UTF8.self)
+            return text.hasPrefix("Original terminal output\nMore terminal output\nFinal terminal output")
+                && text.hasSuffix("Mindmap test shell$")
+        }
+        #expect(terminal.view.paste(text: "pwd -P > shell-directory"))
+        let returnKey = try #require(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: terminal.view.window?.windowNumber ?? 0, context: nil,
+                characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false,
+                keyCode: UInt16(kVK_Return)))
+        terminal.view.keyDown(with: returnKey)
+        let marker = directory.appendingPathComponent("shell-directory")
+        try await waitUntil { FileManager.default.fileExists(atPath: marker.path) }
+        let actual = try String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .newlines)
+        #expect(URL(fileURLWithPath: actual).resolvingSymlinksInPath().path == directory.resolvingSymlinksInPath().path)
+
+        try await workspace.resumeAgent(at: address, detectCLI: detectCLI)
+        #expect(workspace.terminals[address] !== terminal)
+        try await waitUntil {
+            workspace.shellTerminals.isEmpty
+                && FileManager.default.fileExists(atPath: directory.appendingPathComponent("conversation-resumed").path)
+        }
+        workspace.stopAgent(at: address)
+        try await waitUntil { workspace.agentRuns[address]?.state == .stopped }
+        #expect(workspace.terminals[address] == nil)
+
+        try await workspace.openAgentShell(at: address, owner: UUID())
+        #expect(workspace.terminals[address]?.isShell == true)
+        try await workspace.interruptAllAgents()
+        #expect(workspace.terminals[address] == nil)
+        #expect(workspace.agentRuns[address]?.state == .stopped)
     }
 
     private func waitUntil(_ condition: () async -> Bool) async throws {

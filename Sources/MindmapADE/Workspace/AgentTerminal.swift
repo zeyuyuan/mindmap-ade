@@ -6,6 +6,11 @@ import os
 
 @Observable
 final class AgentTerminal {
+    private struct Transport: Sendable {
+        var pty: AgentPTY?
+        var grid = AgentPTY.Grid()
+    }
+
     private static let controller = TerminalController {
         $0.withFontSize(12)
         $0.withCustom("scrollback-limit", "4194304")
@@ -23,12 +28,13 @@ final class AgentTerminal {
     }()
 
     var owner: UUID?
+    private(set) var isShell = false
     @ObservationIgnored let view: AgentTerminalView
     @ObservationIgnored var didExit: ((Int32?, String?) -> Void)? {
         didSet { deliverExit() }
     }
     @ObservationIgnored var recording: Task<Void, Never>?
-    @ObservationIgnored private let pty: AgentPTY
+    @ObservationIgnored private let transport: OSAllocatedUnfairLock<Transport>
     @ObservationIgnored private let session: InMemoryTerminalSession
     @ObservationIgnored private var savedSnapshot: Data?
     @ObservationIgnored private var pendingSnapshot: Data?
@@ -36,12 +42,18 @@ final class AgentTerminal {
     @ObservationIgnored private let outputChanged = OSAllocatedUnfairLock(initialState: false)
 
     init() {
-        let pty = AgentPTY()
+        let transport = OSAllocatedUnfairLock(initialState: Transport())
         let session = InMemoryTerminalSession(
-            write: { pty.send($0) },
-            resize: { pty.resize(to: .init(rows: $0.rows, columns: $0.columns)) },
+            write: { bytes in transport.withLock { $0.pty?.send(bytes) } },
+            resize: { size in
+                guard size.rows > 0, size.columns > 0 else { return }
+                transport.withLock {
+                    $0.grid = .init(rows: size.rows, columns: size.columns)
+                    $0.pty?.resize(to: $0.grid)
+                }
+            },
             suppressesPixelOnlyResizes: true)
-        self.pty = pty
+        self.transport = transport
         self.session = session
         view = AgentTerminalView(frame: NSRect(x: 0, y: 0, width: 720, height: 256))
         view.setAccessibilityElement(true)
@@ -50,15 +62,15 @@ final class AgentTerminal {
         view.controller = Self.controller
         view.configuration = TerminalSurfaceOptions(backend: .inMemory(session))
         session.setOutputBacklogHandler(highWater: AgentPTY.outputHighWater, lowWater: AgentPTY.outputLowWater) {
-            [weak pty] backlogged in
-            if !backlogged { pty?.resumeOutput() }
+            backlogged in
+            if !backlogged { transport.withLock { $0.pty?.resumeOutput() } }
         }
         park()
     }
 
     isolated deinit {
         view.removeFromSuperview()
-        pty.stop()
+        stop()
     }
 
     func attach(to container: NSView) {
@@ -85,6 +97,12 @@ final class AgentTerminal {
     }
 
     func start(executable: String, arguments: [String], environment: [String: String], directory: String) async throws {
+        let pty = AgentPTY()
+        transport.withLock {
+            precondition($0.pty == nil)
+            pty.resize(to: $0.grid)
+            $0.pty = pty
+        }
         do {
             try await pty.start(
                 executable: executable, arguments: arguments, environment: environment, directory: directory,
@@ -95,22 +113,45 @@ final class AgentTerminal {
                 backlog: { [weak session] in session?.pendingOutputByteCount ?? 0 },
                 onExit: { [weak self] status in
                     Task { @MainActor in
-                        self?.pendingExit = status
-                        self?.deliverExit()
+                        guard let self else { return }
+                        self.transport.withLock { $0.pty = nil }
+                        self.pendingExit = status
+                        self.deliverExit()
                     }
                 })
         } catch {
+            transport.withLock { $0.pty = nil }
             throw WorkspaceIssue("The terminal could not start: \(error.localizedDescription)")
+        }
+    }
+
+    func startShell(executable: String, directory: String, afterAgent: Bool) async throws {
+        if afterAgent {
+            // Enter then leave the alternate screen so mode 1049 saves the current cursor
+            // when the agent already returned to the main screen.
+            session.receive(
+                "\u{18}\u{1b}[?1049h\u{1b}[?1049l\u{1b}[!p"
+                    + "\u{1b}[?1000;1002;1003;1004;1006;2004;2026l\u{1b}[=0u\r\n")
+        }
+        var environment = AgentCLI.environment(executable: executable)
+        environment["SHELL"] = executable
+        isShell = true
+        do {
+            try await start(executable: executable, arguments: ["-i"], environment: environment, directory: directory)
+        } catch {
+            isShell = false
+            throw error
         }
     }
 
     private func deliverExit() {
         guard let pendingExit, let didExit else { return }
         self.pendingExit = nil
+        self.didExit = nil
         didExit(pendingExit.code, pendingExit.error)
     }
 
-    func stop() { pty.stop() }
+    func stop() { transport.withLock { $0.pty?.stop() } }
 
     func snapshotToSave() async -> Data? {
         let changed = outputChanged.withLock { value in

@@ -185,9 +185,12 @@ final class WorkspaceStore {
     var dataDirectory: URL { disk.directory }
     let git = GitWorkspace()
     let agentFiles: AgentRunFiles
+    let interactiveShell: String
     var agentRuns: [NodeAddress: AgentRun] = [:]
     var recoveryIssues: [NodeAddress: AgentRecoveryIssue] = [:]
     var terminals: [NodeAddress: AgentTerminal] = [:]
+    // Keep a replaced shell alive until its PTY reaps the process and its jobs.
+    @ObservationIgnored var shellTerminals: [ObjectIdentifier: AgentTerminal] = [:]
     var connectedMapRuns: Set<UUID> = []
     var operations: Set<NodeAddress> = []
     @ObservationIgnored var isQuitting = false
@@ -201,8 +204,9 @@ final class WorkspaceStore {
     @ObservationIgnored private var editingSessions: [EditKey: EditingSession] = [:]
     @ObservationIgnored private var saveRevision = 0
 
-    init(disk: any WorkspacePersistence) {
+    init(disk: any WorkspacePersistence, interactiveShell: String = AgentCLI.interactiveShell) {
         self.disk = disk
+        self.interactiveShell = interactiveShell
         agentFiles = AgentRunFiles(workspace: disk.directory)
         commandCodeConnection = CommandCodeConnection(directory: disk.directory)
     }

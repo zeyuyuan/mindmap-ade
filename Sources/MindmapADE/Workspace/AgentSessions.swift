@@ -39,7 +39,7 @@ extension WorkspaceStore {
             let run = savedConversation(at: address), !run.state.isActive
         else { return }
         let issue = recoveryIssues[address]
-        guard !automatically || (run.state == .interrupted && issue == nil) else { return }
+        guard !automatically || (run.state == .interrupted && issue == nil && terminals[address] == nil) else { return }
         Task {
             guard !operations.contains(address), agentRuns[address]?.id == run.id else { return }
             do {
@@ -122,9 +122,11 @@ extension WorkspaceStore {
                 mcpBridge: connection.bridge, conversationID: conversationID, isResuming: previous != nil,
                 commandCodeMod: commandCodeMod)
             let terminal = AgentTerminal()
-            terminal.owner = owner
             try await terminal.start(
                 executable: executable.path, arguments: arguments, environment: environment, directory: run.directory)
+            let previousTerminal = terminals[address]
+            terminal.owner = owner ?? previousTerminal?.owner
+            previousTerminal?.stop()
             terminals[address] = terminal
             agentRuns[address]?.state = .running
             recordOutput(of: terminal, for: run)
@@ -161,14 +163,26 @@ extension WorkspaceStore {
             agentRuns[address]?.state = .interrupting
             terminals[address]?.stop()
         }
+        for terminal in shellTerminals.values { terminal.stop() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(4))
-        while agentRuns.values.contains(where: { $0.state.isActive }) {
+        while agentRuns.values.contains(where: { $0.state.isActive }) || !shellTerminals.isEmpty {
             guard ContinuousClock.now < deadline else {
-                throw WorkspaceIssue("An Agent is still stopping. Try quitting again after it exits.")
+                throw WorkspaceIssue("A terminal process is still stopping. Try quitting again after it exits.")
             }
             try await Task.sleep(for: .milliseconds(40))
         }
         await commandCodeConnection.removeAll()
+    }
+
+    func startAgentShell(_ terminal: AgentTerminal, for run: AgentRun, afterAgent: Bool) async throws {
+        try await terminal.startShell(executable: interactiveShell, directory: run.directory, afterAgent: afterAgent)
+        let terminalID = ObjectIdentifier(terminal)
+        let address = run.address
+        shellTerminals[terminalID] = terminal
+        terminal.didExit = { [weak self] _, _ in
+            guard let self, let shell = shellTerminals.removeValue(forKey: terminalID) else { return }
+            if terminals[address] === shell { terminals.removeValue(forKey: address) }
+        }
     }
 
     private func recordOutput(of terminal: AgentTerminal, for run: AgentRun) {
@@ -202,23 +216,34 @@ extension WorkspaceStore {
 
     private func finishAgent(at address: NodeAddress, runID: UUID, exitCode: Int32?, error: String?) async {
         guard let run = agentRuns[address], run.id == runID, run.state.isActive else { return }
-        if let terminal = terminals[address] {
+        let terminal = terminals[address]
+        if let terminal {
             terminal.recording?.cancel()
             await terminal.recording?.value
             await saveOutput(of: terminal, for: run)
         }
+        guard let finished = agentRuns[address], finished.id == runID, finished.state.isActive else { return }
+        releaseMCP(for: finished)
+        var shellError: String?
+        if finished.state == .running, error == nil, !isQuitting, let terminal {
+            do {
+                try await startAgentShell(terminal, for: finished, afterAgent: true)
+            } catch {
+                shellError = error.localizedDescription
+            }
+        }
         guard var current = agentRuns[address], current.id == runID, current.state.isActive else { return }
+        if current.state == .stopping || current.state == .interrupting || isQuitting { terminal?.stop() }
         switch current.state {
         case .stopping: current.state = .stopped
         case .interrupting: current.state = .interrupted
         default: current.state = error != nil || exitCode != 0 ? .failed : .exited
         }
         current.exitCode = exitCode
-        current.error = error
+        current.error = error ?? shellError
         current.finishedAt = .now
         agentRuns[address] = current
-        terminals.removeValue(forKey: address)
-        releaseMCP(for: current)
+        if terminals[address]?.isShell != true { terminals.removeValue(forKey: address) }
         scheduleSave()
     }
 

@@ -189,8 +189,6 @@ final class WorkspaceStore {
     var agentRuns: [NodeAddress: AgentRun] = [:]
     var recoveryIssues: [NodeAddress: AgentRecoveryIssue] = [:]
     var terminals: [NodeAddress: AgentTerminal] = [:]
-    // Keep a replaced shell alive until its PTY reaps the process and its jobs.
-    @ObservationIgnored var shellTerminals: [ObjectIdentifier: AgentTerminal] = [:]
     var connectedMapRuns: Set<UUID> = []
     var operations: Set<NodeAddress> = []
     @ObservationIgnored var isQuitting = false

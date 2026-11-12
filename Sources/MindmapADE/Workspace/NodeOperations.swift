@@ -208,23 +208,7 @@ extension WorkspaceStore {
         defer { operations.remove(address) }
         let original = try node(at: address, in: session)
         guard original.content.kind == .agent, let run = agentRuns[address], terminals[address] == nil else { return }
-        let context = session.board.context(above: address.nodeID)
-        let project = try validProject(in: context)
-        guard let worktree = context.worktree, worktree.directory == run.directory,
-            worktree.gitCommonDirectory == run.gitCommonDirectory
-        else { throw WorkspaceIssue("The original worktree is no longer linked to this Agent.") }
-        let checkout = try await git.agentCheckout(worktree.directory, in: project)
-        try validateAgentCheckout(checkout, for: run, confirmedCheckout: AgentRun.checkoutReference(checkout.location))
-        try checkUnchanged(original, address: address, session: session, context: context)
-        let terminal = AgentTerminal()
-        terminal.owner = owner
-        terminals[address] = terminal
-        do {
-            try await startAgentShell(terminal, for: run, afterAgent: false)
-        } catch {
-            terminals.removeValue(forKey: address)
-            throw error
-        }
+        try await startAgentShell(for: run, owner: owner)
     }
 
     private func beginOperation(_ address: NodeAddress) throws -> BoardSession {

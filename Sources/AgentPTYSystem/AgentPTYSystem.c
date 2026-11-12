@@ -59,7 +59,7 @@ static int open_terminal(int *master, int *slave, uint16_t rows, uint16_t column
     return error;
 }
 
-static int spawn_child(const char *directory, char *const argv[], char *const envp[],
+static int spawn_child(int directory, char *const argv[], char *const envp[],
                        int slave, int status_writer, pid_t *pid) {
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attributes;
@@ -82,13 +82,14 @@ static int spawn_child(const char *directory, char *const argv[], char *const en
     result = posix_spawnattr_setflags(&attributes, flags);
     if (result == 0) result = posix_spawnattr_setsigdefault(&attributes, &defaults);
     if (result == 0) result = posix_spawnattr_setsigmask(&attributes, &mask);
+    // Change directory before remapping fd 3, which may be the caller's directory fd.
+    if (result == 0) result = posix_spawn_file_actions_addfchdir(&actions, directory);
     for (int fd = 0; result == 0 && fd <= STDERR_FILENO; ++fd) {
         result = posix_spawn_file_actions_adddup2(&actions, slave, fd);
     }
     if (result == 0) {
         result = posix_spawn_file_actions_adddup2(&actions, status_writer, child_status_fd);
     }
-    if (result == 0) result = posix_spawn_file_actions_addchdir(&actions, directory);
     if (result == 0) result = posix_spawn(pid, argv[0], &actions, &attributes, argv, envp);
 
     posix_spawnattr_destroy(&attributes);
@@ -110,7 +111,7 @@ static int await_exec(int fd) {
     return count == sizeof(child_error) ? child_error : EIO;
 }
 
-int agent_pty_spawn(const char *directory, char *const argv[], char *const envp[],
+int agent_pty_spawn(int directory, char *const argv[], char *const envp[],
                     uint16_t rows, uint16_t columns, AgentPTYHandle *handle) {
     int master = -1, slave = -1;
     int error = open_terminal(&master, &slave, rows, columns);
@@ -147,6 +148,12 @@ int agent_pty_spawn(const char *directory, char *const argv[], char *const envp[
 int agent_pty_resize(int master, uint16_t rows, uint16_t columns) {
     struct winsize size = {.ws_row = rows, .ws_col = columns};
     return ioctl(master, TIOCSWINSZ, &size);
+}
+
+int agent_pty_has_exited(pid_t pid) {
+    siginfo_t info = {0};
+    if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) < 0) return -errno;
+    return info.si_pid == pid;
 }
 
 int agent_pty_reap(pid_t pid, int *exit_code) {

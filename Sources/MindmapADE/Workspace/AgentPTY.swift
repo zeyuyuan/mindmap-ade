@@ -37,7 +37,8 @@ nonisolated final class AgentPTY: @unchecked Sendable {
     private var readBuffer = [UInt8](repeating: 0, count: 32 * 1024)
     private var input = Data()
     private var inputOffset = 0
-    private var stopTargets: StopTargets?
+    private var stopRequested = false
+    private var leaderExited = false
     private var result: Exit?
     private var output: (@Sendable (Data) -> Void)?
     private var backlog: (@Sendable () -> Int)?
@@ -51,6 +52,7 @@ nonisolated final class AgentPTY: @unchecked Sendable {
 
     func start(
         executable: String, arguments: [String], environment: [String: String], directory: String,
+        directoryIdentity: String? = nil,
         output: @escaping @Sendable (Data) -> Void, backlog: @escaping @Sendable () -> Int,
         onExit: @escaping @Sendable (Exit) -> Void
     ) async throws {
@@ -61,7 +63,7 @@ nonisolated final class AgentPTY: @unchecked Sendable {
                     guard self.pid == 0, self.result == nil else { throw POSIXError(.EBUSY) }
                     let handle = try Self.spawn(
                         helper: helper, executable: executable, arguments: arguments, environment: environment,
-                        directory: directory, grid: self.grid)
+                        directory: directory, directoryIdentity: directoryIdentity, grid: self.grid)
                     self.install(handle, output: output, backlog: backlog, onExit: onExit)
                     continuation.resume()
                 } catch {
@@ -100,11 +102,15 @@ nonisolated final class AgentPTY: @unchecked Sendable {
 
     func stop() {
         queue.async { [self] in
-            guard pid > 0, result == nil, stopTargets == nil else { return }
-            let foreground = master.map { tcgetpgrp($0.fd) } ?? -1
-            stopTargets = StopTargets(leader: pid, foreground: foreground)
-            stopTargets?.signal(SIGTERM)
-            queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.forceStop() }
+            guard pid > 0, !leaderExited, !stopRequested else { return }
+            stopRequested = true
+            _ = signalSessionJobs(SIGTERM)
+            _ = kill(pid, SIGTERM)
+            queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self, self.pid > 0, !self.leaderExited else { return }
+                _ = self.signalSessionJobs(SIGKILL)
+                _ = kill(self.pid, SIGKILL)
+            }
         }
     }
 
@@ -209,19 +215,41 @@ nonisolated final class AgentPTY: @unchecked Sendable {
     }
 
     private func reap(observedExit: Bool = true) {
-        guard pid > 0, result == nil else { return }
-        var status: Int32 = 0
-        let reaped = agent_pty_reap(pid, &status)
-        if reaped == -EINTR || (reaped == 0 && observedExit) {
+        guard pid > 0, !leaderExited else { return }
+        let exited = agent_pty_has_exited(pid)
+        if exited == -EINTR || (exited == 0 && observedExit) {
             // NOTE_EXIT can arrive before the child is waitable.
             queue.asyncAfter(deadline: .now() + .milliseconds(10)) { [weak self] in self?.reap() }
             return
         }
-        guard reaped != 0 else { return }
-        result = reaped > 0 ? Exit(code: status) : Exit(code: nil, error: String(cString: strerror(-reaped)))
+        guard exited != 0 else { return }
+        leaderExited = true
+        if exited > 0 {
+            reapAfterCleaningJobs()
+        } else {
+            finish(Exit(code: nil, error: String(cString: strerror(-exited))))
+        }
+    }
+
+    private func reapAfterCleaningJobs() {
+        // Keep the exited leader waitable so its PID cannot be reused while we signal its session.
+        guard signalSessionJobs(SIGKILL) else {
+            queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [weak self] in self?.reapAfterCleaningJobs() }
+            return
+        }
+        var status: Int32 = 0
+        let reaped = agent_pty_reap(pid, &status)
+        if reaped == -EINTR || reaped == 0 {
+            queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [weak self] in self?.reapAfterCleaningJobs() }
+            return
+        }
+        finish(reaped > 0 ? Exit(code: status) : Exit(code: nil, error: String(cString: strerror(-reaped))))
+    }
+
+    private func finish(_ exit: Exit) {
+        result = exit
         reaper?.cancel()
         reaper = nil
-        forceStop()
         if master != nil {
             drainOutput()
         } else {
@@ -251,9 +279,29 @@ nonisolated final class AgentPTY: @unchecked Sendable {
         onExit(result)
     }
 
-    private func forceStop() {
-        stopTargets?.signal(SIGKILL)
-        stopTargets = nil
+    /// Signals live jobs in this PTY session and reports whether the scan found it empty.
+    private func signalSessionJobs(_ signal: Int32) -> Bool {
+        let type = UInt32(PROC_ALL_PIDS)
+        let size = proc_listpids(type, 0, nil, 0)
+        guard size > 0 else { return false }
+        let stride = MemoryLayout<pid_t>.stride
+        var processes = [pid_t](repeating: 0, count: Int(size) / stride + 32)
+        let received = processes.withUnsafeMutableBytes {
+            proc_listpids(type, 0, $0.baseAddress, Int32($0.count))
+        }
+        guard received > 0, Int(received) < processes.count * stride else { return false }
+        var empty = true
+        for process in processes.prefix(Int(received) / stride)
+        where process > 0 && process != pid && getsid(process) == pid {
+            var info = proc_bsdinfo()
+            let length = Int32(MemoryLayout<proc_bsdinfo>.size)
+            if proc_pidinfo(process, PROC_PIDTBSDINFO, 0, &info, length) == length, info.pbi_status == SZOMB {
+                continue
+            }
+            empty = false
+            if getsid(process) == pid { _ = kill(process, signal) }
+        }
+        return empty
     }
 
     private static func launcher() throws -> String {
@@ -275,12 +323,21 @@ nonisolated final class AgentPTY: @unchecked Sendable {
 
     private static func spawn(
         helper: String, executable: String, arguments: [String], environment: [String: String],
-        directory: String, grid: Grid
+        directory: String, directoryIdentity: String?, grid: Grid
     ) throws -> AgentPTYHandle {
         let arguments = [helper, executable, executable] + arguments
         let environment = environment.map { "\($0.key)=\($0.value)" }
         guard !(arguments + environment + [directory]).contains(where: { $0.utf8.contains(0) }) else {
             throw POSIXError(.EINVAL)
+        }
+        let workingDirectory = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard workingDirectory >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(workingDirectory) }
+        if let directoryIdentity {
+            var info = stat()
+            guard fstat(workingDirectory, &info) == 0, GitWorkspace.directoryIdentity(info) == directoryIdentity else {
+                throw WorkspaceIssue("The original worktree was replaced before the terminal started.")
+            }
         }
         var argv = arguments.map { value in value.withCString { strdup($0) } }
         var envp = environment.map { value in value.withCString { strdup($0) } }
@@ -292,59 +349,8 @@ nonisolated final class AgentPTY: @unchecked Sendable {
         argv.append(nil)
         envp.append(nil)
         var handle = AgentPTYHandle()
-        let error = agent_pty_spawn(directory, &argv, &envp, grid.rows, grid.columns, &handle)
+        let error = agent_pty_spawn(workingDirectory, &argv, &envp, grid.rows, grid.columns, &handle)
         guard error == 0 else { throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO) }
         return handle
-    }
-}
-
-private nonisolated struct StopTargets {
-    let leader: pid_t
-    let groups: [pid_t]
-
-    init(leader: pid_t, foreground: pid_t) {
-        self.leader = leader
-        groups = foreground > 0 && foreground != leader ? [leader, foreground] : [leader]
-    }
-
-    func signal(_ signal: Int32) {
-        // Job control can put background commands in their own groups.
-        for group in Set(groups).union(sessionGroups()) where containsSessionMember(group) {
-            _ = kill(-group, signal)
-        }
-    }
-
-    private func sessionGroups() -> Set<pid_t> {
-        let type = UInt32(PROC_ALL_PIDS)
-        let size = proc_listpids(type, 0, nil, 0)
-        guard size > 0 else { return [] }
-        let stride = MemoryLayout<pid_t>.stride
-        var processes = [pid_t](repeating: 0, count: Int(size) / stride + 32)
-        let received = processes.withUnsafeMutableBytes {
-            proc_listpids(type, 0, $0.baseAddress, Int32($0.count))
-        }
-        var groups = Set<pid_t>()
-        for process in processes.prefix(max(0, Int(received) / stride))
-        where process > 0 && getsid(process) == leader {
-            let group = getpgid(process)
-            if group > 0 { groups.insert(group) }
-        }
-        return groups
-    }
-
-    private func containsSessionMember(_ group: pid_t) -> Bool {
-        if getsid(group) == leader, getpgid(group) == group { return true }
-        // A group can outlive its leader. Check a surviving member before signalling it.
-        let type = UInt32(PROC_PGRP_ONLY)
-        let size = proc_listpids(type, UInt32(group), nil, 0)
-        guard size > 0 else { return false }
-        let stride = MemoryLayout<pid_t>.stride
-        var members = [pid_t](repeating: 0, count: Int(size) / stride + 8)
-        let received = members.withUnsafeMutableBytes {
-            proc_listpids(type, UInt32(group), $0.baseAddress, Int32($0.count))
-        }
-        return members.prefix(max(0, Int(received) / stride)).contains {
-            $0 > 0 && getsid($0) == leader && getpgid($0) == group
-        }
     }
 }

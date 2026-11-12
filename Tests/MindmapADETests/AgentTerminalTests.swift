@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Testing
 import os
@@ -72,6 +73,43 @@ struct AgentTerminalTests {
         try await waitUntil { exit.withLock { $0 != nil } }
         #expect(received.withLock { $0 } == length)
         #expect(exit.withLock { $0 } == 0)
+    }
+
+    @Test func naturalExitCleansBackgroundJobsInSeparateProcessGroups() async throws {
+        let pty = AgentPTY()
+        defer { pty.stop() }
+        let output = OSAllocatedUnfairLock(initialState: Data())
+        let exit = OSAllocatedUnfairLock(initialState: Int32?.none)
+        let script = #"""
+            set -m
+            /bin/sh -c 'trap "" HUP TERM; printf "job %s\n" "$$"; exec /bin/sleep 60' &
+            IFS= read -r line
+            exit 17
+            """#
+        try await pty.start(
+            executable: "/bin/sh", arguments: ["-c", script], environment: [:], directory: "/",
+            output: { bytes in output.withLock { $0.append(bytes) } }, backlog: { 0 },
+            onExit: { result in exit.withLock { $0 = result.code ?? -1 } })
+        var job: pid_t?
+        try await waitUntil {
+            let text = output.withLock { String(decoding: $0, as: UTF8.self) }
+            let fields = text.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 2, fields[0] == "job" else { return false }
+            job = pid_t(fields[1])
+            return job != nil
+        }
+        let background = try #require(job)
+        let session = getsid(background)
+        #expect(session > 0)
+        #expect(getpgid(background) == background)
+        #expect(getpgid(background) != session)
+        defer {
+            if session > 0, getsid(background) == session { _ = kill(background, SIGKILL) }
+        }
+        pty.send(Data([0x0a]))
+        try await waitUntil { exit.withLock { $0 != nil } }
+        #expect(exit.withLock { $0 } == 17)
+        try await waitUntil { getsid(background) != session }
     }
 
     @Test func hiddenGhosttySurfaceKeepsScrollbackAndAcceptsInputAfterMovingWindows() async throws {

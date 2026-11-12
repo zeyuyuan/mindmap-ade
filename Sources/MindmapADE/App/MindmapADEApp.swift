@@ -63,7 +63,7 @@ final class MindmapAppDelegate: NSObject, NSApplicationDelegate {
         Task {
             do {
                 try await workspace.flush()
-                if workspace.hasActiveWork() || workspace.mcpListener != nil || !workspace.shellTerminals.isEmpty {
+                if workspace.hasActiveWork() || workspace.mcpListener != nil {
                     try await workspace.interruptAllAgents()
                 }
                 if workspace.saveState != .saved { try await workspace.flush() }

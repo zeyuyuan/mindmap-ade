@@ -96,7 +96,10 @@ final class AgentTerminal {
         Self.parkingWindow.contentView?.addSubview(view)
     }
 
-    func start(executable: String, arguments: [String], environment: [String: String], directory: String) async throws {
+    func start(
+        executable: String, arguments: [String], environment: [String: String], directory: String,
+        directoryIdentity: String? = nil
+    ) async throws {
         let pty = AgentPTY()
         transport.withLock {
             precondition($0.pty == nil)
@@ -106,6 +109,7 @@ final class AgentTerminal {
         do {
             try await pty.start(
                 executable: executable, arguments: arguments, environment: environment, directory: directory,
+                directoryIdentity: directoryIdentity,
                 output: { [weak session, outputChanged] data in
                     session?.receive(data)
                     outputChanged.withLock { $0 = true }
@@ -125,19 +129,23 @@ final class AgentTerminal {
         }
     }
 
-    func startShell(executable: String, directory: String, afterAgent: Bool) async throws {
-        if afterAgent {
-            // Enter then leave the alternate screen so mode 1049 saves the current cursor
-            // when the agent already returned to the main screen.
-            session.receive(
-                "\u{18}\u{1b}[?1049h\u{1b}[?1049l\u{1b}[!p"
-                    + "\u{1b}[?1000;1002;1003;1004;1006;2004;2026l\u{1b}[=0u\r\n")
-        }
+    func resetAfterAgentExit() {
+        // Return to the main screen before reading the final transcript.
+        // The mode 1049 pair preserves the cursor if the agent already left the alternate screen.
+        session.receive(
+            "\u{18}\u{1b}[?1049h\u{1b}[?1049l\u{1b}[!p"
+                + "\u{1b}[?1000;1002;1003;1004;1006;2004;2026l\u{1b}[=0u\r\n")
+        outputChanged.withLock { $0 = true }
+    }
+
+    func startShell(executable: String, checkout: GitWorkspace.AgentCheckout) async throws {
         var environment = AgentCLI.environment(executable: executable)
         environment["SHELL"] = executable
         isShell = true
         do {
-            try await start(executable: executable, arguments: ["-i"], environment: environment, directory: directory)
+            try await start(
+                executable: executable, arguments: ["-i"], environment: environment,
+                directory: checkout.location.directory, directoryIdentity: checkout.directoryIdentity)
         } catch {
             isShell = false
             throw error

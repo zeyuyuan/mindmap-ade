@@ -51,6 +51,11 @@ nonisolated enum AgentCLI {
             && files.isExecutableFile(atPath: path)
     }
 
+    static var interactiveShell: String {
+        if let shell = ProcessInfo.processInfo.environment["SHELL"], isExecutableFile(shell) { return shell }
+        return "/bin/zsh"
+    }
+
     static func environment(executable: String) -> [String: String] {
         var values = ProcessInfo.processInfo.environment
         let bin = URL(fileURLWithPath: executable).deletingLastPathComponent()

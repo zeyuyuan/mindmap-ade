@@ -14,6 +14,7 @@ actor GitWorkspace {
     struct AgentCheckout: Sendable {
         let location: WorktreeLocation
         let identity: String
+        let directoryIdentity: String
     }
 
     func project(at path: String) throws -> ProjectLocation {
@@ -73,7 +74,8 @@ actor GitWorkspace {
         // Git can reuse both paths when a checkout is removed and created again.
         let folderIdentity = try directoryIdentity(location.directory)
         let gitIdentity = try directoryIdentity(gitDirectory)
-        return AgentCheckout(location: location, identity: "\(folderIdentity):\(gitIdentity)")
+        return AgentCheckout(
+            location: location, identity: "\(folderIdentity):\(gitIdentity)", directoryIdentity: folderIdentity)
     }
 
     func plan(
@@ -206,6 +208,10 @@ actor GitWorkspace {
         guard stat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else {
             throw WorkspaceIssue("The original worktree or its Git directory is unavailable.")
         }
+        return Self.directoryIdentity(info)
+    }
+
+    nonisolated static func directoryIdentity(_ info: stat) -> String {
         let birth = info.st_birthtimespec
         return "\(info.st_ino)/\(birth.tv_sec)/\(birth.tv_nsec)"
     }

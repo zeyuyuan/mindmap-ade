@@ -39,7 +39,7 @@ extension WorkspaceStore {
             let run = savedConversation(at: address), !run.state.isActive
         else { return }
         let issue = recoveryIssues[address]
-        guard !automatically || (run.state == .interrupted && issue == nil) else { return }
+        guard !automatically || (run.state == .interrupted && issue == nil && terminals[address] == nil) else { return }
         Task {
             guard !operations.contains(address), agentRuns[address]?.id == run.id else { return }
             do {
@@ -73,22 +73,29 @@ extension WorkspaceStore {
         project: ProjectLocation, executable: AgentCLI.Executable, previous: AgentRun? = nil, owner: UUID? = nil
     ) async throws {
         let worktree = checkout.location
+        var run = AgentRun(
+            address: address, worktree: worktree, cli: agent.cli, executable: executable.path,
+            conversationID: previous?.conversationID, worktreeIdentity: checkout.identity)
+        let previousTerminal = terminals[address]
+        let terminalOwner = owner ?? previousTerminal?.owner
+        if let previousTerminal, previousTerminal.isShell {
+            previousTerminal.stop()
+            try await waitForTerminalShutdown { terminals[address] === previousTerminal }
+            let current = try await git.agentCheckout(worktree.directory, in: project)
+            try validateAgentCheckout(current, for: run, confirmedCheckout: nil)
+        }
         var environment = AgentCLI.environment(executable: executable.path)
-        var conversationID = previous?.conversationID
         if agent.cli == .codex, executable.supportsSessionIntegration {
-            if let conversationID {
+            if let conversationID = run.conversationID {
                 try await CodexConversation.verify(
                     conversationID, executable: executable.path, environment: environment, directory: worktree.directory
                 )
             } else {
                 let name = session.board.nodes[address.nodeID]?.title ?? "Mindmap Agent"
-                conversationID = try? await CodexConversation.create(
+                run.conversationID = try? await CodexConversation.create(
                     executable: executable.path, environment: environment, directory: worktree.directory, name: name)
             }
         }
-        var run = AgentRun(
-            address: address, worktree: worktree, cli: agent.cli, executable: executable.path,
-            conversationID: conversationID, worktreeIdentity: checkout.identity)
         let lastRun = agentRuns[address]
         if let lastRun {
             run.previousSnapshotID = lastRun.previousSnapshotID
@@ -119,20 +126,21 @@ extension WorkspaceStore {
             try validateAgentCheckout(current, for: run, confirmedCheckout: nil)
             let arguments = try AgentCLI.arguments(
                 for: agent, executable: executable, context: promptContext(for: run, in: session),
-                mcpBridge: connection.bridge, conversationID: conversationID, isResuming: previous != nil,
+                mcpBridge: connection.bridge, conversationID: run.conversationID, isResuming: previous != nil,
                 commandCodeMod: commandCodeMod)
             let terminal = AgentTerminal()
-            terminal.owner = owner
-            let runID = run.id
-            terminal.didExit = { [weak self] status, error in
-                Task { await self?.finishAgent(at: address, runID: runID, exitCode: status, error: error) }
-            }
-            try terminal.start(
-                executable: executable.path, arguments: arguments, environment: environment, directory: run.directory)
+            try await terminal.start(
+                executable: executable.path, arguments: arguments, environment: environment, directory: run.directory,
+                directoryIdentity: current.directoryIdentity)
+            terminal.owner = terminalOwner
             terminals[address] = terminal
             agentRuns[address]?.state = .running
             recordOutput(of: terminal, for: run)
             scheduleSave()
+            let runID = run.id
+            terminal.didExit = { [weak self] status, error in
+                Task { await self?.finishAgent(at: address, runID: runID, exitCode: status, error: error) }
+            }
         } catch {
             if let lastRun {
                 agentRuns[address] = lastRun
@@ -161,14 +169,58 @@ extension WorkspaceStore {
             agentRuns[address]?.state = .interrupting
             terminals[address]?.stop()
         }
+        for terminal in terminals.values where terminal.isShell { terminal.stop() }
+        try await waitForTerminalShutdown {
+            agentRuns.values.contains(where: { $0.state.isActive }) || terminals.values.contains(where: \.isShell)
+        }
+        await commandCodeConnection.removeAll()
+    }
+
+    private func waitForTerminalShutdown(while isRunning: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(4))
-        while agentRuns.values.contains(where: { $0.state.isActive }) {
+        while isRunning() {
             guard ContinuousClock.now < deadline else {
-                throw WorkspaceIssue("An Agent is still stopping. Try quitting again after it exits.")
+                throw WorkspaceIssue("A terminal process is still stopping. Try again after it exits.")
             }
             try await Task.sleep(for: .milliseconds(40))
         }
-        await commandCodeConnection.removeAll()
+    }
+
+    func startAgentShell(for run: AgentRun, continuing terminal: AgentTerminal? = nil, owner: UUID? = nil) async throws
+    {
+        let address = run.address
+        guard let session = board(address.boardID), let node = session.board.nodes[address.nodeID],
+            node.content.kind == .agent
+        else { throw WorkspaceIssue("The Agent is no longer available.") }
+        let context = session.board.context(above: address.nodeID)
+        guard context.problem == nil, let project = context.project,
+            let worktree = context.worktree, worktree.directory == run.directory,
+            worktree.gitCommonDirectory == run.gitCommonDirectory
+        else { throw WorkspaceIssue("The original worktree is no longer linked to this Agent.") }
+
+        let checkout = try await git.agentCheckout(worktree.directory, in: project)
+        guard !isQuitting, agentRuns[address]?.id == run.id, agentRuns[address]?.state == run.state,
+            terminals[address] === terminal
+        else { return }
+        guard board(address.boardID) === session, session.board.nodes[address.nodeID]?.content == node.content,
+            session.board.context(above: address.nodeID) == context
+        else { throw WorkspaceIssue("The Agent or its worktree changed while opening the shell.") }
+        try validateAgentCheckout(checkout, for: run, confirmedCheckout: AgentRun.checkoutReference(checkout.location))
+        let shell = terminal ?? AgentTerminal()
+        if terminal == nil {
+            shell.owner = owner
+            terminals[address] = shell
+        }
+        do {
+            try await shell.startShell(executable: interactiveShell, checkout: checkout)
+        } catch {
+            if terminal == nil { terminals.removeValue(forKey: address) }
+            throw error
+        }
+        shell.didExit = { [weak self, weak shell] _, _ in
+            guard let self, let shell, terminals[address] === shell else { return }
+            terminals.removeValue(forKey: address)
+        }
     }
 
     private func recordOutput(of terminal: AgentTerminal, for run: AgentRun) {
@@ -183,7 +235,7 @@ extension WorkspaceStore {
 
     private func saveOutput(of terminal: AgentTerminal, for run: AgentRun) async {
         guard agentRuns[run.address]?.id == run.id else { return }
-        if let snapshot = terminal.snapshotToSave() {
+        if let snapshot = await terminal.snapshotToSave() {
             do {
                 try await agentFiles.saveSnapshot(snapshot, for: run.id)
                 terminal.didSaveSnapshot(snapshot)
@@ -202,23 +254,35 @@ extension WorkspaceStore {
 
     private func finishAgent(at address: NodeAddress, runID: UUID, exitCode: Int32?, error: String?) async {
         guard let run = agentRuns[address], run.id == runID, run.state.isActive else { return }
-        if let terminal = terminals[address] {
+        let terminal = terminals[address]
+        if let terminal {
             terminal.recording?.cancel()
             await terminal.recording?.value
+            terminal.resetAfterAgentExit()
             await saveOutput(of: terminal, for: run)
         }
+        guard let finished = agentRuns[address], finished.id == runID, finished.state.isActive else { return }
+        releaseMCP(for: finished)
+        var shellError: String?
+        if finished.state == .running, error == nil, !isQuitting, let terminal {
+            do {
+                try await startAgentShell(for: finished, continuing: terminal)
+            } catch {
+                shellError = error.localizedDescription
+            }
+        }
         guard var current = agentRuns[address], current.id == runID, current.state.isActive else { return }
+        if current.state == .stopping || current.state == .interrupting || isQuitting { terminal?.stop() }
         switch current.state {
         case .stopping: current.state = .stopped
         case .interrupting: current.state = .interrupted
         default: current.state = error != nil || exitCode != 0 ? .failed : .exited
         }
         current.exitCode = exitCode
-        current.error = error
+        current.error = error ?? shellError
         current.finishedAt = .now
         agentRuns[address] = current
-        terminals.removeValue(forKey: address)
-        releaseMCP(for: current)
+        if terminals[address]?.isShell != true { terminals.removeValue(forKey: address) }
         scheduleSave()
     }
 

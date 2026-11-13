@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Darwin
 import Foundation
 import Testing
@@ -147,6 +148,7 @@ struct AgentWorkspaceTests {
             #"""
             test -t 0 && pwd -P > actual-directory
             printf '%s' "$3" > actual-task
+            set -m
             /bin/sh -c 'trap "" TERM HUP; echo $$ > child-pid.tmp; mv child-pid.tmp child-pid; exec /bin/sleep 99' &
             wait
             """#)
@@ -183,6 +185,7 @@ struct AgentWorkspaceTests {
         let childPID = try #require(
             Int32(String(contentsOf: childMarker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         let childSession = getsid(childPID)
+        #expect(getpgid(childPID) != childSession)
         defer {
             if childSession > 0, getsid(childPID) == childSession { _ = kill(childPID, SIGKILL) }
         }
@@ -596,6 +599,9 @@ struct AgentWorkspaceTests {
         await #expect(throws: WorkspaceIssue.self) {
             try await stopped.resumeAgent(at: address, detectCLI: detectCLI)
         }
+        await #expect(throws: WorkspaceIssue.self) {
+            try await stopped.openAgentShell(at: address, owner: UUID())
+        }
         #expect(stopped.agentRuns[address]?.id == stoppedRun.id)
         #expect(await stopped.agentFiles.snapshot(for: stoppedRun.id) == "Original conversation resumed")
 
@@ -614,25 +620,191 @@ struct AgentWorkspaceTests {
     @Test func terminalOutputRemainsPendingUntilWritten() async throws {
         _ = NSApplication.shared
         let terminal = AgentTerminal()
-        try terminal.start(
+        try await terminal.start(
             executable: "/bin/sh", arguments: ["-c", "echo 'Pending output'; exec /bin/sleep 30"],
             environment: AgentCLI.environment(executable: "/bin/sh"), directory: "/")
         defer { terminal.stop() }
         var output: Data?
         try await waitUntil {
-            output = terminal.snapshotToSave()
+            output = await terminal.snapshotToSave()
             return output != nil
         }
         let snapshot = try #require(output)
         #expect(String(decoding: snapshot, as: UTF8.self) == "Pending output")
-        #expect(terminal.snapshotToSave() == snapshot)
+        #expect(await terminal.snapshotToSave() == snapshot)
         terminal.didSaveSnapshot(snapshot)
-        #expect(terminal.snapshotToSave() == nil)
+        #expect(await terminal.snapshotToSave() == nil)
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
+    @Test(arguments: [false, true])
+    func controlCReturnsToAnInteractiveShellInTheSameWorktree(alternateScreen: Bool) async throws {
+        _ = NSApplication.shared
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let cli = try fixture.commandCodeStub(
+            #"""
+            printf '%s' 4f371e83-3a27-4474-b85d-2fd93212a841 > "$MINDMAP_AGENT_SESSION_FILE"
+            if [ "$4" = --session ]; then
+                if /bin/ps -o state= -p "$(cat shell-job)" | /usr/bin/grep -q '^[[:space:]]*[^[:space:]Z]'; then
+                    touch shell-job-overlap
+                fi
+                touch conversation-resumed
+                exec /bin/sleep 30
+            fi
+            trap 'exit 0' INT
+            printf 'Original terminal output\nMore terminal output\nFinal terminal output\n'
+            if \#(alternateScreen ? "true" : "false"); then
+                printf '\033[?1049hAlternate screen content\n'
+            fi
+            printf '\033[?2004h'
+            touch agent-ready
+            while IFS= read -r line; do :; done
+            """#)
+        let shell = try fixture.cliStub(
+            "test-shell",
+            #"""
+            #!/bin/sh
+            test "$1" = -i && test -t 0 || exit 40
+            test -z "$MINDMAP_MCP_TOKEN$MINDMAP_MCP_SOCKET$MINDMAP_AGENT_SESSION_FILE" || exit 41
+            PS1='Mindmap test shell$ ' ENV=/dev/null exec /bin/sh "$@"
+            """#)
+        var project = ProjectTopic()
+        project.location = try await GitWorkspace().project(at: fixture.repository.path)
+        let root = MapNode(content: .project(project))
+        let topic = AgentTopic()
+        let node = MapNode(content: .agent(topic))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(node, parent: root.id)).edit)
+        let disk = LaunchTestDisk(directory: fixture.data, board: board)
+        let workspace = WorkspaceStore(disk: disk, interactiveShell: shell.path)
+        await workspace.loadIfNeeded()
+        let address = NodeAddress(boardID: board.id, nodeID: node.id)
+        let detectCLI: @MainActor (AgentCLIKind) async -> AgentCLI.Executable? = { _ in
+            .init(path: cli.path, supportsSessionIntegration: true)
+        }
+        try await workspace.launchAgent(topic, at: address, detectCLI: detectCLI)
+        let terminal = try #require(workspace.terminals[address])
+        defer {
+            terminal.stop()
+            workspace.terminals[address]?.stop()
+        }
+        let run = try #require(workspace.agentRuns[address])
+        let directory = URL(fileURLWithPath: run.directory)
+        try await waitUntil {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("agent-ready").path)
+        }
+        #expect(terminal.view.sendKey(.c, modifiers: [.ctrl]))
+
+        try await waitUntil { workspace.agentRuns[address]?.state == .exited && terminal.isShell }
+        #expect(workspace.terminals[address] === terminal)
+        #expect(workspace.agentRuns[address]?.exitCode == 0)
+        #expect(workspace.mcpGrants.isEmpty)
+        #expect(workspace.savedConversation(at: address) != nil)
+        let saved = try #require(await workspace.agentFiles.snapshot(for: run.id))
+        #expect(saved.hasPrefix("Original terminal output\nMore terminal output\nFinal terminal output"))
+        #expect(!saved.contains("Alternate screen content"))
+        #expect(!saved.contains("Mindmap test shell$"))
+        try await waitUntil {
+            guard let snapshot = await terminal.snapshotToSave() else { return false }
+            let text = String(decoding: snapshot, as: UTF8.self)
+            return text.hasPrefix("Original terminal output\nMore terminal output\nFinal terminal output")
+                && text.hasSuffix("Mindmap test shell$")
+        }
+        #expect(terminal.view.paste(text: "pwd -P > shell-directory"))
+        let returnKey = try #require(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: terminal.view.window?.windowNumber ?? 0, context: nil,
+                characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false,
+                keyCode: UInt16(kVK_Return)))
+        terminal.view.keyDown(with: returnKey)
+        let marker = directory.appendingPathComponent("shell-directory")
+        try await waitUntil { FileManager.default.fileExists(atPath: marker.path) }
+        let actual = try String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .newlines)
+        #expect(URL(fileURLWithPath: actual).resolvingSymlinksInPath().path == directory.resolvingSymlinksInPath().path)
+
+        #expect(
+            terminal.view.paste(
+                text:
+                    #"/bin/sh -c 'trap "" HUP TERM; echo $$ > shell-job.tmp; mv shell-job.tmp shell-job; exec /bin/sleep 30' &"#
+            ))
+        terminal.view.keyDown(with: returnKey)
+        let shellJobMarker = directory.appendingPathComponent("shell-job")
+        try await waitUntil { FileManager.default.fileExists(atPath: shellJobMarker.path) }
+        let background = try #require(
+            pid_t(
+                try String(contentsOf: shellJobMarker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+        let shellSession = getsid(background)
+        defer {
+            if shellSession > 0, getsid(background) == shellSession { _ = kill(background, SIGKILL) }
+        }
+        try await workspace.resumeAgent(at: address, detectCLI: detectCLI)
+        #expect(workspace.terminals[address] !== terminal)
+        try await waitUntil {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("conversation-resumed").path)
+        }
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("shell-job-overlap").path))
+        workspace.stopAgent(at: address)
+        try await waitUntil { workspace.agentRuns[address]?.state == .stopped }
+        #expect(workspace.terminals[address] == nil)
+
+        try await workspace.openAgentShell(at: address, owner: UUID())
+        #expect(workspace.terminals[address]?.isShell == true)
+        try await workspace.interruptAllAgents()
+        #expect(workspace.terminals[address] == nil)
+        #expect(workspace.agentRuns[address]?.state == .stopped)
+    }
+
+    @Test func agentExitDoesNotOpenAShellInAReplacementDirectory() async throws {
+        _ = NSApplication.shared
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let cli = try fixture.commandCodeStub(
+            """
+            trap 'exit 0' INT
+            touch agent-ready
+            while IFS= read -r line; do :; done
+            """)
+        let shell = try fixture.cliStub("test-shell", "#!/bin/sh\ntouch shell-started\nexec /bin/sleep 30\n")
+        var project = ProjectTopic()
+        project.location = try await GitWorkspace().project(at: fixture.repository.path)
+        let root = MapNode(content: .project(project))
+        let topic = AgentTopic()
+        let node = MapNode(content: .agent(topic))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(node, parent: root.id)).edit)
+        let disk = LaunchTestDisk(directory: fixture.data, board: board)
+        let workspace = WorkspaceStore(disk: disk, interactiveShell: shell.path)
+        await workspace.loadIfNeeded()
+        let address = NodeAddress(boardID: board.id, nodeID: node.id)
+        try await workspace.launchAgent(topic, at: address, detectCLI: { _ in .init(path: cli.path) })
+        let terminal = try #require(workspace.terminals[address])
+        defer { terminal.stop() }
+        let run = try #require(workspace.agentRuns[address])
+        let directory = URL(fileURLWithPath: run.directory)
+        try await waitUntil {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("agent-ready").path)
+        }
+        let moved = fixture.home.appendingPathComponent("Moved worktree")
+        try fixture.git(["worktree", "move", run.directory, moved.path])
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+
+        #expect(terminal.view.sendKey(.c, modifiers: [.ctrl]))
+        try await waitUntil { workspace.agentRuns[address]?.state == .exited }
+        #expect(workspace.terminals[address] == nil)
+        #expect(workspace.agentRuns[address]?.exitCode == 0)
+        #expect(workspace.agentRuns[address]?.error != nil)
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("shell-started").path))
+        await #expect(throws: WorkspaceIssue.self) {
+            try await workspace.openAgentShell(at: address, owner: UUID())
+        }
+        #expect(workspace.terminals[address] == nil)
+    }
+
+    private func waitUntil(_ condition: () async -> Bool) async throws {
         for _ in 0..<200 {
-            if condition() { return }
+            if await condition() { return }
             try await Task.sleep(for: .milliseconds(10))
         }
         throw WorkspaceIssue("Timed out waiting for the test process.")

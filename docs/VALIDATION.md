@@ -75,7 +75,7 @@ Validated on November 7, 2026:
 
 ## Deferred Validation
 
-Embedded Ghostty terminals and other node types are outside this version. Real IME composition, VoiceOver navigation, and sustained GPU/frame-time profiling need dedicated testing before broader distribution.
+Real IME composition, VoiceOver navigation, and sustained GPU/frame-time profiling need dedicated testing before broader distribution.
 
 ## Resource Nodes and Agent Sessions
 
@@ -86,4 +86,12 @@ Validated November 7–9, 2026, with macOS 27.0.1 and Xcode 26.6. Native checks 
 - Command Code and Codex started in their bound Worktrees and discovered the map tools. The integration tests cover branch permissions, duplicate operation IDs, registering another Worktree, and revoking map access after Stop.
 - The Agent form kept the conversation name visible and the focus rings intact. Its CLI selection survived restart. The terminal opened to the right of the canvas; hiding it or switching boards preserved a live conversation.
 
-The terminal backend is SwiftTerm. The workspace keeps the latest run record. Terminal scrollback is available during the current app session. A future backend can supply a libghostty surface through the terminal session boundary.
+The terminal backend uses Ghostty with a host-managed PTY. The workspace keeps the latest run record and a bounded plain-text terminal snapshot for recovery.
+
+## Ghostty and Native PTY
+
+Validated November 11, 2026, on Apple Silicon with macOS 27.0.1 and Xcode 26.6.
+
+- Both SwiftPM build systems passed all 45 tests. The concurrent PTY regression also passed eight repeated 12-session runs. Coverage includes launch errors, controlling terminals, separate job groups, output backpressure, rapid exits, hidden scrollback, cross-window attachment, and final snapshot writes.
+- A temporary workspace exercised the native pane with a deterministic CLI. Unicode paste, divider resize, hide and reopen after 20,000 output lines, switching between two Agents, Stop, exit status, and saved output worked.
+- The signed universal Release app launched after being moved outside the checkout. It restored the interrupted test session, accepted terminal input, and quit normally with Command-Q while the terminal was focused.

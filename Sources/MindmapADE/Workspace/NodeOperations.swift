@@ -23,20 +23,27 @@ extension WorkspaceStore {
     func hasActiveWork(in boardID: UUID? = nil) -> Bool {
         operations.contains { boardID == nil || $0.boardID == boardID }
             || agentRuns.values.contains { $0.state.isActive && (boardID == nil || $0.address.boardID == boardID) }
+            || terminals.contains { $0.value.isShell && (boardID == nil || $0.key.boardID == boardID) }
     }
 
     func rejection(of edit: BoardEdit, on board: MindMapBoard) -> String? {
-        let active = agentRuns.values.filter { $0.address.boardID == board.id && $0.state.isActive }
+        let active = agentRuns.values.filter {
+            $0.address.boardID == board.id && ($0.state.isActive || terminals[$0.address]?.isShell == true)
+        }
         guard !active.isEmpty else { return nil }
         var candidate = board
         candidate.apply(edit)
         for run in active {
             let context = candidate.context(above: run.address.nodeID)
             guard case .agent(let agent) = candidate.nodes[run.address.nodeID]?.content,
-                agent.isConfigured, agent.cli == run.cli, context.problem == nil,
+                agent.isConfigured, !run.state.isActive || agent.cli == run.cli, context.problem == nil,
                 context.worktree?.directory == run.directory,
                 context.worktree?.gitCommonDirectory == run.gitCommonDirectory
-            else { return "Stop the running conversation before removing it or changing its worktree." }
+            else {
+                return run.state.isActive
+                    ? "Stop the running conversation before removing it or changing its worktree."
+                    : "Exit the shell before removing its Agent or changing its worktree."
+            }
         }
         return nil
     }
@@ -194,6 +201,14 @@ extension WorkspaceStore {
         try await startAgentProcess(
             agent, at: address, in: session, checkout: checkout, project: project, executable: executable,
             previous: previous, owner: owner)
+    }
+
+    func openAgentShell(at address: NodeAddress, owner: UUID) async throws {
+        let session = try beginOperation(address)
+        defer { operations.remove(address) }
+        let original = try node(at: address, in: session)
+        guard original.content.kind == .agent, let run = agentRuns[address], terminals[address] == nil else { return }
+        try await startAgentShell(for: run, owner: owner)
     }
 
     private func beginOperation(_ address: NodeAddress) throws -> BoardSession {

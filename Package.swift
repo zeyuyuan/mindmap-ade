@@ -9,13 +9,18 @@ let package = Package(
         .executable(name: "MindmapADE", targets: ["MindmapADE"])
     ],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.99.3")
+        .package(path: "Vendor/libghostty-spm")
     ],
     targets: [
         .target(name: "MindMapCore"),
+        .target(name: "AgentPTYSystem"),
+        .executableTarget(name: "AgentPTYLaunch"),
         .executableTarget(
             name: "MindmapADE",
-            dependencies: ["MindMapCore", .product(name: "SwiftTerm", package: "SwiftTerm")],
+            dependencies: [
+                "MindMapCore", "AgentPTYSystem", "AgentPTYLaunch",
+                .product(name: "GhosttyTerminal", package: "libghostty-spm"),
+            ],
             swiftSettings: [.defaultIsolation(MainActor.self)]
         ),
         .testTarget(name: "MindMapCoreTests", dependencies: ["MindMapCore"]),

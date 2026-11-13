@@ -1,4 +1,5 @@
 import AppKit
+import GhosttyTerminal
 import MindMapCore
 import SwiftUI
 
@@ -10,8 +11,10 @@ struct AgentTerminalPane: View {
     @State private var output: String?
     @State private var previousOutput: String?
     @State private var showsPreviousOutput = false
+    @State private var shellError: String?
 
     private var run: AgentRun? { workspace.agentRuns[address] }
+    private var terminal: AgentTerminal? { workspace.terminals[address] }
     private var recoveryIssue: AgentRecoveryIssue? { workspace.recoveryIssues[address] }
     private var hasSavedConversation: Bool { workspace.savedConversation(at: address) != nil }
     private var isOpening: Bool {
@@ -22,13 +25,13 @@ struct AgentTerminalPane: View {
         VStack(spacing: 0) {
             header
             Divider()
-            if let terminal = workspace.terminals[address], !showsPreviousOutput {
+            if run?.state.isActive != true || isOpening {
+                recoveryActions
+                Divider()
+            }
+            if let terminal, !showsPreviousOutput {
                 liveTerminal(terminal)
             } else {
-                if run?.state.isActive != true || isOpening {
-                    recoveryActions
-                    Divider()
-                }
                 transcript
             }
         }
@@ -53,7 +56,7 @@ struct AgentTerminalPane: View {
     @ViewBuilder
     private func liveTerminal(_ terminal: AgentTerminal) -> some View {
         if terminal.owner == actions.windowID {
-            TerminalAttachment(terminal: terminal)
+            TerminalAttachment(terminal: terminal, windowID: actions.windowID)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
         } else {
@@ -95,13 +98,13 @@ struct AgentTerminalPane: View {
             if isOpening {
                 HStack(spacing: CanvasStyle.formSpacing) {
                     ProgressView().controlSize(.small)
-                    Text("Opening conversation…")
+                    Text("Opening terminal…")
                 }
             } else if let run {
-                if let message = recoveryIssue?.errorDescription ?? run.error {
+                if let message = shellError ?? recoveryIssue?.errorDescription ?? run.error {
                     Label(message, systemImage: "exclamationmark.triangle")
                         .fixedSize(horizontal: false, vertical: true)
-                } else if !hasSavedConversation {
+                } else if !hasSavedConversation, terminal?.isShell != true {
                     Text("There is no saved conversation for this Agent configuration.")
                         .foregroundStyle(.secondary)
                 }
@@ -128,8 +131,22 @@ struct AgentTerminalPane: View {
     private func recoveryButtons(for run: AgentRun) -> some View {
         if hasSavedConversation {
             Button(recoveryTitle(for: run)) {
+                shellError = nil
                 showsPreviousOutput = false
                 workspace.requestAgentResume(at: address, owner: actions.windowID)
+            }
+        }
+        if terminal == nil {
+            Button("Open Shell") {
+                shellError = nil
+                showsPreviousOutput = false
+                Task {
+                    do {
+                        try await workspace.openAgentShell(at: address, owner: actions.windowID)
+                    } catch {
+                        shellError = error.localizedDescription
+                    }
+                }
             }
         }
         if !hasSavedConversation || recoveryIssue != nil || run.state == .failed {
@@ -160,11 +177,8 @@ struct AgentTerminalPane: View {
             HStack(spacing: CanvasStyle.formSpacing) {
                 if let run {
                     HStack(spacing: CanvasStyle.formSpacing) {
-                        Text(
-                            workspace.connectedMapRuns.contains(run.id)
-                                ? "\(run.state.title) · Map connected" : run.state.title
-                        )
-                        .layoutPriority(1)
+                        Text(statusTitle(for: run))
+                            .layoutPriority(1)
                         if let code = run.exitCode { Text("Exit \(code)").fixedSize() }
                         Text(run.directory).monospaced().truncationMode(.middle)
                     }
@@ -204,23 +218,78 @@ struct AgentTerminalPane: View {
         .padding(.vertical, CanvasStyle.statusVerticalPadding)
         .background(.bar)
     }
+
+    private func statusTitle(for run: AgentRun) -> String {
+        if terminal?.isShell == true, !run.state.isActive, !showsPreviousOutput {
+            return "Shell · \(run.state.title)"
+        }
+        if workspace.connectedMapRuns.contains(run.id) { return "\(run.state.title) · Map connected" }
+        return run.state.title
+    }
+}
+
+final class AgentTerminalView: AppTerminalView {
+    private static let appKeys: Set<String> = ["h", "m", "n", "q", "w"]
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if let key = event.charactersIgnoringModifiers?.lowercased(),
+            (modifiers == .command && Self.appKeys.contains(key))
+                || (modifiers == [.command, .shift] && key == "n")
+        {
+            // The AppKit menu owns window and application commands.
+            return false
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 private struct TerminalAttachment: NSViewRepresentable {
     let terminal: AgentTerminal
+    let windowID: UUID
 
-    func makeNSView(context: Context) -> NSView { NSView() }
-
-    func updateNSView(_ container: NSView, context: Context) {
-        guard terminal.view.superview !== container else { return }
-        terminal.view.removeFromSuperview()
-        terminal.view.frame = container.bounds
-        terminal.view.autoresizingMask = [.width, .height]
-        container.addSubview(terminal.view)
+    func makeNSView(context: Context) -> Host {
+        let host = Host()
+        host.wantsLayer = true
+        host.layer?.masksToBounds = true
+        return host
     }
 
-    static func dismantleNSView(_ view: NSView, coordinator: ()) {
-        for child in view.subviews { child.removeFromSuperview() }
+    func updateNSView(_ host: Host, context: Context) {
+        let isNew = host.terminal !== terminal
+        if isNew { host.detach() }
+        guard terminal.owner == windowID else { return }
+        host.terminal = terminal
+        terminal.attach(to: host)
+        if isNew, terminal.isShell { host.focusTerminal() }
+    }
+
+    static func dismantleNSView(_ view: Host, coordinator: ()) {
+        view.detach()
+    }
+
+    final class Host: NSView {
+        weak var terminal: AgentTerminal?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if terminal?.isShell == true { focusTerminal() }
+        }
+
+        func focusTerminal() {
+            Task { [weak self] in
+                guard let self, let terminal, terminal.view.superview === self, window?.isKeyWindow == true else {
+                    return
+                }
+                terminal.view.acquireProgrammaticFocus()
+            }
+        }
+
+        func detach() {
+            // The previous host can be dismantled after a transfer to another window.
+            if let terminal, terminal.view.superview === self { terminal.park() }
+            terminal = nil
+        }
     }
 }
 

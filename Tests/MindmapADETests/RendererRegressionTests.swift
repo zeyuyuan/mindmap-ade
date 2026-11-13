@@ -117,4 +117,52 @@ struct RendererRegressionTests {
         #expect(trees.last?.sublayers?.first === topic)
         #expect(icon.isHidden)
     }
+
+    @Test func activeTerminalHighlightMovesAndClearsIndependentlyOfSelection() throws {
+        _ = NSApplication.shared
+        let first = MapNode(content: .agent(AgentTopic(task: "First session")))
+        let second = MapNode(content: .agent(AgentTopic(task: "Second session")))
+        var board = MindMapBoard(root: first)
+        board.apply(
+            try #require(board.inserting(second, parent: nil, position: CGPoint(x: 0, y: 100))).edit)
+        let size = CGSize(width: MapMetrics.resourceMinimumWidth, height: MapMetrics.resourceHeight)
+        let layout = TreeLayout.make(board: board, sizes: [first.id: size, second.id: size])
+        let host = CALayer()
+        let renderer = MapRenderer(layer: host)
+        let viewport = CGRect(x: 0, y: 0, width: 300, height: 200)
+
+        func render(activeAgentID: UUID?) {
+            renderer.render(
+                board: board, layout: layout, camera: MapCamera(), viewport: viewport,
+                selection: [second.id], backingScale: 2, activeAgentID: activeAgentID)
+        }
+
+        render(activeAgentID: nil)
+        let trees = try #require(host.sublayers?.first?.sublayers)
+        let firstCard = try #require(trees.first?.sublayers?.first)
+        let secondCard = try #require(trees.last?.sublayers?.first)
+        let firstIcon = try #require(firstCard.sublayers?.first { $0.contents != nil })
+        let secondIcon = try #require(secondCard.sublayers?.first { $0.contents != nil })
+        let background = try #require(firstCard.backgroundColor)
+        let icon = try #require(firstIcon.contents as AnyObject?)
+
+        render(activeAgentID: first.id)
+        #expect(firstCard.backgroundColor != background)
+        #expect(firstIcon.contents as AnyObject? !== icon)
+        #expect(firstCard.borderWidth == CanvasStyle.borderWidth)
+        #expect(secondCard.backgroundColor == background)
+        #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
+
+        render(activeAgentID: second.id)
+        #expect(firstCard.backgroundColor == background)
+        #expect(firstIcon.contents as AnyObject? === icon)
+        #expect(secondCard.backgroundColor != background)
+        #expect(secondIcon.contents as AnyObject? !== icon)
+        #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
+
+        render(activeAgentID: nil)
+        #expect(secondCard.backgroundColor == background)
+        #expect(secondIcon.contents as AnyObject? === icon)
+        #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
+    }
 }

@@ -150,15 +150,14 @@ private struct BoardCanvasContent: View {
 
     var body: some View {
         GeometryReader { geometry in
+            let terminalAddress = visibleTerminalAddress
             HStack(spacing: 0) {
                 MindMapCanvas(
                     session: session, workspace: workspace, actions: actions, revision: session.revision,
-                    runtimeDetails: runtimeDetails
+                    runtimeDetails: runtimeDetails, activeAgentID: terminalAddress?.nodeID
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if let address = actions.terminalAddress, address.boardID == session.id,
-                    workspace.canOpenAgent(at: address)
-                {
+                if let address = terminalAddress {
                     let available = max(0, geometry.size.width - CanvasStyle.terminalResizeHandleWidth)
                     let width = boundedTerminalWidth(available * actions.terminalWidthShare, available: available)
                     TerminalDivider(width: width) { proposed in
@@ -202,6 +201,13 @@ private struct BoardCanvasContent: View {
             .background(.bar)
             .overlay(alignment: .top) { Divider() }
         }
+    }
+
+    private var visibleTerminalAddress: NodeAddress? {
+        guard let address = actions.terminalAddress, address.boardID == session.id,
+            workspace.canOpenAgent(at: address)
+        else { return nil }
+        return address
     }
 
     private var runtimeDetails: [UUID: String] {

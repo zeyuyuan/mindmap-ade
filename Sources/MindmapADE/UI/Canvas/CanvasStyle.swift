@@ -11,6 +11,8 @@ enum CanvasStyle {
     static let dragThreshold: CGFloat = 4
     static let selectionOpacity: CGFloat = 0.08
     static let resourceIconPointSize: CGFloat = 16
+    static let activeAgentTintFraction: CGFloat = 0.18
+    static let activeAgentSymbol = "terminal.fill"
     static let formWidth: CGFloat = 384
     static let formMaximumBodyHeight: CGFloat = 344
     static let formPadding: CGFloat = 16
@@ -62,6 +64,11 @@ enum CanvasStyle {
 
     static func font(root: Bool) -> NSFont {
         .systemFont(ofSize: MapMetrics.fontSize, weight: root ? .semibold : .regular)
+    }
+
+    static var activeAgentBackground: NSColor {
+        let background = NSColor.controlBackgroundColor
+        return background.blended(withFraction: activeAgentTintFraction, of: .controlAccentColor) ?? background
     }
 
     static func resourceIcon(named name: String, color: NSColor, contentsScale: CGFloat) -> CGImage? {

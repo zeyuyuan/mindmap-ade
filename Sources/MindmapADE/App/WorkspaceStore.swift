@@ -3,12 +3,43 @@ import Darwin
 import MindMapCore
 import Observation
 
+enum AgentMapChange: String {
+    case added = "Agent Added Topic"
+    case edited = "Agent Edited Topic"
+    case moved = "Agent Moved Topic"
+    case removed = "Agent Removed Topic"
+    case registeredWorktree = "Agent Registered Worktree"
+
+    var status: String {
+        switch self {
+        case .added: "Agent added a topic"
+        case .edited: "Agent edited a topic"
+        case .moved: "Agent moved a topic"
+        case .removed: "Agent removed a topic"
+        case .registeredWorktree: "Agent updated a worktree topic"
+        }
+    }
+}
+
 @Observable
 final class BoardSession: Identifiable {
+    struct AgentEditNotice {
+        let change: AgentMapChange
+        let undoTime: ContinuousClock.Instant
+        let expiresAt: ContinuousClock.Instant
+    }
+
     private struct HistoryEntry {
         let edit: BoardEdit
         let action: String
+        let agentTopics: Set<UUID>
         let time = ContinuousClock.now
+
+        init(edit: BoardEdit, action: String, agentTopics: Set<UUID> = []) {
+            self.edit = edit
+            self.action = action
+            self.agentTopics = agentTopics
+        }
     }
 
     let id: UUID
@@ -16,9 +47,12 @@ final class BoardSession: Identifiable {
     private(set) var revision = 0
     private(set) var nodeCount: Int
     private(set) var gitProjectLocations: [UUID: ProjectLocation] = [:]
+    private(set) var agentEditNotice: AgentEditNotice?
+    private(set) var agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     @ObservationIgnored private(set) var board: MindMapBoard
     @ObservationIgnored private var undoStack: [HistoryEntry] = []
     @ObservationIgnored private var redoStack: [HistoryEntry] = []
+    @ObservationIgnored private var agentEditExpiry: Task<Void, Never>?
     @ObservationIgnored var didChange: (() -> Void)?
     @ObservationIgnored var rejectEdit: ((MindMapBoard, BoardEdit) -> String?)?
     @ObservationIgnored var isReadOnly = false
@@ -56,10 +90,20 @@ final class BoardSession: Identifiable {
     func apply(_ edit: BoardEdit?, named action: String, recordHistory: Bool = true) -> Bool {
         guard let edit, let inverse = applyChange(edit) else { return false }
         if recordHistory {
-            undoStack.append(HistoryEntry(edit: inverse, action: action))
-            if undoStack.count > 100 { undoStack.removeFirst() }
-            redoStack.removeAll()
+            record(HistoryEntry(edit: inverse, action: action))
         }
+        didChange?()
+        return true
+    }
+
+    func applyAgentEdit(_ edit: BoardEdit, change: AgentMapChange, highlighting topics: Set<UUID>) -> Bool {
+        guard let inverse = applyChange(edit) else { return false }
+        let entry = HistoryEntry(edit: inverse, action: change.rawValue, agentTopics: topics)
+        record(entry)
+        let deadline = entry.time.advanced(by: CanvasStyle.agentEditHighlightDuration)
+        for id in topics { agentEditedTopics[id] = deadline }
+        agentEditNotice = AgentEditNotice(change: change, undoTime: entry.time, expiresAt: deadline)
+        scheduleAgentEditExpiry()
         didChange?()
         return true
     }
@@ -68,6 +112,8 @@ final class BoardSession: Identifiable {
         guard let entry = undoStack.last, let inverse = applyChange(entry.edit) else { return }
         undoStack.removeLast()
         redoStack.append(HistoryEntry(edit: inverse, action: entry.action))
+        for id in entry.agentTopics { clearAgentHighlight(for: id) }
+        if agentEditNotice?.undoTime == entry.time { agentEditNotice = nil }
         didChange?()
     }
 
@@ -76,6 +122,12 @@ final class BoardSession: Identifiable {
         redoStack.removeLast()
         undoStack.append(HistoryEntry(edit: inverse, action: entry.action))
         didChange?()
+    }
+
+    private func record(_ entry: HistoryEntry) {
+        undoStack.append(entry)
+        if undoStack.count > 100 { undoStack.removeFirst() }
+        redoStack.removeAll()
     }
 
     private func applyChange(_ edit: BoardEdit) -> BoardEdit? {
@@ -88,11 +140,32 @@ final class BoardSession: Identifiable {
             if gitProjectLocations[replacement.id] != location {
                 gitProjectLocations[replacement.id] = location
             }
+            if replacement.node == nil { clearAgentHighlight(for: replacement.id) }
         }
         name = board.name
         nodeCount = board.nodes.count
         revision += 1
         return inverse
+    }
+
+    private func clearAgentHighlight(for id: UUID) {
+        if agentEditedTopics[id] != nil { agentEditedTopics.removeValue(forKey: id) }
+    }
+
+    private func scheduleAgentEditExpiry() {
+        agentEditExpiry?.cancel()
+        let deadline = agentEditedTopics.values.min() ?? agentEditNotice?.expiresAt
+        agentEditExpiry = deadline.map { deadline in
+            Task { [weak self] in
+                do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+                guard !Task.isCancelled, let self else { return }
+                let now = ContinuousClock.now
+                let remaining = self.agentEditedTopics.filter { $0.value > now }
+                if remaining.count != self.agentEditedTopics.count { self.agentEditedTopics = remaining }
+                if let notice = self.agentEditNotice, notice.expiresAt <= now { self.agentEditNotice = nil }
+                self.scheduleAgentEditExpiry()
+            }
+        }
     }
 
     private static func gitProjectLocation(_ node: MapNode?) -> ProjectLocation? {

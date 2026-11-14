@@ -58,6 +58,9 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 | `selectionOpacity` | 0.08 | Accent fill for selection and drop overlays |
 | `resourceIconPointSize` | 16 pt | Symbol inside the resource icon tile |
 | `activeAgentTintFraction` | 0.18 | System accent blended into the active Agent card background |
+| `agentEditColor` / `agentEditTintFraction` | System green / 0.14 | Semantic color for recent Agent changes, blended over the current card background |
+| `agentEditBadgeSize` / `agentEditSymbolSize` | 20 / 12 pt | Top-right circular badge containing the `pencil` symbol, hidden at overview zoom |
+| `agentEditHighlightDuration` | 5 s | Time the Agent edit mark or status is visible |
 | `formWidth` / `formMaximumBodyHeight` | 384 / 344 pt | Native node popover and its scrollable form body |
 | `formPadding` / `formSpacing` / `formGroupSpacing` | 16 / 8 / 16 pt | Node form insets, related controls, and group spacing |
 | `formFocusInset` | 8 pt | Room for system focus rings inside the form scroll clip |
@@ -76,6 +79,8 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 `MapCamera.minimumScale` is 0.000001 and `maximumScale` is 4, allowing Fit Content to include very large maps. Sub-percent magnification displays fractional percentages. Editing below 75% aims for 100%; editing is capped at 150% and reduced as needed to fit the topic's width. Fit Content enlarges no further than 150%. Camera changes preserve their anchor. Native sidebar controls use system sizing.
 
 Selection uses the system accent outline. The Agent whose terminal pane is open has a tinted card and the `terminal.fill` symbol. Its highlight follows the pane independently of canvas selection and process status. Do not add custom glass or shadows to map content. Disable implicit layer animations during pointer manipulation.
+
+Agent edits tint each directly changed topic and add a pencil badge without changing its size or selection. VoiceOver exposes the status on the topic. The status bar describes the latest Agent edit, including deletions, and shows the standard Undo shortcut when it would undo that edit.
 
 The status bar distinguishes loading, saving, saved, failed, and read-only states. Place workspace errors below the split view so they do not cover the canvas status or sidebar controls. Undo a board deletion from the Edit menu without adding a footer.
 

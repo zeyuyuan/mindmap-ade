@@ -13,6 +13,12 @@ enum CanvasStyle {
     static let resourceIconPointSize: CGFloat = 16
     static let activeAgentTintFraction: CGFloat = 0.18
     static let activeAgentSymbol = "terminal.fill"
+    static let agentEditHighlightDuration: Duration = .seconds(5)
+    static let agentEditTintFraction: CGFloat = 0.14
+    static let agentEditBadgeSize: CGFloat = 20
+    static let agentEditSymbolSize: CGFloat = 12
+    static let agentEditSymbol = "pencil"
+    static var agentEditColor: NSColor { .systemGreen }
     static let formWidth: CGFloat = 384
     static let formMaximumBodyHeight: CGFloat = 344
     static let formPadding: CGFloat = 16
@@ -71,15 +77,16 @@ enum CanvasStyle {
         return background.blended(withFraction: activeAgentTintFraction, of: .controlAccentColor) ?? background
     }
 
-    static func resourceIcon(named name: String, color: NSColor, contentsScale: CGFloat) -> CGImage? {
-        let configuration = NSImage.SymbolConfiguration(pointSize: resourceIconPointSize, weight: .medium)
+    static func symbolImage(
+        named name: String, color: NSColor, size: CGFloat, pointSize: CGFloat, contentsScale: CGFloat
+    ) -> CGImage? {
+        let configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
             .applying(.init(paletteColors: [color]))
         guard
             let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
                 .withSymbolConfiguration(configuration)
         else { return nil }
 
-        let size = MapMetrics.resourceIconSize
         let pixels = Int(ceil(size * contentsScale))
         guard
             let context = CGContext(

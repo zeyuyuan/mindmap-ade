@@ -229,15 +229,16 @@ struct AgentTerminalPane: View {
 }
 
 final class AgentTerminalView: AppTerminalView {
-    private static let appKeys: Set<String> = ["h", "m", "n", "q", "w"]
+    private static let appKeys: Set<String> = ["h", "m", "n", "q", "w", "z"]
+    private static let shiftedAppKeys: Set<String> = ["n", "z"]
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if let key = event.charactersIgnoringModifiers?.lowercased(),
             (modifiers == .command && Self.appKeys.contains(key))
-                || (modifiers == [.command, .shift] && key == "n")
+                || (modifiers == [.command, .shift] && Self.shiftedAppKeys.contains(key))
         {
-            // The AppKit menu owns window and application commands.
+            // Leave window commands and board Undo/Redo to the AppKit menu.
             return false
         }
         return super.performKeyEquivalent(with: event)

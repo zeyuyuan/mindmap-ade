@@ -476,6 +476,10 @@ struct CanvasRegressionTests {
         var board = MindMapBoard(root: root)
         board.apply(try #require(board.inserting(second, parent: nil, position: CGPoint(x: 0, y: 84))).edit)
         board.apply(try #require(board.inserting(agent, parent: nil, position: CGPoint(x: 380, y: 0))).edit)
+        for index in 1...51 {
+            let position = CGPoint(x: 500, y: index * 64)
+            board.apply(try #require(board.inserting(text: "Topic \(index)", parent: nil, position: position)).edit)
+        }
         let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
         await workspace.loadIfNeeded()
         let session = try #require(workspace.boards.first)
@@ -537,15 +541,30 @@ struct CanvasRegressionTests {
         #expect(try ids(await selection()) == [root.id.uuidString, second.id.uuidString])
         let first = try await selection(["nodeId": second.id.uuidString])
         #expect(first["hasMore"] as? Bool == true)
-        let offset = try #require(first["nextOffset"] as? Int)
-        let rest = try await selection(["nodeId": second.id.uuidString, "offset": offset])
+        let textCursor = try #require(first["nextCursor"] as? String)
+        let rest = try await selection(["cursor": textCursor])
         #expect(rest["hasMore"] as? Bool == false)
         let text = try #require(first["text"] as? String) + (try #require(rest["text"] as? String))
         #expect(text.utf8.elementsEqual(longText.utf8))
 
-        let edit = try await call(
-            "create_node", arguments: ["parentId": root.id.uuidString, "text": "Outside", "operationId": "outside"])
-        #expect(edit["isError"] as? Bool == true)
+        canvas.view.selectAll(nil)
+        let firstPage = try await selection()
+        let nextPage = try #require(firstPage["nextCursor"] as? String)
+        let secondPage = try await selection(["cursor": nextPage])
+        #expect(try ids(firstPage).count == 50)
+        #expect(try ids(firstPage).isDisjoint(with: ids(secondPage)))
+        #expect(try ids(firstPage).union(ids(secondPage)) == Set(board.nodes.keys.map(\.uuidString)))
+
+        let revision = session.revision
+        try canvas.click(CGPoint(x: 8, y: 8))
+        #expect(session.revision == revision)
+        let staleList = try await call("get_selection", arguments: ["cursor": nextPage])
+        #expect(staleList["isError"] as? Bool == true)
+        let noLongerSelected = try await call("get_selection", arguments: ["cursor": textCursor])
+        #expect(noLongerSelected["isError"] as? Bool == true)
+        try canvas.click(CGPoint(x: 148, y: 118))
+        #expect(try ids(await selection()) == [root.id.uuidString])
+
         canvas.actions.targetBoardID = UUID()
         #expect(try ids(await selection()).isEmpty)
         canvas.actions.targetBoardID = session.id

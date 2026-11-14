@@ -131,10 +131,11 @@ struct RendererRegressionTests {
         let renderer = MapRenderer(layer: host)
         let viewport = CGRect(x: 0, y: 0, width: 300, height: 200)
 
-        func render(activeAgentID: UUID?) {
+        func render(activeAgentID: UUID?, agentEditedTopics: Set<UUID> = []) {
             renderer.render(
                 board: board, layout: layout, camera: MapCamera(), viewport: viewport,
-                selection: [second.id], backingScale: 2, activeAgentID: activeAgentID)
+                selection: [second.id], backingScale: 2, activeAgentID: activeAgentID,
+                agentEditedTopics: agentEditedTopics)
         }
 
         render(activeAgentID: nil)
@@ -160,7 +161,18 @@ struct RendererRegressionTests {
         #expect(secondIcon.contents as AnyObject? !== icon)
         #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
 
+        let activeBackground = secondCard.backgroundColor
+        let activeIcon = secondIcon.contents as AnyObject?
+        let selectionBorder = secondCard.borderColor
+        render(activeAgentID: second.id, agentEditedTopics: [second.id])
+        let badge = try #require(secondCard.sublayers?.first { $0 !== secondIcon && $0.contents != nil })
+        #expect(!badge.isHidden)
+        #expect(secondCard.backgroundColor != activeBackground)
+        #expect(secondCard.borderColor == selectionBorder)
+        #expect(secondIcon.contents as AnyObject? === activeIcon)
+
         render(activeAgentID: nil)
+        #expect(badge.isHidden)
         #expect(secondCard.backgroundColor == background)
         #expect(secondIcon.contents as AnyObject? === icon)
         #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)

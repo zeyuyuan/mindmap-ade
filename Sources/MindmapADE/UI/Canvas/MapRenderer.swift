@@ -13,6 +13,7 @@ final class TopicLayer {
     let layer = CALayer()
     private let text = TopicTextRenderer()
     private var iconLayer: CALayer?
+    private var agentEditBadge: CALayer?
     private var detailRenderer: TopicTextRenderer?
     private var previousDetail: String?
     private var previousDetailColor: CGColor?
@@ -42,8 +43,9 @@ final class TopicLayer {
     }
 
     func configure(
-        node: MapNode, descendantCount: Int, root: Bool, selected: Bool, isActiveAgent: Bool,
-        scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool
+        node: MapNode, descendantCount: Int, root: Bool, selected: Bool, isActiveAgent: Bool, wasEditedByAgent: Bool,
+        scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, agentEditIcon: CGImage?,
+        isEditingTitle: Bool
     ) {
         let title = node.title
         let detail = runtimeDetail ?? node.detail
@@ -102,7 +104,12 @@ final class TopicLayer {
         } else {
             detailRenderer?.layer.isHidden = true
         }
-        layer.backgroundColor = (isActiveAgent ? CanvasStyle.activeAgentBackground : .controlBackgroundColor).cgColor
+        let background = isActiveAgent ? CanvasStyle.activeAgentBackground : .controlBackgroundColor
+        layer.backgroundColor =
+            (wasEditedByAgent
+            ? background.blended(withFraction: CanvasStyle.agentEditTintFraction, of: CanvasStyle.agentEditColor)
+                ?? background
+            : background).cgColor
         layer.borderColor =
             (selected ? NSColor.controlAccentColor : root ? NSColor.secondaryLabelColor : .separatorColor).cgColor
         layer.borderWidth = (selected ? CanvasStyle.selectedBorderWidth : CanvasStyle.borderWidth) / max(scale, 0.5)
@@ -148,6 +155,30 @@ final class TopicLayer {
             }
             disclosureGlyph.path = path
         }
+        configureAgentEditBadge(hidesText ? nil : agentEditIcon)
+    }
+
+    private func configureAgentEditBadge(_ image: CGImage?) {
+        guard let image else {
+            agentEditBadge?.isHidden = true
+            return
+        }
+        let size = CanvasStyle.agentEditBadgeSize
+        let badge = agentEditBadge ?? CALayer()
+        if agentEditBadge == nil {
+            badge.cornerRadius = size / 2
+            badge.borderWidth = CanvasStyle.borderWidth
+            layer.addSublayer(badge)
+            agentEditBadge = badge
+        }
+        // Keep the badge within the card's width and above its text inset.
+        badge.frame = CGRect(
+            x: layer.bounds.maxX - size - CanvasStyle.borderWidth, y: MapMetrics.verticalPadding - size,
+            width: size, height: size)
+        badge.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        badge.borderColor = CanvasStyle.agentEditColor.cgColor
+        if badge.contents as AnyObject? !== image { badge.contents = image }
+        badge.isHidden = false
     }
 
     private func configureIcon(_ image: CGImage?) {
@@ -213,6 +244,9 @@ final class MapRenderer {
     private var resourceIconImages: [String: CGImage] = [:]
     private var resourceIconScale: CGFloat = 0
     private var resourceIconColor: CGColor?
+    private var agentEditIcon: CGImage?
+    private var agentEditIconScale: CGFloat = 0
+    private var agentEditIconColor: CGColor?
 
     init(layer: CALayer) {
         world.anchorPoint = .zero
@@ -234,17 +268,31 @@ final class MapRenderer {
             resourceIconImages.removeAll(keepingCapacity: true)
             let symbols = NodeKind.allCases.filter { $0 != .text }.map(\.symbol) + [CanvasStyle.activeAgentSymbol]
             for symbol in symbols {
-                resourceIconImages[symbol] = CanvasStyle.resourceIcon(
-                    named: symbol, color: NSColor(cgColor: color) ?? .labelColor, contentsScale: contentsScale)
+                resourceIconImages[symbol] = CanvasStyle.symbolImage(
+                    named: symbol, color: NSColor(cgColor: color) ?? .labelColor, size: MapMetrics.resourceIconSize,
+                    pointSize: CanvasStyle.resourceIconPointSize, contentsScale: contentsScale)
             }
         }
         return resourceIconImages
     }
 
+    private func editIcon(contentsScale: CGFloat) -> CGImage? {
+        let color = NSColor.labelColor
+        if agentEditIconScale != contentsScale || agentEditIconColor != color.cgColor {
+            agentEditIconScale = contentsScale
+            agentEditIconColor = color.cgColor
+            agentEditIcon = CanvasStyle.symbolImage(
+                named: CanvasStyle.agentEditSymbol, color: color, size: CanvasStyle.agentEditBadgeSize,
+                pointSize: CanvasStyle.agentEditSymbolSize, contentsScale: contentsScale)
+        }
+        return agentEditIcon
+    }
+
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
-        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil
+        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil,
+        agentEditedTopics: Set<UUID> = []
     ) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -293,6 +341,9 @@ final class MapRenderer {
         }
         let contentsScale = backingScale * max(1, ceil(camera.scale))
         var icons: [String: CGImage]?
+        let editBadge =
+            !agentEditedTopics.isEmpty && camera.scale >= CanvasStyle.textDetailScale
+            ? editIcon(contentsScale: contentsScale) : nil
         for id in visible {
             guard let placement = layout.nodes[id], let node = board.nodes[id],
                 let tree = trees[placement.rootID], let origin = rootIndex[placement.rootID]
@@ -311,14 +362,16 @@ final class MapRenderer {
             topic.layer.opacity = drag?.topLevelIDs.contains(id) == true && drag?.rootIDs.contains(id) != true ? 0.7 : 1
             let kind = node.content.kind
             let isActiveAgent = kind == .agent && id == activeAgentID
+            let wasEditedByAgent = agentEditedTopics.contains(id)
             if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
                 icons = resourceIcons(contentsScale: contentsScale)
             }
             topic.configure(
                 node: node, descendantCount: placement.descendantCount, root: placement.depth == 0,
-                selected: selection.contains(id), isActiveAgent: isActiveAgent,
+                selected: selection.contains(id), isActiveAgent: isActiveAgent, wasEditedByAgent: wasEditedByAgent,
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
                 resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
+                agentEditIcon: wasEditedByAgent ? editBadge : nil,
                 isEditingTitle: editingTitleID == id
             )
         }

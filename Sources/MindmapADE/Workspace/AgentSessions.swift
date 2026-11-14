@@ -254,6 +254,7 @@ extension WorkspaceStore {
 
     private func finishAgent(at address: NodeAddress, runID: UUID, exitCode: Int32?, error: String?) async {
         guard let run = agentRuns[address], run.id == runID, run.state.isActive else { return }
+        releaseMCP(for: run)
         let terminal = terminals[address]
         if let terminal {
             terminal.recording?.cancel()
@@ -262,7 +263,6 @@ extension WorkspaceStore {
             await saveOutput(of: terminal, for: run)
         }
         guard let finished = agentRuns[address], finished.id == runID, finished.state.isActive else { return }
-        releaseMCP(for: finished)
         var shellError: String?
         if finished.state == .running, error == nil, !isQuitting, let terminal {
             do {
@@ -294,8 +294,10 @@ extension WorkspaceStore {
             if !project.details.isEmpty { parts.append("Project notes:\n\(project.details)") }
         }
         parts.append(
-            "Mindmap ADE MCP tools can read this conversation's context and update its map branch. "
-                + "Use get_selection when the user refers to topics they selected on the canvas.")
+            "Mindmap ADE MCP tools can read and edit this board. Start with get_selection for selected topics, "
+                + "search_nodes for a phrase, or get_context for this Agent's location. Use get_node for a topic's text "
+                + "and list_nodes for its direct children. Pass nextCursor as cursor to continue a page. "
+                + "Read only the topics needed for the task.")
         return parts.joined(separator: "\n") + "\n\nTask:\n"
     }
 }

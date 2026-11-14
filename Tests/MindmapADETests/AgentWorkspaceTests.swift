@@ -67,6 +67,11 @@ private actor LaunchTestDisk: WorkspacePersistence {
         value = WorkspaceArchive(boards: [board])
     }
 
+    init(directory: URL, boards: [MindMapBoard]) {
+        self.directory = directory
+        value = WorkspaceArchive(boards: boards)
+    }
+
     func load() -> (WorkspaceArchive?, Bool) { (value, true) }
 
     func save(_ archive: WorkspaceArchive) throws {
@@ -307,7 +312,7 @@ struct AgentWorkspaceTests {
         #expect(try await workspace.git.worktrees(for: binding).count == 4)
     }
 
-    @Test func legacyCustomDraftUsesDetectedCommandCodeAndScopedMapTools() async throws {
+    @Test func legacyCustomDraftUsesDetectedCommandCodeAndBoardMapTools() async throws {
         _ = NSApplication.shared
         let fixture = try ScratchRepository()
         defer { fixture.cleanUp() }
@@ -334,7 +339,14 @@ struct AgentWorkspaceTests {
         var board = MindMapBoard(root: root)
         board.apply(try #require(board.inserting(tree, parent: root.id)).edit)
         board.apply(try #require(board.inserting(agent, parent: tree.id)).edit)
-        let disk = LaunchTestDisk(directory: fixture.data, board: board)
+        let release = MapNode(text: "Release plan")
+        let longText = String(repeating: "准备 中文 👩🏽‍💻\n", count: 650) + "Café Gate"
+        let requirement = MapNode(text: longText)
+        board.apply(try #require(board.inserting(release, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(requirement, parent: release.id)).edit)
+        board.apply(try #require(board.togglingCollapse(release.id)))
+        let another = MindMapBoard(root: MapNode(text: "Café Gate on another board"))
+        let disk = LaunchTestDisk(directory: fixture.data, boards: [board, another])
         let workspace = WorkspaceStore(disk: disk)
         await workspace.loadIfNeeded()
         let session = try #require(workspace.boards.first)
@@ -357,16 +369,207 @@ struct AgentWorkspaceTests {
         #expect(denied["error"] != nil)
         let create: [String: Any] = ["name": "create_node", "arguments": ["text": "Child", "operationId": "add-1"]]
         let first = try await request(connection, token: token, method: "tools/call", params: create)
+        let childID = try #require((toolResult(first)["nodeId"] as? String).flatMap(UUID.init(uuidString:)))
+        #expect(Set(session.agentEditedTopics.keys) == [childID])
+        let firstDeadline = try #require(session.agentEditedTopics[childID])
         let repeated = try await request(connection, token: token, method: "tools/call", params: create)
         #expect(try toolResult(first)["nodeId"] as? String == toolResult(repeated)["nodeId"] as? String)
+        #expect(session.agentEditedTopics[childID] == firstDeadline)
         #expect(session.board.nodes[agent.id]?.children.count == 1)
-        let outside = try await request(
-            connection, token: token, method: "tools/call",
-            params: [
-                "name": "create_node",
-                "arguments": ["text": "Outside", "operationId": "outside", "parentId": root.id.uuidString],
+        func call(_ name: String, _ arguments: [String: Any] = [:]) async throws -> [String: Any] {
+            try await request(
+                connection, token: token, method: "tools/call", params: ["name": name, "arguments": arguments])
+        }
+        let search = try toolResult(await call("search_nodes", ["query": "cafe gate"]))
+        let matches = try #require(search["nodes"] as? [[String: Any]])
+        #expect(matches.count == 1)
+        let match = try #require(matches.first)
+        #expect(match["id"] as? String == requirement.id.uuidString)
+        #expect(match["parentId"] as? String == release.id.uuidString)
+        #expect((match["snippet"] as? String)?.contains("Café Gate") == true)
+        let path = try #require(match["ancestors"] as? [[String: String]])
+        #expect(path.compactMap { $0["id"] } == [root.id.uuidString, release.id.uuidString])
+        let underAgent = try toolResult(
+            await call("search_nodes", ["query": "cafe gate", "rootId": agent.id.uuidString]))
+        #expect((underAgent["nodes"] as? [[String: Any]])?.isEmpty == true)
+        let children = try toolResult(await call("list_nodes", ["parentId": release.id.uuidString]))
+        #expect((children["nodes"] as? [[String: String]])?.compactMap { $0["id"] } == [requirement.id.uuidString])
+        let roots = try toolResult(await call("list_nodes", ["parentId": NSNull()]))
+        #expect((roots["nodes"] as? [[String: String]])?.compactMap { $0["id"] } == [root.id.uuidString])
+
+        var nextPage: [String: Any] = ["nodeId": requirement.id.uuidString]
+        var firstCursor: String?
+        var read = ""
+        for _ in 0..<4 {
+            let page = try toolResult(await call("get_node", nextPage))
+            read += try #require(page["text"] as? String)
+            if page["hasMore"] as? Bool == false { break }
+            let cursor = try #require(page["nextCursor"] as? String)
+            if firstCursor == nil { firstCursor = cursor }
+            nextPage = ["cursor": cursor]
+        }
+        #expect(read.utf8.elementsEqual(longText.utf8))
+
+        let otherNode = try #require(another.roots.first).id
+        let deniedRead = try await call("get_node", ["nodeId": otherNode.uuidString])
+        #expect((deniedRead["result"] as? [String: Any])?["isError"] as? Bool == true)
+        let deniedWrite = try await call(
+            "create_node", ["parentId": otherNode.uuidString, "text": "Cross-board", "operationId": "other"])
+        #expect((deniedWrite["result"] as? [String: Any])?["isError"] as? Bool == true)
+        let change: [String: Any] = [
+            "nodeId": requirement.id.uuidString, "text": "Updated acceptance criteria",
+            "operationId": "update", "expectedRevision": session.revision,
+        ]
+        let editToken = workspace.beginEditing(nodeID: requirement.id, boardID: board.id, commit: {})
+        let deniedDraft = try await call("update_node", change)
+        #expect((deniedDraft["result"] as? [String: Any])?["isError"] as? Bool == true)
+        #expect(session.agentEditedTopics[requirement.id] == nil)
+        workspace.endEditing(nodeID: requirement.id, boardID: board.id, token: editToken)
+        let updated = try toolResult(await call("update_node", change))
+        #expect(updated["nodeId"] as? String == requirement.id.uuidString)
+        #expect(session.agentEditedTopics[requirement.id] != nil)
+        #expect(await disk.snapshot().boards[0].nodes[requirement.id]?.text == "Updated acceptance criteria")
+        let staleTextPage = try await call("get_node", ["cursor": try #require(firstCursor)])
+        #expect((staleTextPage["result"] as? [String: Any])?["isError"] as? Bool == true)
+        session.undo()
+        #expect(session.board.nodes[requirement.id]?.text == longText)
+        #expect(session.agentEditedTopics[requirement.id] == nil && session.agentEditNotice == nil)
+        var staleChange = change
+        staleChange["operationId"] = "stale"
+        let deniedRevision = try await call("update_node", staleChange)
+        #expect((deniedRevision["result"] as? [String: Any])?["isError"] as? Bool == true)
+
+        let rootTitle = try toolResult(
+            await call(
+                "update_node",
+                [
+                    "nodeId": root.id.uuidString, "field": "description", "text": "Release notes for this project",
+                    "operationId": "project-notes", "expectedRevision": session.revision,
+                ]))
+        #expect(rootTitle["nodeId"] as? String == root.id.uuidString)
+        let notes = try toolResult(await call("get_node", ["nodeId": root.id.uuidString, "field": "description"]))
+        #expect(notes["text"] as? String == "Release notes for this project")
+        let conversation = try toolResult(await call("get_node", ["field": "task"]))
+        #expect(conversation["text"] as? String == original.task)
+        #expect(conversation["editableFields"] as? [String] == ["progress", "name"])
+        let taskRevision = session.revision
+        let deniedTask = try await call(
+            "update_node",
+            [
+                "nodeId": agent.id.uuidString, "field": "task", "text": "Replacement task",
+                "operationId": "replace-initial-task", "expectedRevision": taskRevision,
             ])
-        #expect((outside["result"] as? [String: Any])?["isError"] as? Bool == true)
+        #expect((deniedTask["result"] as? [String: Any])?["isError"] as? Bool == true)
+        #expect(session.revision == taskRevision)
+        _ = try toolResult(
+            await call(
+                "update_node",
+                [
+                    "nodeId": agent.id.uuidString, "text": "Added release notes",
+                    "operationId": "update-my-progress", "expectedRevision": taskRevision,
+                ]))
+        let progress = try toolResult(await call("get_node", ["field": "progress"]))
+        #expect(progress["text"] as? String == "Added release notes")
+        #expect(try toolResult(await call("get_node", ["field": "task"]))["text"] as? String == original.task)
+
+        let draft = try toolResult(
+            await call(
+                "create_node",
+                [
+                    "parentId": NSNull(), "kind": "agent", "text": "Follow up",
+                    "operationId": "add-draft", "expectedRevision": session.revision,
+                ]))
+        let draftID = try #require((draft["nodeId"] as? String).flatMap(UUID.init(uuidString:)))
+        #expect(session.board.roots.last?.id == draftID)
+        #expect(session.board.nodes[draftID]?.content.isDraft == true)
+        _ = try toolResult(
+            await call(
+                "update_node",
+                [
+                    "nodeId": draftID.uuidString, "field": "task", "text": "Review the release with QA",
+                    "operationId": "edit-draft-task", "expectedRevision": session.revision,
+                ]))
+        let draftTask = try toolResult(await call("get_node", ["nodeId": draftID.uuidString, "field": "task"]))
+        #expect(draftTask["text"] as? String == "Review the release with QA")
+        session.undo()
+        session.undo()
+        #expect(session.board.nodes[draftID] == nil)
+
+        let branchRevision = session.revision
+        for branch in ["release..next", "HEAD"] {
+            let invalid = try await call(
+                "create_node",
+                [
+                    "parentId": root.id.uuidString, "kind": "worktree", "text": branch,
+                    "operationId": "bad-branch-\(branch)", "expectedRevision": branchRevision,
+                ])
+            let error = try #require(invalid["result"] as? [String: Any])
+            #expect(error["isError"] as? Bool == true)
+            #expect((error["content"] as? [[String: String]])?.first?["text"]?.contains("Git branch") == true)
+            #expect(session.revision == branchRevision)
+        }
+        let branchDraft = try toolResult(
+            await call(
+                "create_node",
+                [
+                    "parentId": root.id.uuidString, "kind": "worktree", "text": " release/next ",
+                    "operationId": "valid-branch", "expectedRevision": branchRevision,
+                ]))
+        let branchID = try #require(branchDraft["nodeId"] as? String)
+        let draftRevision = session.revision
+        let badEdit = try await call(
+            "update_node",
+            [
+                "nodeId": branchID, "field": "branch", "text": "feature//next",
+                "operationId": "invalid-branch-edit", "expectedRevision": draftRevision,
+            ])
+        #expect((badEdit["result"] as? [String: Any])?["isError"] as? Bool == true)
+        #expect(session.revision == draftRevision)
+        let branch = try toolResult(await call("get_node", ["nodeId": branchID, "field": "branch"]))
+        #expect(branch["text"] as? String == "release/next")
+        _ = try toolResult(
+            await call(
+                "update_node",
+                [
+                    "nodeId": branchID, "field": "branch", "text": "",
+                    "operationId": "automatic-branch", "expectedRevision": session.revision,
+                ]))
+        let blankBranch = try toolResult(await call("get_node", ["nodeId": branchID, "field": "branch"]))
+        #expect(blankBranch["text"] as? String == "")
+        session.undo()
+        session.undo()
+
+        let moved = try toolResult(
+            await call(
+                "move_node",
+                [
+                    "nodeId": requirement.id.uuidString, "parentId": root.id.uuidString, "index": 0,
+                    "operationId": "move", "expectedRevision": session.revision,
+                ]))
+        #expect(moved["nodeId"] as? String == requirement.id.uuidString)
+        #expect(session.board.nodes[root.id]?.children.first == requirement.id)
+        #expect(session.agentEditedTopics[requirement.id] != nil)
+        let removed = try toolResult(
+            await call(
+                "delete_node",
+                [
+                    "nodeId": requirement.id.uuidString, "operationId": "delete", "expectedRevision": session.revision,
+                ]))
+        #expect(removed["nodeId"] as? String == requirement.id.uuidString)
+        #expect(session.board.nodes[requirement.id] == nil)
+        #expect(session.agentEditedTopics[requirement.id] == nil && session.agentEditNotice?.change == .removed)
+        session.undo()
+        #expect(session.board.nodes[requirement.id]?.text == longText)
+
+        let busyBranch = try await call(
+            "delete_node",
+            [
+                "nodeId": tree.id.uuidString, "operationId": "busy", "expectedRevision": session.revision,
+            ])
+        let denial = try #require(busyBranch["result"] as? [String: Any])
+        #expect(denial["isError"] as? Bool == true)
+        #expect((denial["content"] as? [[String: String]])?.first?["text"]?.contains("Stop the running") == true)
+        #expect(session.board.nodes[agent.id] != nil)
         let other = fixture.home.appendingPathComponent("New branch")
         try fixture.git(["worktree", "add", "-b", "external", other.path, "HEAD"])
         let register = try await request(
@@ -377,13 +580,137 @@ struct AgentWorkspaceTests {
             ])
         #expect(try toolResult(register)["requiresRebind"] as? Bool == true)
         #expect(try toolResult(register)["draftAgentId"] != nil)
+        let registered = try toolResult(register)
+        for key in ["worktreeId", "draftAgentId"] {
+            let id = try #require((registered[key] as? String).flatMap(UUID.init(uuidString:)))
+            #expect(session.agentEditedTopics[id] != nil)
+        }
         #expect(session.board.context(above: agent.id).worktree?.directory == location.directory)
-        #expect(await disk.snapshot().boards[0].nodes.count == 6)
+        #expect(await disk.snapshot().boards[0].nodes.count == 8)
         try await workspace.interruptAllAgents()
         let ended = try await request(connection, token: token, method: "tools/list")
         #expect(ended["error"] != nil)
         #expect(
             try String(contentsOf: commands, encoding: .utf8).split(whereSeparator: \.isNewline) == ["add", "remove"])
+    }
+
+    @Test func revokedMapGrantCannotFinishPendingWriteWhileRunStillLooksActive() async throws {
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let git = GitWorkspace()
+        var project = ProjectTopic()
+        project.location = try await git.project(at: fixture.repository.path)
+        let root = MapNode(content: .project(project))
+        let agent = MapNode(content: .agent(AgentTopic(task: "Work on the board")))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(agent, parent: root.id)).edit)
+        let workspace = WorkspaceStore(disk: LaunchTestDisk(directory: fixture.data, board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let run = mapRun(on: board, for: agent)
+        let token = UUID().uuidString
+        let grant = MCPGrant(run: run)
+        workspace.mcpGrants[token] = grant
+        workspace.agentRuns[run.address] = run
+
+        // Hold the Git actor so the requested change has passed authorization but cannot apply yet.
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        let gitActor = workspace.git
+        let busy = Task.detached {
+            await holdGit(gitActor) { _ in
+                entered.signal()
+                _ = gate.wait(timeout: .now() + 3)
+            }
+        }
+        defer { gate.signal() }
+        try await waitUntil { semaphoreWasSignaled(entered) }
+        let pending = Task { () throws -> String in
+            let response = try await workspaceMapCall(
+                workspace, token: token, name: "create_node",
+                arguments: [
+                    "kind": "worktree", "parentId": root.id.uuidString, "text": "release/next",
+                    "operationId": "pending-branch",
+                ])
+            let result = try #require(response["result"] as? [String: Any])
+            #expect(result["isError"] as? Bool == true)
+            return try #require((result["content"] as? [[String: String]])?.first?["text"])
+        }
+        try await waitUntil { grant.pending.contains("pending-branch") }
+        workspace.releaseMCP(for: run)
+        #expect(workspace.agentRuns[run.address]?.state == .running)
+        gate.signal()
+        await busy.value
+        #expect(try await pending.value.contains("session has ended"))
+        #expect(session.revision == 0)
+        #expect(session.board.nodes.count == 2)
+    }
+
+    @Test func mapPagesContinueInOrderAndRejectStaleVersions() async throws {
+        let root = MapNode(text: "Release root")
+        var topic = AgentTopic(task: "Find pages", cli: .codex)
+        topic.isConfigured = true
+        let agent = MapNode(content: .agent(topic))
+        let decoy = MapNode(text: "Release outside the chosen root")
+        let children = (1...53).map { MapNode(text: $0.isMultiple(of: 3) ? "Release \($0)" : "Other \($0)") }
+        let nested = MapNode(text: "Release nested")
+        let last = MapNode(text: "Other nested")
+        var board = MindMapBoard(root: root)
+        var binding = ProjectTopic()
+        binding.location = ProjectLocation(
+            directory: mapCheckout.directory, gitCommonDirectory: mapCheckout.gitCommonDirectory)
+        let project = MapNode(content: .project(binding))
+        let worktree = MapNode(content: .worktree(WorktreeTopic(location: mapCheckout)))
+        let nodes: [(MapNode, UUID?)] = [(project, nil), (worktree, project.id), (agent, worktree.id), (decoy, nil)]
+        for (node, parent) in nodes + children.map({ ($0, root.id) }) + [
+            (nested, children[23].id), (last, children[23].id),
+        ] {
+            board.apply(try #require(board.inserting(node, parent: parent)).edit)
+        }
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let run = mapRun(on: board, for: agent)
+        let token = UUID().uuidString
+        workspace.agentRuns[run.address] = run
+        workspace.mcpGrants[token] = MCPGrant(run: run)
+        func read(_ name: String, _ arguments: [String: Any]) async throws -> [String: Any] {
+            try await workspaceMapCall(workspace, token: token, name: name, arguments: arguments)
+        }
+        func ids(_ page: [String: Any]) throws -> [String] {
+            try #require(page["nodes"] as? [[String: Any]]).map { try #require($0["id"] as? String) }
+        }
+
+        let first = try toolResult(await read("search_nodes", ["query": "release", "rootId": root.id.uuidString]))
+        let cursor = try #require(first["nextCursor"] as? String)
+        #expect(try ids(first).count == 8)
+        let second = try toolResult(await read("search_nodes", ["cursor": cursor]))
+        #expect(try ids(second).count == 8)
+        let third = try toolResult(
+            await read("search_nodes", ["cursor": try #require(second["nextCursor"] as? String)]))
+        #expect(third["hasMore"] as? Bool == false)
+        let expected =
+            [root.id]
+            + children.enumerated().flatMap { index, node -> [UUID] in
+                guard (index + 1).isMultiple(of: 3) else { return [] }
+                return index == 23 ? [node.id, nested.id] : [node.id]
+            }
+        #expect(try ids(first) + ids(second) + ids(third) == expected.map(\.uuidString))
+
+        let firstList = try toolResult(await read("list_nodes", ["parentId": root.id.uuidString]))
+        let listCursor = try #require(firstList["nextCursor"] as? String)
+        let secondList = try toolResult(await read("list_nodes", ["cursor": listCursor]))
+        #expect(secondList["hasMore"] as? Bool == false)
+        #expect(try ids(firstList) + ids(secondList) == children.map(\.id.uuidString))
+        let wrongTool = try await read("list_nodes", ["cursor": cursor])
+        #expect((wrongTool["result"] as? [String: Any])?["isError"] as? Bool == true)
+
+        let userEdit = try #require(session.board.replacingText(children[0].id, with: "Release added first"))
+        try #require(session.apply(userEdit, named: "User Edit"))
+        for (tool, token) in [("search_nodes", cursor), ("list_nodes", listCursor)] {
+            let stale = try await read(tool, ["cursor": token])
+            #expect((stale["result"] as? [String: Any])?["isError"] as? Bool == true)
+        }
     }
 
     @Test func codexUsesTheBoundWorktreeAndARevocableMapConnection() async throws {
@@ -827,6 +1154,41 @@ struct AgentWorkspaceTests {
             return MCPSocket.readMessage(from: descriptor)
         }.value
         let received = try #require(response)
+        return try #require(JSONSerialization.jsonObject(with: received) as? [String: Any])
+    }
+
+    private var mapCheckout: WorktreeLocation {
+        WorktreeLocation(
+            directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "test", commit: "sha",
+            isPrimary: false)
+    }
+
+    private func mapRun(on board: MindMapBoard, for agent: MapNode) -> AgentRun {
+        var run = AgentRun(
+            address: NodeAddress(boardID: board.id, nodeID: agent.id), worktree: mapCheckout,
+            cli: .codex, executable: "/usr/bin/true")
+        run.state = .running
+        return run
+    }
+
+    private func holdGit(
+        _ git: isolated GitWorkspace, perform: @Sendable (isolated GitWorkspace) -> Void
+    ) {
+        perform(git)
+    }
+
+    private func semaphoreWasSignaled(_ semaphore: DispatchSemaphore) -> Bool {
+        semaphore.wait(timeout: .now()) == .success
+    }
+
+    private func workspaceMapCall(
+        _ workspace: WorkspaceStore, token: String, name: String, arguments: [String: Any]
+    ) async throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["name": name, "arguments": arguments],
+        ])
+        let bytes = try JSONEncoder().encode(MCPEnvelope(token: token, message: body))
+        let received = try #require(await workspace.handleMCP(bytes))
         return try #require(JSONSerialization.jsonObject(with: received) as? [String: Any])
     }
 

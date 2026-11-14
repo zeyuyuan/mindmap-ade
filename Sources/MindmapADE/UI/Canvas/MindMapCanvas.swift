@@ -9,6 +9,7 @@ struct MindMapCanvas: NSViewRepresentable {
     let revision: Int
     let runtimeDetails: [UUID: String]
     let activeAgentID: UUID?
+    let agentEditedTopics: Set<UUID>
 
     func makeNSView(context: Context) -> MindMapCanvasView {
         MindMapCanvasView(session: session, workspace: workspace, actions: actions)
@@ -16,7 +17,8 @@ struct MindMapCanvas: NSViewRepresentable {
 
     func updateNSView(_ view: MindMapCanvasView, context: Context) {
         view.update(session: session, revision: revision)
-        view.updatePresentation(runtimeDetails: runtimeDetails, activeAgentID: activeAgentID)
+        view.updatePresentation(
+            runtimeDetails: runtimeDetails, activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics)
     }
 
     static func dismantleNSView(_ view: MindMapCanvasView, coordinator: ()) {
@@ -65,6 +67,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var configureAfterLayout: UUID?
     private var runtimeDetails: [UUID: String] = [:]
     private var activeAgentID: UUID?
+    private var agentEditedTopics: Set<UUID> = []
     private var editorScroll: NSScrollView?
     private var editorBackdrop: NSView?
     private var provisionalEditFrame: CGRect?
@@ -155,6 +158,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             pendingFit = false
             mapLayout = .empty
             activeAgentID = nil
+            agentEditedTopics.removeAll()
             camera = workspace?.cameras[session.id] ?? MapCamera()
             hasCamera = workspace?.cameras[session.id] != nil
             selected = workspace?.selections[session.id] ?? Set(session.board.roots.prefix(1).map(\.id))
@@ -268,16 +272,22 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                         topLevelIDs: draggedBranchIDs, rootIDs: draggedRootIDs,
                         movedIDs: forbiddenTargets, offset: dragOffset),
                 runtimeDetails: runtimeDetails, editingTitleID: worktreeNameField == nil ? nil : editingID,
-                activeAgentID: activeAgentID
+                activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics
             )
         }
         updateAccessibility()
     }
 
-    func updatePresentation(runtimeDetails: [UUID: String], activeAgentID: UUID?) {
-        guard self.runtimeDetails != runtimeDetails || self.activeAgentID != activeAgentID else { return }
+    func updatePresentation(
+        runtimeDetails: [UUID: String], activeAgentID: UUID?, agentEditedTopics: Set<UUID> = []
+    ) {
+        guard
+            self.runtimeDetails != runtimeDetails || self.activeAgentID != activeAgentID
+                || self.agentEditedTopics != agentEditedTopics
+        else { return }
         self.runtimeDetails = runtimeDetails
         self.activeAgentID = activeAgentID
+        self.agentEditedTopics = agentEditedTopics
         accessibilityRevision = -1
         render()
         updateActions()
@@ -1545,7 +1555,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 : "\(node.children.count) children"
             let detail = runtimeDetails[id] ?? node.detail
             let terminalStatus = id == activeAgentID ? "Active terminal" : nil
-            element.setAccessibilityValue([terminalStatus, detail, children].compactMap { $0 }.joined(separator: ", "))
+            let agentEditStatus = agentEditedTopics.contains(id) ? "Recently changed by an Agent" : nil
+            element.setAccessibilityValue(
+                [terminalStatus, agentEditStatus, detail, children].compactMap { $0 }.joined(separator: ", "))
             element.setAccessibilitySelected(selected.contains(id))
             element.setAccessibilityEnabled(!session.isReadOnly)
             accessibilityNodes[id] = element

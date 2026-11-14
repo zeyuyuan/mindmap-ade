@@ -1078,7 +1078,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             toggleCollapse()
             return
         }
-        let id = mapLayout.hitTest(world)
+        let id = mapLayout.hitTest(world).flatMap { session.board.nodes[$0]?.id }
         if event.clickCount == 2, plainClick {
             if let id { select(id, edit: true) } else { insertRoot(at: world) }
             return
@@ -1116,7 +1116,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard dragStarted || distance >= CanvasStyle.dragThreshold else { return }
         if !dragStarted {
             dragStarted = true
-            if !isPanning && !isMarquee, !session.isReadOnly, let id = pressedNode {
+            if !isPanning && !isMarquee, !session.isReadOnly, let id = pressedNode, session.board.nodes[id] != nil {
                 if !selected.contains(id) { selected = [id] }
                 draggedBranches = session.board.topLevelSelection(selected)
                 draggedBranchIDs = Set(draggedBranches)
@@ -1215,7 +1215,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard dragStarted else {
             if pressedWithoutModifiers {
                 if let id = pressedNode {
-                    selected = [id]
+                    if session.board.nodes[id] != nil {
+                        selected = [id]
+                    } else {
+                        selected.remove(id)
+                    }
                 } else {
                     selected.removeAll()
                 }
@@ -1236,6 +1240,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         case .child(let parent):
             edit = session.board.movingBranches(draggedBranchIDs, to: parent)
         case .sibling(let target, let after):
+            guard session.board.nodes[target] != nil else { return }
             let parent = session.board.parents[target]
             let siblings = parent.flatMap { session.board.nodes[$0]?.children } ?? session.board.roots.map(\.id)
             let filtered = siblings.filter { !draggedBranchIDs.contains($0) }

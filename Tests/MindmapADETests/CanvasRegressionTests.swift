@@ -447,6 +447,28 @@ struct CanvasRegressionTests {
         #expect(canvas.actions.terminalAddress == secondAddress)
     }
 
+    @Test func releasingTheMouseDoesNotReselectADeletedTopic() async throws {
+        let root = MapNode(text: "Root A")
+        var board = MindMapBoard(root: root)
+        let second = try #require(board.inserting(text: "Root B", parent: nil, position: CGPoint(x: 0, y: 170)))
+        board.apply(second.edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 100))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        let point = CGPoint(x: 148, y: 288)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: point))
+        #expect(canvas.view.selected == [second.id])
+        let edit = try #require(session.board.deleting([second.id]))
+        #expect(session.applyAgentEdit(edit, change: .removed, highlighting: []))
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: point))
+        #expect(!canvas.view.selected.contains(second.id))
+    }
+
     @Test func multiSelectionDragMovesBothRootsAndUndoesAsOneOperation() async throws {
         var board = MindMapBoard(root: MapNode(text: "Root A"))
         let rootA = board.roots[0].id

@@ -5,7 +5,7 @@ import SwiftUI
 
 @Observable
 final class EditorActions {
-    static let defaultHint = "Double-click to edit · Tab to add a child · Drag the canvas to pan"
+    static let defaultHint = "Shift-drag to select · Drag to pan · Double-click to edit"
 
     @ObservationIgnored weak var canvas: MindMapCanvasView?
     @ObservationIgnored weak var workspace: WorkspaceStore?

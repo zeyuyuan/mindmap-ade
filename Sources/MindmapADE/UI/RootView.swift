@@ -154,7 +154,8 @@ private struct BoardCanvasContent: View {
             HStack(spacing: 0) {
                 MindMapCanvas(
                     session: session, workspace: workspace, actions: actions, revision: session.revision,
-                    runtimeDetails: runtimeDetails, activeAgentID: terminalAddress?.nodeID
+                    runtimeDetails: runtimeDetails, activeAgentID: terminalAddress?.nodeID,
+                    agentEditedTopics: session.agentEditedTopics
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let address = terminalAddress {
@@ -185,7 +186,7 @@ private struct BoardCanvasContent: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
-                Text(actions.hint).lineLimit(1)
+                Text(canvasHint).lineLimit(1).help(canvasHint)
                 Spacer(minLength: CanvasStyle.statusHorizontalPadding)
                 Text(actions.zoomLabel)
                     .monospacedDigit()
@@ -201,6 +202,17 @@ private struct BoardCanvasContent: View {
             .background(.bar)
             .overlay(alignment: .top) { Divider() }
         }
+    }
+
+    private var canvasHint: String {
+        guard actions.hint == EditorActions.defaultHint, let notice = session.agentEditNotice else {
+            return actions.hint
+        }
+        let undoTargetsAgentEdit =
+            actions.canUndo && !actions.isEditingTopic && !actions.shouldUndoBoardDeletion
+            && !workspace.hasUnsavedTopicEdit(in: session.id) && session.lastUndoTime == notice.undoTime
+        let status = notice.change.status
+        return undoTargetsAgentEdit ? "\(status) · ⌘Z to undo" : status
     }
 
     private var visibleTerminalAddress: NodeAddress? {

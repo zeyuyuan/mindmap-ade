@@ -10,9 +10,12 @@ struct MapDragPreview {
 }
 
 final class TopicLayer {
+    private static let agentEditFadeKey = "recentAgentEdit"
     let layer = CALayer()
     private let text = TopicTextRenderer()
     private var iconLayer: CALayer?
+    private var agentEditDeadline: ContinuousClock.Instant?
+    private var agentEditTint: CGColor?
     private var detailRenderer: TopicTextRenderer?
     private var previousDetail: String?
     private var previousDetailColor: CGColor?
@@ -42,7 +45,7 @@ final class TopicLayer {
     }
 
     func configure(
-        node: MapNode, descendantCount: Int, root: Bool, selected: Bool, isActiveAgent: Bool,
+        node: MapNode, descendantCount: Int, root: Bool, selected: Bool,
         scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool
     ) {
         let title = node.title
@@ -102,7 +105,6 @@ final class TopicLayer {
         } else {
             detailRenderer?.layer.isHidden = true
         }
-        layer.backgroundColor = (isActiveAgent ? CanvasStyle.activeAgentBackground : .controlBackgroundColor).cgColor
         layer.borderColor =
             (selected ? NSColor.controlAccentColor : root ? NSColor.secondaryLabelColor : .separatorColor).cgColor
         layer.borderWidth = (selected ? CanvasStyle.selectedBorderWidth : CanvasStyle.borderWidth) / max(scale, 0.5)
@@ -148,6 +150,42 @@ final class TopicLayer {
             }
             disclosureGlyph.path = path
         }
+    }
+
+    func configureBackground(isActiveAgent: Bool, editDeadline: ContinuousClock.Instant?, now: ContinuousClock.Instant)
+    {
+        let background = isActiveAgent ? CanvasStyle.activeAgentBackground : .controlBackgroundColor
+        let normalColor = background.cgColor
+        if layer.backgroundColor != normalColor { layer.backgroundColor = normalColor }
+        guard let editDeadline, editDeadline > now else {
+            if agentEditDeadline != nil {
+                layer.removeAnimation(forKey: Self.agentEditFadeKey)
+                agentEditDeadline = nil
+                agentEditTint = nil
+            }
+            return
+        }
+        let tint = background.blended(withFraction: CanvasStyle.agentEditTintFraction, of: CanvasStyle.agentEditColor)
+        let tintColor = (tint ?? background).cgColor
+        guard
+            editDeadline != agentEditDeadline || tintColor != agentEditTint
+                || layer.animation(forKey: Self.agentEditFadeKey) == nil
+        else { return }
+        agentEditDeadline = editDeadline
+        agentEditTint = tintColor
+
+        // Anchor the fade to the edit, so a redraw or a recycled layer can join it at the right point.
+        let remaining = now.duration(to: editDeadline).components
+        let remainingSeconds = Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18
+        let duration = CanvasStyle.agentEditFadeDuration
+        let animation = CABasicAnimation(keyPath: "backgroundColor")
+        animation.fromValue = tintColor
+        animation.toValue = normalColor
+        animation.duration = duration
+        animation.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + remainingSeconds - duration
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.fillMode = .backwards
+        layer.add(animation, forKey: Self.agentEditFadeKey)
     }
 
     private func configureIcon(_ image: CGImage?) {
@@ -234,8 +272,9 @@ final class MapRenderer {
             resourceIconImages.removeAll(keepingCapacity: true)
             let symbols = NodeKind.allCases.filter { $0 != .text }.map(\.symbol) + [CanvasStyle.activeAgentSymbol]
             for symbol in symbols {
-                resourceIconImages[symbol] = CanvasStyle.resourceIcon(
-                    named: symbol, color: NSColor(cgColor: color) ?? .labelColor, contentsScale: contentsScale)
+                resourceIconImages[symbol] = CanvasStyle.symbolImage(
+                    named: symbol, color: NSColor(cgColor: color) ?? .labelColor, size: MapMetrics.resourceIconSize,
+                    pointSize: CanvasStyle.resourceIconPointSize, contentsScale: contentsScale)
             }
         }
         return resourceIconImages
@@ -244,7 +283,8 @@ final class MapRenderer {
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
-        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil
+        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil,
+        agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     ) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -293,6 +333,7 @@ final class MapRenderer {
         }
         let contentsScale = backingScale * max(1, ceil(camera.scale))
         var icons: [String: CGImage]?
+        let now = ContinuousClock.now
         for id in visible {
             guard let placement = layout.nodes[id], let node = board.nodes[id],
                 let tree = trees[placement.rootID], let origin = rootIndex[placement.rootID]
@@ -316,11 +357,12 @@ final class MapRenderer {
             }
             topic.configure(
                 node: node, descendantCount: placement.descendantCount, root: placement.depth == 0,
-                selected: selection.contains(id), isActiveAgent: isActiveAgent,
+                selected: selection.contains(id),
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
                 resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
                 isEditingTitle: editingTitleID == id
             )
+            topic.configureBackground(isActiveAgent: isActiveAgent, editDeadline: agentEditedTopics[id], now: now)
         }
 
         // Query edges separately: a connector can cross the viewport while both endpoints are outside it.

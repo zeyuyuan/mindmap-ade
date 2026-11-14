@@ -17,6 +17,14 @@ actor GitWorkspace {
         let directoryIdentity: String
     }
 
+    func validateBranchName(_ name: String) throws {
+        // Check a literal ref before --branch can interpret previous-checkout syntax.
+        guard !name.hasPrefix("-"), !name.contains("\0"),
+            (try? git(["check-ref-format", "refs/heads/\(name)"], in: "/")) != nil,
+            (try? git(["check-ref-format", "--branch", name], in: "/")) != nil
+        else { throw WorkspaceIssue("Enter a valid Git branch name.") }
+    }
+
     func project(at path: String) throws -> ProjectLocation {
         let directory = try availableDirectory(path)
         let root: String
@@ -85,9 +93,7 @@ actor GitWorkspace {
         let common = try verify(project)
         let names = Self.names(for: choice, id: id, title: title)
         guard Self.isValidFolderName(names.name) else { throw WorkspaceIssue(Self.folderNameHelp) }
-        guard !names.branch.hasPrefix("-"),
-            (try? git(["check-ref-format", "refs/heads/\(names.branch)"], in: project.directory)) != nil
-        else { throw WorkspaceIssue("Enter a valid Git branch name.") }
+        try validateBranchName(names.branch)
         let commit: String
         if let source {
             let checkout = try existing(source.directory, in: project)

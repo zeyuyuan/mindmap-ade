@@ -131,10 +131,11 @@ struct RendererRegressionTests {
         let renderer = MapRenderer(layer: host)
         let viewport = CGRect(x: 0, y: 0, width: 300, height: 200)
 
-        func render(activeAgentID: UUID?) {
+        func render(activeAgentID: UUID?, agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]) {
             renderer.render(
                 board: board, layout: layout, camera: MapCamera(), viewport: viewport,
-                selection: [second.id], backingScale: 2, activeAgentID: activeAgentID)
+                selection: [second.id], backingScale: 2, activeAgentID: activeAgentID,
+                agentEditedTopics: agentEditedTopics)
         }
 
         render(activeAgentID: nil)
@@ -160,7 +161,36 @@ struct RendererRegressionTests {
         #expect(secondIcon.contents as AnyObject? !== icon)
         #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
 
+        let activeBackground = secondCard.backgroundColor
+        let activeIcon = secondIcon.contents as AnyObject?
+        let selectionBorder = secondCard.borderColor
+        let contentsCount = secondCard.sublayers?.count
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        render(activeAgentID: second.id, agentEditedTopics: [second.id: deadline])
+        let key = try #require(secondCard.animationKeys()?.first)
+        let fade = try #require(secondCard.animation(forKey: key) as? CABasicAnimation)
+        #expect(secondCard.sublayers?.count == contentsCount)
+        #expect((fade.fromValue as! CGColor) != activeBackground)
+        #expect((fade.toValue as! CGColor) == activeBackground)
+        #expect(fade.duration == 2)
+        let remainingHold = fade.beginTime - secondCard.convertTime(CACurrentMediaTime(), from: nil)
+        #expect((5.8...6).contains(remainingHold))
+        #expect(secondCard.backgroundColor == activeBackground)
+        #expect(secondCard.borderColor == selectionBorder)
+        #expect(secondIcon.contents as AnyObject? === activeIcon)
+
+        render(activeAgentID: second.id, agentEditedTopics: [second.id: deadline])
+        #expect(secondCard.animation(forKey: key)?.beginTime == fade.beginTime)
+        render(activeAgentID: second.id, agentEditedTopics: [second.id: deadline.advanced(by: .seconds(1))])
+        #expect((secondCard.animation(forKey: key)?.beginTime ?? 0) > fade.beginTime + 0.8)
+
+        render(activeAgentID: first.id, agentEditedTopics: [second.id: .now.advanced(by: .seconds(1))])
+        let inProgress = try #require(secondCard.animation(forKey: key) as? CABasicAnimation)
+        #expect(inProgress.beginTime < secondCard.convertTime(CACurrentMediaTime(), from: nil))
+        #expect((inProgress.toValue as! CGColor) == background)
+
         render(activeAgentID: nil)
+        #expect(secondCard.animation(forKey: key) == nil)
         #expect(secondCard.backgroundColor == background)
         #expect(secondIcon.contents as AnyObject? === icon)
         #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)

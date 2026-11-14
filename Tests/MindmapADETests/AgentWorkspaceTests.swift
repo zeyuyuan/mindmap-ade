@@ -367,6 +367,16 @@ struct AgentWorkspaceTests {
         #expect(initial["result"] != nil)
         let denied = try await request(connection, token: "wrong-token", method: "tools/list")
         #expect(denied["error"] != nil)
+        let catalog = try await request(connection, token: token, method: "tools/list")
+        let tools = try #require((catalog["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        for tool in tools {
+            let name = try #require(tool["name"] as? String)
+            let annotations = try #require(tool["annotations"] as? [String: Bool])
+            #expect(
+                annotations["readOnlyHint"]
+                    == ["get_context", "get_node", "get_selection", "search_nodes", "list_nodes"].contains(name))
+            if name == "delete_node" { #expect(annotations["destructiveHint"] == true) }
+        }
         let create: [String: Any] = ["name": "create_node", "arguments": ["text": "Child", "operationId": "add-1"]]
         let first = try await request(connection, token: token, method: "tools/call", params: create)
         let childID = try #require((toolResult(first)["nodeId"] as? String).flatMap(UUID.init(uuidString:)))
@@ -453,6 +463,7 @@ struct AgentWorkspaceTests {
         #expect(conversation["text"] as? String == original.task)
         #expect(conversation["editableFields"] as? [String] == ["progress", "name"])
         let taskRevision = session.revision
+        let taskLayout = session.layoutRevision
         let deniedTask = try await call(
             "update_node",
             [
@@ -470,6 +481,8 @@ struct AgentWorkspaceTests {
                 ]))
         let progress = try toolResult(await call("get_node", ["field": "progress"]))
         #expect(progress["text"] as? String == "Added release notes")
+        #expect(session.revision > taskRevision)
+        #expect(session.layoutRevision == taskLayout)
         #expect(try toolResult(await call("get_node", ["field": "task"]))["text"] as? String == original.task)
 
         let draft = try toolResult(

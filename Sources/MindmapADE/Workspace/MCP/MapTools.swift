@@ -153,9 +153,15 @@ private enum MapTool: String, CaseIterable {
         }
         let paginated = !changesMap && self != .context
         if paginated { fields["cursor"] = ["type": "string"] }
+        var annotations: [String: Any] = ["readOnlyHint": !changesMap, "openWorldHint": false]
+        if changesMap {
+            annotations["destructiveHint"] = self == .delete || self == .update || self == .move
+            annotations["idempotentHint"] = true
+        }
         return [
             "name": rawValue,
             "description": description + (paginated ? " To continue, send nextCursor as cursor by itself." : ""),
+            "annotations": annotations,
             "inputSchema": [
                 "type": "object",
                 "properties": fields,

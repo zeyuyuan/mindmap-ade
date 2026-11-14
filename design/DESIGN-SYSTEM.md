@@ -53,7 +53,7 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 | `borderWidth` / `selectedBorderWidth` | 1 / 2 pt | Normal and selected topic outlines |
 | `edgeWidth` | 1.5 pt | Simple curved connectors and disclosure strokes |
 | `viewportOverscan` | 160 pt | Preload margin outside the visible canvas |
-| `fitPadding` | 64 pt | Space around content when fitting or revealing a topic |
+| `fitPadding` / `minimumFitPadding` / `fitPaddingFraction` | 64 pt / 16 pt / 0.10 | Fit and reveal padding uses a tenth of the canvas's shorter side, within these bounds |
 | `dragThreshold` | 4 pt | Pointer travel before starting a drag |
 | `selectionOpacity` | 0.08 | Accent fill for selection and drop overlays |
 | `resourceIconPointSize` | 16 pt | Symbol inside the resource icon tile |

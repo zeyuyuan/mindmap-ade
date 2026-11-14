@@ -45,6 +45,7 @@ final class BoardSession: Identifiable {
     let id: UUID
     private(set) var name: String
     private(set) var revision = 0
+    private(set) var layoutRevision = 0
     private(set) var nodeCount: Int
     private(set) var gitProjectLocations: [UUID: ProjectLocation] = [:]
     private(set) var agentEditNotice: AgentEditNotice?
@@ -135,7 +136,17 @@ final class BoardSession: Identifiable {
         editError = rejectEdit?(board, edit)
         guard editError == nil else { return nil }
         let inverse = board.apply(edit)
-        for replacement in edit.nodes {
+        // Progress, project notes, and board names do not affect the canvas geometry.
+        var needsLayout = edit.roots != nil && inverse.roots != board.roots
+        for (replacement, previous) in zip(edit.nodes, inverse.nodes) {
+            if !needsLayout, let before = previous.node, let after = replacement.node {
+                needsLayout =
+                    before.children != after.children || before.isCollapsed != after.isCollapsed
+                    || before.content.kind != after.content.kind || before.title != after.title
+                    || before.worktreeNameSuggestion != after.worktreeNameSuggestion
+            } else if previous.node == nil || replacement.node == nil {
+                needsLayout = true
+            }
             let location = Self.gitProjectLocation(replacement.node)
             if gitProjectLocations[replacement.id] != location {
                 gitProjectLocations[replacement.id] = location
@@ -144,6 +155,7 @@ final class BoardSession: Identifiable {
         }
         name = board.name
         nodeCount = board.nodes.count
+        if needsLayout { layoutRevision += 1 }
         revision += 1
         return inverse
     }
@@ -272,7 +284,7 @@ final class WorkspaceStore {
     @ObservationIgnored private let disk: any WorkspacePersistence
     @ObservationIgnored private var loadStarted = false
     @ObservationIgnored private var saveTask: Task<Void, Never>?
-    @ObservationIgnored private var editingSessions: [EditKey: EditingSession] = [:]
+    private var editingSessions: [EditKey: EditingSession] = [:]
     @ObservationIgnored private var saveRevision = 0
 
     init(disk: any WorkspacePersistence, interactiveShell: String = AgentCLI.interactiveShell) {
@@ -443,6 +455,10 @@ final class WorkspaceStore {
 
     func isEditing(_ address: NodeAddress) -> Bool {
         formClosers[address] != nil || editingSessions[EditKey(boardID: address.boardID, nodeID: address.nodeID)] != nil
+    }
+
+    func hasUnsavedTopicEdit(in boardID: UUID) -> Bool {
+        editingSessions.contains { $0.key.boardID == boardID && $0.value.text != nil }
     }
 
     func commitEdits(in boardID: UUID? = nil) {

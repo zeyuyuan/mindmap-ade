@@ -18,7 +18,7 @@ make run
 
 - Double-click a topic or press F2 to edit. Return finishes editing, Option-Return inserts a newline, and Escape discards the current draft. Opening the same topic for editing in another window commits the first editor and continues with that text.
 - With the canvas focused, Tab adds a child and Return adds a sibling. Shift-Command-R adds a root. Typing replaces the selected topic's text.
-- Drag blank space to pan; pinch or Command-scroll to zoom. Command-plus/minus zoom, Command-0 restores actual size, and Shift-Command-0 fits content.
+- Drag blank space to pan while keeping your selection. Click blank space to clear it. Pinch or Command-scroll to zoom. Command-plus/minus zoom, Command-0 restores actual size, and Shift-Command-0 fits content.
 - Right-click blank canvas for Fit Content. The bottom bar displays the current zoom; the title bar keeps only the board name and native sidebar toggle.
 - Drag a topic onto another topic to reparent its branch. Drop near a topic's upper or lower edge to reorder, or on blank space to make a root. Drag a selected topic to move the selection together; one undo restores the group. Drops onto a moved branch's descendants leave the map unchanged.
 - Click a topic to select it. Command-click adds or removes individual topics, and Shift-drag from blank canvas adds the topics inside the selection rectangle. Click the external minus control to fold a branch, and click the hidden descendant count to expand it. Arrow keys navigate, expand, and collapse.

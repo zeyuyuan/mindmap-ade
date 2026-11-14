@@ -210,7 +210,7 @@ private struct BoardCanvasContent: View {
         }
         let undoTargetsAgentEdit =
             actions.canUndo && !actions.isEditingTopic && !actions.shouldUndoBoardDeletion
-            && session.lastUndoTime == notice.undoTime
+            && !workspace.hasUnsavedTopicEdit(in: session.id) && session.lastUndoTime == notice.undoTime
         let status = notice.change.status
         return undoTargetsAgentEdit ? "\(status) · ⌘Z to undo" : status
     }

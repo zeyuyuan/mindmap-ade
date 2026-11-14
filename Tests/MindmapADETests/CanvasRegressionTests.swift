@@ -32,11 +32,14 @@ private final class CanvasFixture {
     let view: MindMapCanvasView
     let window: NSWindow
 
-    init(workspace: WorkspaceStore, session: BoardSession) {
+    init(
+        workspace: WorkspaceStore, session: BoardSession,
+        size: CGSize = CGSize(width: 1000, height: 640)
+    ) {
         _ = NSApplication.shared
         view = MindMapCanvasView(session: session, workspace: workspace, actions: actions)
         window = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 1000, height: 640),
+            contentRect: CGRect(origin: .zero, size: size),
             styleMask: [.titled], backing: .buffered, defer: true)
         window.isReleasedWhenClosed = false
         window.contentView = view
@@ -420,11 +423,14 @@ struct CanvasRegressionTests {
 
         let secondPoint = try center(of: second)
         try canvas.click(secondPoint, modifiers: .command)
-        try canvas.click(secondPoint)
+        #expect(canvas.view.selected == [first.id, second.id])
         #expect(canvas.actions.terminalAddress == firstAddress)
+        try canvas.click(secondPoint)
+        #expect(canvas.view.selected == [second.id])
+        #expect(canvas.actions.terminalAddress == secondAddress)
 
         try canvas.click(try center(of: root))
-        #expect(canvas.actions.terminalAddress == firstAddress)
+        #expect(canvas.actions.terminalAddress == secondAddress)
         try canvas.click(secondPoint)
         #expect(canvas.actions.terminalAddress == secondAddress)
         #expect(canvas.window.firstResponder === canvas.view)
@@ -455,7 +461,14 @@ struct CanvasRegressionTests {
         try await canvas.ready()
         try canvas.click(CGPoint(x: 148, y: 118))
         try canvas.click(CGPoint(x: 148, y: 288), modifiers: .command)
-        try canvas.drag(from: CGPoint(x: 148, y: 118), to: CGPoint(x: 178, y: 143))
+        canvas.view.insertNode(asChild: true)
+        canvas.view.editSelection()
+        #expect(canvas.editor == nil)
+        #expect(session.board == board)
+        try canvas.drag(from: CGPoint(x: 20, y: 20), to: CGPoint(x: 65, y: 37))
+        #expect(canvas.view.selected == [rootA, second.id])
+        #expect(session.board == board)
+        try canvas.drag(from: CGPoint(x: 193, y: 135), to: CGPoint(x: 223, y: 160))
         #expect(session.board.roots.first { $0.id == rootA }?.position == CGPoint(x: 30, y: 25))
         #expect(session.board.roots.first { $0.id == second.id }?.position == CGPoint(x: 30, y: 195))
         let selected = canvas.view.accessibilityChildren()?.compactMap { $0 as? NSAccessibilityElement }
@@ -570,6 +583,27 @@ struct CanvasRegressionTests {
         canvas.actions.targetBoardID = session.id
         terminal.park()
         #expect(try ids(await selection()).isEmpty)
+    }
+
+    @Test func narrowCanvasFitsAnOrdinaryBranchWithoutHidingItsControls() async throws {
+        let root = MapNode(text: "Release")
+        var board = MindMapBoard(root: root)
+        let child = try #require(board.inserting(text: "Checklist", parent: root.id))
+        board.apply(child.edit)
+        board.apply(try #require(board.inserting(text: "Owner", parent: child.id)).edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session, size: CGSize(width: 180, height: 440))
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        canvas.view.fitContent()
+
+        let camera = try #require(workspace.cameras[board.id])
+        #expect(camera.scale >= CanvasStyle.textDetailScale)
+        let controls = canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicDisclosureAccessibilityElement }
+        #expect(controls?.count == 2)
     }
 
     @Test func droppingABranchOnItsDescendantDoesNotDetachIt() async throws {

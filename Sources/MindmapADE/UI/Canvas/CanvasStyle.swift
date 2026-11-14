@@ -8,6 +8,8 @@ enum CanvasStyle {
     static let edgeWidth: CGFloat = 1.5
     static let viewportOverscan: CGFloat = 160
     static let fitPadding: CGFloat = 64
+    static let minimumFitPadding: CGFloat = 16
+    static let fitPaddingFraction: CGFloat = 0.10
     static let dragThreshold: CGFloat = 4
     static let selectionOpacity: CGFloat = 0.08
     static let resourceIconPointSize: CGFloat = 16

@@ -9,7 +9,7 @@ struct MindMapCanvas: NSViewRepresentable {
     let revision: Int
     let runtimeDetails: [UUID: String]
     let activeAgentID: UUID?
-    let agentEditedTopics: Set<UUID>
+    let agentEditedTopics: [UUID: ContinuousClock.Instant]
 
     func makeNSView(context: Context) -> MindMapCanvasView {
         MindMapCanvasView(session: session, workspace: workspace, actions: actions)
@@ -69,7 +69,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var configureAfterLayout: UUID?
     private var runtimeDetails: [UUID: String] = [:]
     private var activeAgentID: UUID?
-    private var agentEditedTopics: Set<UUID> = []
+    private var agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     private var editorScroll: NSScrollView?
     private var editorBackdrop: NSView?
     private var provisionalEditFrame: CGRect?
@@ -294,7 +294,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     func updatePresentation(
-        runtimeDetails: [UUID: String], activeAgentID: UUID?, agentEditedTopics: Set<UUID> = []
+        runtimeDetails: [UUID: String], activeAgentID: UUID?, agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     ) {
         guard
             self.runtimeDetails != runtimeDetails || self.activeAgentID != activeAgentID
@@ -1613,7 +1613,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 : "\(node.children.count) children"
             let detail = runtimeDetails[id] ?? node.detail
             let terminalStatus = id == activeAgentID ? "Active terminal" : nil
-            let agentEditStatus = agentEditedTopics.contains(id) ? "Recently changed by an Agent" : nil
+            let agentEditStatus = agentEditedTopics[id] != nil ? "Recently changed by an Agent" : nil
             element.setAccessibilityValue(
                 [terminalStatus, agentEditStatus, detail, children].compactMap { $0 }.joined(separator: ", "))
             element.setAccessibilitySelected(selected.contains(id))

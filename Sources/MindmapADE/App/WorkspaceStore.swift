@@ -101,7 +101,8 @@ final class BoardSession: Identifiable {
         guard let inverse = applyChange(edit) else { return false }
         let entry = HistoryEntry(edit: inverse, action: change.rawValue, agentTopics: topics)
         record(entry)
-        let deadline = entry.time.advanced(by: CanvasStyle.agentEditHighlightDuration)
+        let duration = CanvasStyle.agentEditHighlightDuration + .seconds(CanvasStyle.agentEditFadeDuration)
+        let deadline = entry.time.advanced(by: duration)
         for id in topics { agentEditedTopics[id] = deadline }
         agentEditNotice = AgentEditNotice(change: change, undoTime: entry.time, expiresAt: deadline)
         scheduleAgentEditExpiry()

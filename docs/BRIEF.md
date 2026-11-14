@@ -14,7 +14,7 @@ A local mind-map workspace for turning a text task into an Agent conversation. B
 - **Empty and blocked states.** New boards start with an editable text root. Missing context has an action to choose a Git project or configure its ancestor. Non-Git folders can be organized as projects. A new Worktree focuses its name directly on the canvas. Tab accepts the suggested name. Return or leaving the field creates the checkout. Linking an existing checkout has its own entry point.
 - **Interaction.** Save Project and Link Worktree bind existing directories. Create Worktree writes Git state. Start validates and saves the Agent binding before launching. A new worktree uses the suggested name when the name field is blank and becomes the Agent's immediate parent. A running conversation stays active when switching boards or closing a pane. Moving or undoing its branch is allowed when it remains bound to its working directory. Relaunch restores the last board, camera, selection, and open terminal pane. An interrupted conversation continues when its pane opens. A branch change requires confirmation. Missing worktrees and unavailable conversations keep their saved output visible.
 
-- Agent edits appear immediately. Added, edited, and moved topics display a temporary green tint and pencil badge. The status bar reports deletions and shows the Command-Z shortcut when it would undo the reported change.
+- Agent edits appear immediately. Added, edited, and moved topics stay green for six seconds, then fade to their usual color over two seconds. The status bar reports deletions and shows the Command-Z shortcut when it would undo the reported change.
 
 ## Engineering Direction
 

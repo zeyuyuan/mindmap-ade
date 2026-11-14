@@ -15,11 +15,9 @@ enum CanvasStyle {
     static let resourceIconPointSize: CGFloat = 16
     static let activeAgentTintFraction: CGFloat = 0.18
     static let activeAgentSymbol = "terminal.fill"
-    static let agentEditHighlightDuration: Duration = .seconds(5)
+    static let agentEditHighlightDuration: Duration = .seconds(6)
+    static let agentEditFadeDuration: TimeInterval = 2
     static let agentEditTintFraction: CGFloat = 0.14
-    static let agentEditBadgeSize: CGFloat = 20
-    static let agentEditSymbolSize: CGFloat = 12
-    static let agentEditSymbol = "pencil"
     static var agentEditColor: NSColor { .systemGreen }
     static let formWidth: CGFloat = 384
     static let formMaximumBodyHeight: CGFloat = 344

@@ -155,7 +155,7 @@ private struct BoardCanvasContent: View {
                 MindMapCanvas(
                     session: session, workspace: workspace, actions: actions, revision: session.revision,
                     runtimeDetails: runtimeDetails, activeAgentID: terminalAddress?.nodeID,
-                    agentEditedTopics: Set(session.agentEditedTopics.keys)
+                    agentEditedTopics: session.agentEditedTopics
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let address = terminalAddress {

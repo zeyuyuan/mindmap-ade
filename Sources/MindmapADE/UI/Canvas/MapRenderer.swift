@@ -42,8 +42,8 @@ final class TopicLayer {
     }
 
     func configure(
-        node: MapNode, descendantCount: Int, root: Bool, selected: Bool, scale: CGFloat, contentsScale: CGFloat,
-        runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool
+        node: MapNode, descendantCount: Int, root: Bool, selected: Bool, isActiveAgent: Bool,
+        scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool
     ) {
         let title = node.title
         let detail = runtimeDetail ?? node.detail
@@ -102,7 +102,7 @@ final class TopicLayer {
         } else {
             detailRenderer?.layer.isHidden = true
         }
-        layer.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer.backgroundColor = (isActiveAgent ? CanvasStyle.activeAgentBackground : .controlBackgroundColor).cgColor
         layer.borderColor =
             (selected ? NSColor.controlAccentColor : root ? NSColor.secondaryLabelColor : .separatorColor).cgColor
         layer.borderWidth = (selected ? CanvasStyle.selectedBorderWidth : CanvasStyle.borderWidth) / max(scale, 0.5)
@@ -210,7 +210,7 @@ final class MapRenderer {
     private var topics: [UUID: TopicLayer] = [:]
     private var connectorBatches: [BatchKey: ConnectorBatch] = [:]
     private var reusableTopics: [TopicLayer] = []
-    private var resourceIconImages: [NodeKind: CGImage] = [:]
+    private var resourceIconImages: [String: CGImage] = [:]
     private var resourceIconScale: CGFloat = 0
     private var resourceIconColor: CGColor?
 
@@ -226,15 +226,16 @@ final class MapRenderer {
         dropIndicator.lineDashPattern = [4, 3]
     }
 
-    private func resourceIcons(contentsScale: CGFloat) -> [NodeKind: CGImage] {
+    private func resourceIcons(contentsScale: CGFloat) -> [String: CGImage] {
         let color = NSColor.labelColor.cgColor
         if resourceIconScale != contentsScale || resourceIconColor != color {
             resourceIconScale = contentsScale
             resourceIconColor = color
             resourceIconImages.removeAll(keepingCapacity: true)
-            for kind in NodeKind.allCases where kind != .text {
-                resourceIconImages[kind] = CanvasStyle.resourceIcon(
-                    named: kind.symbol, color: NSColor(cgColor: color) ?? .labelColor, contentsScale: contentsScale)
+            let symbols = NodeKind.allCases.filter { $0 != .text }.map(\.symbol) + [CanvasStyle.activeAgentSymbol]
+            for symbol in symbols {
+                resourceIconImages[symbol] = CanvasStyle.resourceIcon(
+                    named: symbol, color: NSColor(cgColor: color) ?? .labelColor, contentsScale: contentsScale)
             }
         }
         return resourceIconImages
@@ -243,7 +244,7 @@ final class MapRenderer {
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
-        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil
+        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil
     ) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -291,7 +292,7 @@ final class MapRenderer {
             trees.removeValue(forKey: id)?.removeFromSuperlayer()
         }
         let contentsScale = backingScale * max(1, ceil(camera.scale))
-        var icons: [NodeKind: CGImage]?
+        var icons: [String: CGImage]?
         for id in visible {
             guard let placement = layout.nodes[id], let node = board.nodes[id],
                 let tree = trees[placement.rootID], let origin = rootIndex[placement.rootID]
@@ -309,14 +310,16 @@ final class MapRenderer {
             topic.layer.frame = frame
             topic.layer.opacity = drag?.topLevelIDs.contains(id) == true && drag?.rootIDs.contains(id) != true ? 0.7 : 1
             let kind = node.content.kind
+            let isActiveAgent = kind == .agent && id == activeAgentID
             if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
                 icons = resourceIcons(contentsScale: contentsScale)
             }
             topic.configure(
                 node: node, descendantCount: placement.descendantCount, root: placement.depth == 0,
-                selected: selection.contains(id),
+                selected: selection.contains(id), isActiveAgent: isActiveAgent,
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
-                resourceIcon: icons?[kind], isEditingTitle: editingTitleID == id
+                resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
+                isEditingTitle: editingTitleID == id
             )
         }
 

@@ -18,13 +18,14 @@ final class MCPGrant {
 private enum MapTool: String, CaseIterable {
     case context = "get_context"
     case list = "list_nodes"
+    case selection = "get_selection"
     case create = "create_node"
     case update = "update_node"
     case move = "move_node"
     case delete = "delete_node"
     case register = "register_worktree"
 
-    var changesMap: Bool { self != .context && self != .list }
+    var changesMap: Bool { self != .context && self != .list && self != .selection }
 
     var definition: [String: Any] {
         var fields: [String: String] = [:]
@@ -36,6 +37,12 @@ private enum MapTool: String, CaseIterable {
         case .list:
             description = "Read a page of direct children in the current conversation branch."
             fields = ["parentId": "string", "offset": "integer"]
+        case .selection:
+            description =
+                "Read the topics currently selected on the board beside this conversation's terminal. "
+                + "Omit nodeId to list topics and text previews. "
+                + "Pass a selected nodeId to read its full text in chunks. Use nextOffset to continue either response."
+            fields = ["nodeId": "string", "offset": "integer"]
         case .create:
             description = "Add a text topic under the current conversation or one of its text topics."
             fields = ["parentId": "string", "text": "string"]
@@ -204,6 +211,7 @@ extension WorkspaceStore {
                 "ancestors": Array(ancestors.reversed()),
             ]
         }
+        if tool == .selection { return try readSelection(arguments, at: grant.run.address, in: session) }
         let parent = try scopedNode(arguments["parentId"], default: origin, grant: grant, in: board)
         let children = board.nodes[parent]?.children ?? []
         let offset = max(0, min(arguments["offset"] as? Int ?? 0, children.count))
@@ -213,6 +221,57 @@ extension WorkspaceStore {
             return ["id": id.uuidString, "title": String(node.title.prefix(1000)), "kind": node.content.kind.rawValue]
         }
         return ["nodes": topics, "nextOffset": end, "total": children.count, "revision": session.revision]
+    }
+
+    private func readSelection(
+        _ arguments: [String: Any], at address: NodeAddress, in session: BoardSession
+    ) throws -> [String: Any] {
+        let board = session.board
+        let selected = terminals[address]?.canvasSelection(in: session) ?? []
+        let offset = max(0, arguments["offset"] as? Int ?? 0)
+        let context: [String: Any] = [
+            "boardId": board.id.uuidString, "board": board.name, "revision": session.revision,
+        ]
+        if let nodeID = arguments["nodeId"] {
+            guard let value = nodeID as? String, let id = UUID(uuidString: value),
+                selected.contains(id), let node = board.nodes[id]
+            else { throw WorkspaceIssue("Provide an ID for a topic currently selected on the canvas.") }
+            let content = selectionText(for: node).unicodeScalars
+            let start = min(offset, content.count)
+            // Keep the text slice small enough for the socket even after both layers of JSON escaping.
+            let slice = content.dropFirst(start).prefix(4_000)
+            return context.merging([
+                "id": id.uuidString, "kind": node.content.kind.rawValue,
+                "text": String(slice),
+                "nextOffset": start + slice.count, "hasMore": slice.endIndex != content.endIndex,
+            ]) { _, value in value }
+        }
+        let ids = selected.filter { board.nodes[$0] != nil }.sorted()
+        let start = min(offset, ids.count)
+        let end = min(start + 50, ids.count)
+        let nodes = ids[start..<end].compactMap { id -> [String: Any]? in
+            guard let node = board.nodes[id] else { return nil }
+            let content = selectionText(for: node).unicodeScalars
+            let preview = content.prefix(200)
+            return [
+                "id": id.uuidString, "kind": node.content.kind.rawValue,
+                "title": String(node.title.unicodeScalars.prefix(200)),
+                "text": String(preview), "hasMoreText": preview.endIndex != content.endIndex,
+            ]
+        }
+        return context.merging([
+            "nodes": nodes, "nextOffset": end, "total": ids.count, "hasMore": end < ids.count,
+        ]) { _, value in value }
+    }
+
+    private func selectionText(for node: MapNode) -> String {
+        switch node.content {
+        case .text: node.text
+        case .project(let project): project.details
+        case .agent(let agent): agent.task
+        case .worktree(let tree): tree.location?.directory ?? node.title
+        case .branch: node.title
+        }
     }
 
     private func write(
@@ -261,7 +320,7 @@ extension WorkspaceStore {
             return ["nodeId": id.uuidString]
         case .register:
             return try await register(arguments: arguments, grant: grant, session: session)
-        case .context, .list:
+        case .context, .list, .selection:
             return [:]
         }
     }

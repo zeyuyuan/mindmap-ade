@@ -56,7 +56,7 @@ struct AgentTerminalPane: View {
     @ViewBuilder
     private func liveTerminal(_ terminal: AgentTerminal) -> some View {
         if terminal.owner == actions.windowID {
-            TerminalAttachment(terminal: terminal, windowID: actions.windowID)
+            TerminalAttachment(terminal: terminal, actions: actions)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
         } else {
@@ -246,7 +246,7 @@ final class AgentTerminalView: AppTerminalView {
 
 private struct TerminalAttachment: NSViewRepresentable {
     let terminal: AgentTerminal
-    let windowID: UUID
+    let actions: EditorActions
 
     func makeNSView(context: Context) -> Host {
         let host = Host()
@@ -258,9 +258,9 @@ private struct TerminalAttachment: NSViewRepresentable {
     func updateNSView(_ host: Host, context: Context) {
         let isNew = host.terminal !== terminal
         if isNew { host.detach() }
-        guard terminal.owner == windowID else { return }
+        guard terminal.owner == actions.windowID else { return }
         host.terminal = terminal
-        terminal.attach(to: host)
+        terminal.attach(to: host, editor: actions)
         if isNew, terminal.isShell { host.focusTerminal() }
     }
 

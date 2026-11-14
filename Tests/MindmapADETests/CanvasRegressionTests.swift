@@ -468,6 +468,91 @@ struct CanvasRegressionTests {
         #expect(session.board.roots[1].position == CGPoint(x: 30, y: 195))
     }
 
+    @Test func agentReadsLiveCanvasSelectionFromItsOwnWindow() async throws {
+        let root = MapNode(text: "First topic")
+        let longText = String(repeating: "e\u{301} 中文 👩🏽‍💻\n", count: 700)
+        let second = MapNode(text: longText)
+        let agent = MapNode(content: .agent(AgentTopic(task: "Read the canvas")))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(second, parent: nil, position: CGPoint(x: 0, y: 84))).edit)
+        board.apply(try #require(board.inserting(agent, parent: nil, position: CGPoint(x: 380, y: 0))).edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 100))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let otherWindow = CanvasFixture(workspace: workspace, session: session)
+        defer { otherWindow.close() }
+        try await otherWindow.ready()
+
+        let address = NodeAddress(boardID: session.id, nodeID: agent.id)
+        let terminal = AgentTerminal()
+        defer { terminal.park() }
+        let checkout = WorktreeLocation(
+            directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "test", commit: "sha",
+            isPrimary: false)
+        var run = AgentRun(address: address, worktree: checkout, cli: .commandCode, executable: "/usr/bin/true")
+        run.state = .running
+        workspace.agentRuns[address] = run
+        workspace.terminals[address] = terminal
+        let token = UUID().uuidString
+        workspace.mcpGrants[token] = MCPGrant(run: run)
+        canvas.actions.workspace = workspace
+        canvas.actions.targetBoardID = session.id
+        canvas.actions.showTerminal(at: address, revealNode: false)
+        terminal.attach(to: canvas.view, editor: canvas.actions)
+
+        func call(_ name: String, arguments: [String: Any] = [:]) async throws -> [String: Any] {
+            let message = try JSONSerialization.data(withJSONObject: [
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["name": name, "arguments": arguments],
+            ])
+            let envelope = try JSONEncoder().encode(MCPEnvelope(token: token, message: message))
+            let reply = try #require(await workspace.handleMCP(envelope))
+            let body = try #require(JSONSerialization.jsonObject(with: reply) as? [String: Any])
+            return try #require(body["result"] as? [String: Any])
+        }
+
+        func selection(_ arguments: [String: Any] = [:]) async throws -> [String: Any] {
+            let result = try await call("get_selection", arguments: arguments)
+            let content = try #require(result["content"] as? [[String: String]])
+            let payload = try #require(content.first?["text"])
+            return try #require(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        }
+
+        func ids(_ result: [String: Any]) throws -> Set<String> {
+            let nodes = try #require(result["nodes"] as? [[String: Any]])
+            return Set(nodes.compactMap { $0["id"] as? String })
+        }
+
+        try canvas.click(CGPoint(x: 148, y: 118))
+        try otherWindow.click(CGPoint(x: 8, y: 8))
+        #expect(try ids(await selection()) == [root.id.uuidString])
+        let marqueeStart = CGPoint(x: 84, y: 84)
+        let marqueeEnd = CGPoint(x: 430, y: 350)
+        try canvas.view.mouseDown(with: canvas.event(.leftMouseDown, at: marqueeStart, modifiers: .shift))
+        try canvas.view.mouseDragged(with: canvas.event(.leftMouseDragged, at: marqueeEnd, modifiers: .shift))
+        try canvas.view.mouseUp(with: canvas.event(.leftMouseUp, at: marqueeEnd, modifiers: .shift))
+        #expect(try ids(await selection()) == [root.id.uuidString, second.id.uuidString])
+        let first = try await selection(["nodeId": second.id.uuidString])
+        #expect(first["hasMore"] as? Bool == true)
+        let offset = try #require(first["nextOffset"] as? Int)
+        let rest = try await selection(["nodeId": second.id.uuidString, "offset": offset])
+        #expect(rest["hasMore"] as? Bool == false)
+        let text = try #require(first["text"] as? String) + (try #require(rest["text"] as? String))
+        #expect(text.utf8.elementsEqual(longText.utf8))
+
+        let edit = try await call(
+            "create_node", arguments: ["parentId": root.id.uuidString, "text": "Outside", "operationId": "outside"])
+        #expect(edit["isError"] as? Bool == true)
+        canvas.actions.targetBoardID = UUID()
+        #expect(try ids(await selection()).isEmpty)
+        canvas.actions.targetBoardID = session.id
+        terminal.park()
+        #expect(try ids(await selection()).isEmpty)
+    }
+
     @Test func droppingABranchOnItsDescendantDoesNotDetachIt() async throws {
         var board = MindMapBoard(root: MapNode(text: "Root"))
         let root = board.roots[0].id

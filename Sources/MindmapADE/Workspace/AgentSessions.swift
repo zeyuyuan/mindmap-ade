@@ -293,7 +293,9 @@ extension WorkspaceStore {
             parts.append("Project: \(node.title)")
             if !project.details.isEmpty { parts.append("Project notes:\n\(project.details)") }
         }
-        parts.append("Mindmap ADE MCP tools can read this conversation's context and update its map branch.")
+        parts.append(
+            "Mindmap ADE MCP tools can read this conversation's context and update its map branch. "
+                + "Use get_selection when the user refers to topics they selected on the canvas.")
         return parts.joined(separator: "\n") + "\n\nTask:\n"
     }
 }

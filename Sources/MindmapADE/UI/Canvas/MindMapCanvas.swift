@@ -51,7 +51,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private let nativeHost = NativeNodeHostView()
     private var camera = MapCamera()
     private var hasCamera = false
-    private var selected = Set<UUID>()
+    private(set) var selected = Set<UUID>()
     private var editor: TopicTextView?
     private var worktreeNameField: NSTextField?
     private var pendingWorktreeCreations = Set<NodeAddress>()
@@ -134,7 +134,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         actions.canvas = self
         setAccessibilityRole(.group)
         setAccessibilityLabel("Mind map canvas")
-        setAccessibilityHelp("Use Tab to add a child, Return to add a sibling, and arrow keys to navigate topics.")
+        setAccessibilityHelp(
+            "Shift-drag from blank canvas to select topics. Use Tab to add a child, Return to add a sibling, "
+                + "and arrow keys to navigate topics.")
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -1424,6 +1426,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             select(node.id)
         } else {
             selected.removeAll()
+            render()
             updateActions()
         }
         let menu = NSMenu()

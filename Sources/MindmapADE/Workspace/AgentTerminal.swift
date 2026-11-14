@@ -30,6 +30,7 @@ final class AgentTerminal {
     var owner: UUID?
     private(set) var isShell = false
     @ObservationIgnored let view: AgentTerminalView
+    @ObservationIgnored private weak var attachedEditor: EditorActions?
     @ObservationIgnored var didExit: ((Int32?, String?) -> Void)? {
         didSet { deliverExit() }
     }
@@ -73,7 +74,8 @@ final class AgentTerminal {
         stop()
     }
 
-    func attach(to container: NSView) {
+    func attach(to container: NSView, editor: EditorActions? = nil) {
+        attachedEditor = editor
         guard view.superview !== container else { return }
         view.removeFromSuperview()
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -88,12 +90,20 @@ final class AgentTerminal {
     }
 
     func park() {
+        attachedEditor = nil
         view.setSurfaceVisible(false)
         guard view.superview !== Self.parkingWindow.contentView else { return }
         view.removeFromSuperview()
         view.translatesAutoresizingMaskIntoConstraints = true
         view.autoresizingMask = []
         Self.parkingWindow.contentView?.addSubview(view)
+    }
+
+    func canvasSelection(in session: BoardSession) -> Set<UUID> {
+        guard let editor = attachedEditor, owner == editor.windowID, editor.targetBoardID == session.id,
+            let canvas = editor.canvas, canvas.session === session, let window = view.window, canvas.window === window
+        else { return [] }
+        return canvas.selected
     }
 
     func start(

@@ -55,6 +55,9 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 | `viewportOverscan` | 160 pt | Preload margin outside the visible canvas |
 | `fitPadding` / `minimumFitPadding` / `fitPaddingFraction` | 64 pt / 16 pt / 0.10 | Fit and reveal padding uses a tenth of the canvas's shorter side, within these bounds |
 | `dragThreshold` | 4 pt | Pointer travel before starting a drag |
+| `dropHorizontalReach` / `dropVerticalReach` | 24 / 12 pt | Reach outside a topic for drag targets, capped at half the horizontal branch gap and the vertical branch gap in world coordinates |
+| `dropOutlinePadding` | 4 pt | Inset between the target topic and its drop outline |
+| `draggedTopicOpacity` | 0.72 | Allows prospective drop targets to remain visible under the dragged branch |
 | `selectionOpacity` | 0.08 | Accent fill for selection and drop overlays |
 | `resourceIconPointSize` | 16 pt | Symbol inside the resource icon tile |
 | `activeAgentTintFraction` | 0.18 | System accent blended into the active Agent card background |
@@ -78,6 +81,8 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 `MapCamera.minimumScale` is 0.000001 and `maximumScale` is 4, allowing Fit Content to include very large maps. Sub-percent magnification displays fractional percentages. Editing below 75% aims for 100%; editing is capped at 150% and reduced as needed to fit the topic's width. Fit Content enlarges no further than 150%. Camera changes preserve their anchor. Native sidebar controls use system sizing.
 
 Selection uses the system accent outline. The Agent whose terminal pane is open has a tinted card and the `terminal.fill` symbol. Its highlight follows the pane independently of canvas selection and process status. Do not add custom glass or shadows to map content. Disable implicit layer animations during pointer manipulation.
+
+During a branch drag, use the system accent to outline a prospective parent or draw a solid insertion line for a sibling. The status bar describes the result of releasing at the current point.
 
 Agent edits tint each directly changed topic for the hold and fade durations. The fade changes only the background color, including with Reduce Motion enabled. VoiceOver exposes the status on the topic. The status bar describes the latest Agent edit, including deletions, and shows the standard Undo shortcut when it would undo that edit.
 

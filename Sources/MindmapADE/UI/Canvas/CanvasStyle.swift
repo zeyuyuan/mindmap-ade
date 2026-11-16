@@ -11,6 +11,10 @@ enum CanvasStyle {
     static let minimumFitPadding: CGFloat = 16
     static let fitPaddingFraction: CGFloat = 0.10
     static let dragThreshold: CGFloat = 4
+    static let dropHorizontalReach: CGFloat = 24
+    static let dropVerticalReach: CGFloat = 12
+    static let dropOutlinePadding: CGFloat = 4
+    static let draggedTopicOpacity: Float = 0.72
     static let selectionOpacity: CGFloat = 0.08
     static let resourceIconPointSize: CGFloat = 16
     static let activeAgentTintFraction: CGFloat = 0.18

@@ -205,6 +205,7 @@ private struct BoardCanvasContent: View {
     }
 
     private var canvasHint: String {
+        if let hint = actions.dropHint { return hint }
         guard actions.hint == EditorActions.defaultHint, let notice = session.agentEditNotice else {
             return actions.hint
         }

@@ -628,6 +628,93 @@ struct CanvasRegressionTests {
         #expect(controls?.count == 2)
     }
 
+    @Test func droppingNearATopicAttachesAFloatingBranch() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Root"))
+        let parent = try #require(board.inserting(text: "Target", parent: board.roots[0].id))
+        board.apply(parent.edit)
+        let floating = try #require(
+            board.inserting(text: "Floating", parent: nil, position: CGPoint(x: 420, y: 170)))
+        board.apply(floating.edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 100))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        let start = CGPoint(x: 568, y: 288)
+        let outsideTarget = CGPoint(x: 374, y: 118)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: start))
+        canvas.view.mouseDragged(with: try canvas.event(.leftMouseDragged, at: outsideTarget))
+        #expect(canvas.actions.dropHint == "Release to attach as a child")
+        #expect(session.board == board)
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: outsideTarget))
+
+        #expect(session.board.parents[floating.id] == parent.id)
+        #expect(canvas.actions.dropHint == nil)
+        canvas.view.undoCommand()
+        #expect(session.board == board)
+    }
+
+    @Test func droppingInTheGapBetweenSiblingsInsertsAtTheLine() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Root"))
+        let root = board.roots[0].id
+        var children: [UUID] = []
+        for title in ["First", "Second", "Third"] {
+            let child = try #require(board.inserting(text: title, parent: root))
+            board.apply(child.edit)
+            children.append(child.id)
+        }
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 100))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        let start = CGPoint(x: 308, y: 170)
+        let gap = CGPoint(x: 308, y: 92)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: start))
+        canvas.view.mouseDragged(with: try canvas.event(.leftMouseDragged, at: gap))
+        #expect(canvas.actions.dropHint == "Release to insert at the line")
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: gap))
+
+        #expect(session.board.nodes[root]?.children == [children[0], children[2], children[1]])
+        #expect(session.board.roots == board.roots)
+    }
+
+    @Test func releasingInOpenCanvasDetachesAtTheReleasePoint() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Root"))
+        let root = board.roots[0].id
+        let branch = try #require(board.inserting(text: "Branch", parent: root))
+        board.apply(branch.edit)
+        let descendant = try #require(board.inserting(text: "Descendant", parent: branch.id))
+        board.apply(descendant.edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 100))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        let start = CGPoint(x: 308, y: 118)
+        let nearParent = CGPoint(x: 210, y: 118)
+        let blank = CGPoint(x: 600, y: 300)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: start))
+        canvas.view.mouseDragged(with: try canvas.event(.leftMouseDragged, at: nearParent))
+        #expect(canvas.actions.dropHint == "Release to attach as a child")
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: blank))
+
+        #expect(session.board.parents[branch.id] == nil)
+        #expect(session.board.parents[descendant.id] == branch.id)
+        #expect(session.board.roots.last == RootPlacement(id: branch.id, position: CGPoint(x: 452, y: 182)))
+        canvas.view.undoCommand()
+        #expect(session.board == board)
+    }
+
     @Test func droppingABranchOnItsDescendantDoesNotDetachIt() async throws {
         var board = MindMapBoard(root: MapNode(text: "Root"))
         let root = board.roots[0].id

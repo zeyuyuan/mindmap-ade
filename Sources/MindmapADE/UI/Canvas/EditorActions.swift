@@ -28,6 +28,7 @@ final class EditorActions {
     var isEditingTopic = false
     var canCollapse = false
     var hint = defaultHint
+    var dropHint: String?
 
     func activateTarget() {
         guard let id = targetBoardID, let session = workspace?.board(id), canvas?.session !== session else { return }

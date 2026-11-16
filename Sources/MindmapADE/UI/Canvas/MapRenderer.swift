@@ -9,6 +9,11 @@ struct MapDragPreview {
     let offset: CGSize
 }
 
+enum MapDropIndicator {
+    case child(CGRect, radius: CGFloat)
+    case sibling(CGRect)
+}
+
 final class TopicLayer {
     private static let agentEditFadeKey = "recentAgentEdit"
     let layer = CALayer()
@@ -261,7 +266,8 @@ final class MapRenderer {
             overlay.lineWidth = CanvasStyle.borderWidth
             layer.addSublayer(overlay)
         }
-        dropIndicator.lineDashPattern = [4, 3]
+        dropIndicator.lineWidth = CanvasStyle.selectedBorderWidth
+        dropIndicator.lineCap = .round
     }
 
     private func resourceIcons(contentsScale: CGFloat) -> [String: CGImage] {
@@ -349,7 +355,7 @@ final class MapRenderer {
                 frame = frame.offsetBy(dx: drag.offset.width, dy: drag.offset.height)
             }
             topic.layer.frame = frame
-            topic.layer.opacity = drag?.topLevelIDs.contains(id) == true && drag?.rootIDs.contains(id) != true ? 0.7 : 1
+            topic.layer.opacity = drag?.movedIDs.contains(id) == true ? CanvasStyle.draggedTopicOpacity : 1
             let kind = node.content.kind
             let isActiveAgent = kind == .agent && id == activeAgentID
             if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
@@ -433,24 +439,29 @@ final class MapRenderer {
         CATransaction.commit()
     }
 
-    func showDropTarget(_ rect: CGRect?, sibling: Bool = false) {
+    func showDropTarget(_ indicator: MapDropIndicator?) {
+        guard indicator != nil || dropIndicator.path != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if let rect {
-            if sibling {
-                let path = CGMutablePath()
-                path.move(to: rect.origin)
-                path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
-                dropIndicator.path = path
-            } else {
-                dropIndicator.path = CGPath(
-                    roundedRect: rect.insetBy(dx: -4, dy: -4), cornerWidth: CanvasStyle.nodeRadius,
-                    cornerHeight: CanvasStyle.nodeRadius, transform: nil
-                )
-            }
-        } else {
+        defer { CATransaction.commit() }
+        let accent = NSColor.controlAccentColor
+        dropIndicator.strokeColor = accent.cgColor
+        switch indicator {
+        case .child(let rect, let radius):
+            let padding = CanvasStyle.dropOutlinePadding
+            dropIndicator.fillColor = accent.withAlphaComponent(CanvasStyle.selectionOpacity).cgColor
+            dropIndicator.path = CGPath(
+                roundedRect: rect.insetBy(dx: -padding, dy: -padding),
+                cornerWidth: radius + padding, cornerHeight: radius + padding,
+                transform: nil)
+        case .sibling(let line):
+            let path = CGMutablePath()
+            path.move(to: line.origin)
+            path.addLine(to: CGPoint(x: line.maxX, y: line.minY))
+            dropIndicator.fillColor = nil
+            dropIndicator.path = path
+        case nil:
             dropIndicator.path = nil
         }
-        CATransaction.commit()
     }
 }

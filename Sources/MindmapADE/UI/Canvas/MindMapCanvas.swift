@@ -113,6 +113,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private enum DropTarget {
+        case root
         case child(UUID)
         case sibling(UUID, after: Bool)
         case invalid(ResourcePlacementProblem?)
@@ -149,6 +150,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     func update(session: BoardSession, revision: Int) {
         if self.session !== session {
+            if dragStart != nil { resetPointerGesture() }
             closeNodeForm()
             configureAfterLayout = nil
             revealAfterTerminalResize = nil
@@ -227,6 +229,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     func prepareForRemoval() {
+        if dragStart != nil { resetPointerGesture() }
         closeNodeForm()
         finishEditing(.keepDraft)
         persistCamera()
@@ -289,6 +292,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 runtimeDetails: runtimeDetails, editingTitleID: worktreeNameField == nil ? nil : editingID,
                 activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics
             )
+            renderer.showDropTarget(dropIndicator)
         }
         updateAccessibility()
     }
@@ -374,6 +378,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private func cameraChanged() {
+        if !draggedBranches.isEmpty, let start = dragStart, let lastDrag {
+            updateBranchDrag(at: lastDrag, from: start)
+        }
         render()
         positionEditor()
         actions?.zoomLabel = CanvasStyle.zoomLabel(for: camera.scale)
@@ -1141,74 +1148,118 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             render()
             updateActions()
         } else if !draggedBranches.isEmpty {
-            dragOffset = CGSize(width: (point.x - start.x) / camera.scale, height: (point.y - start.y) / camera.scale)
-            updateDropTarget(at: camera.worldPoint(point))
+            updateBranchDrag(at: point, from: start)
             render()
         }
         lastDrag = point
     }
 
-    private func updateDropTarget(at world: CGPoint) {
-        dropTarget = nil
-        guard let id = mapLayout.hitTest(world), let target = mapLayout.nodes[id] else {
-            renderer.showDropTarget(nil)
-            if allowsDrop(under: nil) { NSCursor.arrow.set() }
-            return
+    private func updateBranchDrag(at point: CGPoint, from start: CGPoint) {
+        dragOffset = CGSize(width: (point.x - start.x) / camera.scale, height: (point.y - start.y) / camera.scale)
+        let target = resolveDropTarget(at: camera.worldPoint(point))
+        dropTarget = target
+        let hint: String
+        switch target {
+        case .root:
+            hint = draggedRootIDs == draggedBranchIDs ? "Release to move" : "Release to make a root topic"
+        case .child:
+            hint = "Release to attach as a child"
+        case .sibling:
+            hint = "Release to insert at the line"
+        case .invalid(let problem):
+            hint = problem?.message ?? "A branch cannot be moved into itself."
         }
-        if forbiddenTargets.contains(id) {
-            if !draggedBranchIDs.contains(id) {
-                dropTarget = .invalid(nil)
-                NSCursor.operationNotAllowed.set()
-            } else if allowsDrop(under: nil) {
-                NSCursor.arrow.set()
-            }
-            renderer.showDropTarget(nil)
-            return
+        if case .invalid = target {
+            NSCursor.operationNotAllowed.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+        if actions?.dropHint != hint { actions?.dropHint = hint }
+    }
+
+    private func resolveDropTarget(at world: CGPoint) -> DropTarget {
+        let hit = mapLayout.hitTest(world, excluding: draggedBranchIDs)
+        if let hit, forbiddenTargets.contains(hit) { return .invalid(nil) }
+        guard let target = hit.flatMap({ mapLayout.nodes[$0] }) ?? nearbyDropNode(at: world) else {
+            return validatedDrop(.root, under: nil)
         }
         let relativeY = (world.y - target.frame.minY) / target.frame.height
-        let isSibling = relativeY < 0.25 || relativeY > 0.75
-        let parent = isSibling ? session.board.parents[id] : id
-        guard allowsDrop(under: parent) else { return }
-        NSCursor.arrow.set()
-        if isSibling {
-            dropTarget = .sibling(id, after: relativeY > 0.75)
-            var line = viewRect(target.frame)
-            line.origin.y = relativeY > 0.75 ? line.maxY + 8 : line.minY - 8
-            line.size.height = 1
-            renderer.showDropTarget(line, sibling: true)
-        } else {
-            dropTarget = .child(id)
-            renderer.showDropTarget(viewRect(target.frame))
+        let parent = session.board.parents[target.id]
+        if (parent != nil || hit != nil) && (relativeY < 0.25 || relativeY > 0.75) {
+            return validatedDrop(.sibling(target.id, after: relativeY > 0.75), under: parent)
+        }
+        return validatedDrop(.child(target.id), under: target.id)
+    }
+
+    private func nearbyDropNode(at world: CGPoint) -> PlacedNode? {
+        // Keep the reach comfortable at regular zoom and local to the branch at overview zoom.
+        let dx = min(CanvasStyle.dropHorizontalReach / camera.scale, MapMetrics.horizontalGap / 2)
+        let dy = min(CanvasStyle.dropVerticalReach / camera.scale, MapMetrics.verticalGap)
+        let query = CGRect(x: world.x - dx, y: world.y - dy, width: dx * 2, height: dy * 2)
+        var nearest: PlacedNode?
+        var nearestDistance = CGFloat.infinity
+        for id in mapLayout.visibleNodes(in: query).reversed() {
+            guard !forbiddenTargets.contains(id), session.board.nodes[id] != nil, let node = mapLayout.nodes[id]
+            else { continue }
+            let frame = node.frame
+            let distance = hypot(
+                max(frame.minX - world.x, world.x - frame.maxX, 0),
+                max(frame.minY - world.y, world.y - frame.maxY, 0))
+            guard distance < nearestDistance else { continue }
+            nearest = node
+            nearestDistance = distance
+        }
+        return nearest
+    }
+
+    private func validatedDrop(_ target: DropTarget, under parent: UUID?) -> DropTarget {
+        if let problem = session.board.resourceMoveProblem(for: draggedResources, to: parent) {
+            return .invalid(problem)
+        }
+        return target
+    }
+
+    private var dropIndicator: MapDropIndicator? {
+        switch dropTarget {
+        case .child(let id):
+            return mapLayout.nodes[id].map {
+                .child(viewRect($0.frame), radius: CanvasStyle.nodeRadius * camera.scale)
+            }
+        case .sibling(let id, let after):
+            guard let frame = mapLayout.nodes[id]?.frame else { return nil }
+            let gap = MapMetrics.verticalGap / 2
+            let y = after ? frame.maxY + gap : frame.minY - gap
+            return .sibling(viewRect(CGRect(x: frame.minX, y: y, width: frame.width, height: 0)))
+        default:
+            return nil
         }
     }
 
-    private func allowsDrop(under parent: UUID?) -> Bool {
-        guard let problem = session.board.resourceMoveProblem(for: draggedResources, to: parent) else { return true }
-        dropTarget = .invalid(problem)
+    private func resetPointerGesture() {
+        if terminalClick == .pressed { terminalClick = nil }
+        dragStart = nil
+        lastDrag = nil
+        pressedNode = nil
+        pressedWithoutModifiers = false
+        draggedBranches = []
+        draggedBranchIDs = []
+        draggedRootIDs = []
+        draggedResources = [:]
+        forbiddenTargets = []
+        dragStarted = false
+        dragOffset = .zero
+        dropTarget = nil
+        actions?.dropHint = nil
+        renderer.showMarquee(nil)
         renderer.showDropTarget(nil)
-        NSCursor.operationNotAllowed.set()
-        return false
+        NSCursor.arrow.set()
     }
 
     override func mouseUp(with event: NSEvent) {
         let isTerminalClick = terminalClick == .pressed
         terminalClick = nil
         defer {
-            dragStart = nil
-            lastDrag = nil
-            pressedNode = nil
-            pressedWithoutModifiers = false
-            draggedBranches = []
-            draggedBranchIDs = []
-            draggedRootIDs = []
-            draggedResources = [:]
-            forbiddenTargets = []
-            dragStarted = false
-            dragOffset = .zero
-            dropTarget = nil
-            renderer.showMarquee(nil)
-            renderer.showDropTarget(nil)
-            NSCursor.arrow.set()
+            resetPointerGesture()
             render()
             updateActions()
         }
@@ -1227,7 +1278,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             if isTerminalClick { showTerminalForClick(event) }
             return
         }
-        guard !draggedBranches.isEmpty else { return }
+        guard !draggedBranches.isEmpty, let start = dragStart else { return }
+        updateBranchDrag(at: localPoint(event), from: start)
         let positions = Dictionary(
             uniqueKeysWithValues: draggedBranches.compactMap { id -> (UUID, CGPoint)? in
                 guard let placement = mapLayout.nodes[id] else { return nil }
@@ -1249,8 +1301,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         case .invalid(let problem):
             if let problem { actions?.hint = problem.message }
             return
-        case nil:
+        case .root:
             edit = session.board.movingBranches(draggedBranchIDs, to: nil, positions: positions)
+        case nil:
+            return
         }
         if session.apply(edit, named: "Move Branch") { actions?.hint = EditorActions.defaultHint }
         changed()
@@ -1331,6 +1385,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             return
         }
         actions?.activateTarget()
+        if event.keyCode == 53, !draggedBranches.isEmpty {
+            resetPointerGesture()
+            render()
+            return
+        }
         if event.keyCode == 49 {
             isSpaceDown = true
             NSCursor.openHand.set()

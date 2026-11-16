@@ -20,6 +20,12 @@ extension WorkspaceStore {
         }
     }
 
+    func agentRunStates(in boardID: UUID) -> [UUID: AgentRun.State] {
+        Dictionary(
+            uniqueKeysWithValues: agentRuns.values.lazy.filter { $0.address.boardID == boardID }
+                .map { ($0.address.nodeID, $0.state) })
+    }
+
     func hasActiveWork(in boardID: UUID? = nil) -> Bool {
         operations.contains { boardID == nil || $0.boardID == boardID }
             || agentRuns.values.contains { $0.state.isActive && (boardID == nil || $0.address.boardID == boardID) }

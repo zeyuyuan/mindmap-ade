@@ -27,7 +27,13 @@ final class EditorActions {
     var canRedo = false
     var isEditingTopic = false
     var canCollapse = false
+    var canFocusBranch = false
+    var isBranchFocused = false
+    var isFinding = false
+    var findFieldHasFocus = false
+    private(set) var findFocusRequest = 0
     var hint = defaultHint
+    var dropHint: String?
 
     func activateTarget() {
         guard let id = targetBoardID, let session = workspace?.board(id), canvas?.session !== session else { return }
@@ -95,21 +101,45 @@ final class EditorActions {
     func zoomOut() { activeCanvas?.zoom(by: 1 / 1.2) }
     func actualSize() { activeCanvas?.setZoom(1) }
     func fit() { activeCanvas?.fitContent() }
+    func toggleBranchFocus() { activeCanvas?.toggleBranchFocus() }
+
+    func showFind() {
+        guard let activeCanvas else { return }
+        activeCanvas.prepareForFind()
+        isFinding = true
+        findFocusRequest += 1
+    }
+
+    func closeFind() {
+        isFinding = false
+        activeCanvas?.focusCanvas()
+    }
+
+    func showFindResult(_ id: UUID) { activeCanvas?.jumpToTopic(id, focusingCanvas: false) }
+
     var shouldUndoBoardDeletion: Bool {
-        guard !isEditingTopic, let deletion = workspace?.lastBoardDeletionTime else { return false }
+        guard !findFieldHasFocus, !isEditingTopic, let deletion = workspace?.lastBoardDeletionTime else { return false }
         guard let mapEdit = workspace?.board(targetBoardID)?.lastUndoTime else { return true }
         return deletion >= mapEdit
     }
 
     func undo() {
-        if shouldUndoBoardDeletion, let id = workspace?.undoDeleteBoard() {
+        if findFieldHasFocus {
+            NSApp.keyWindow?.firstResponder?.undoManager?.undo()
+        } else if shouldUndoBoardDeletion, let id = workspace?.undoDeleteBoard() {
             targetBoardID = id
             requestedBoardID = id
         } else {
             activeCanvas?.undoCommand()
         }
     }
-    func redo() { activeCanvas?.redoCommand() }
+    func redo() {
+        if findFieldHasFocus {
+            NSApp.keyWindow?.firstResponder?.undoManager?.redo()
+        } else {
+            activeCanvas?.redoCommand()
+        }
+    }
     func moveUp() { activeCanvas?.moveSelection(by: -1) }
     func moveDown() { activeCanvas?.moveSelection(by: 1) }
 }
@@ -141,10 +171,17 @@ struct MindMapCommands: Commands {
             let restoresBoard = actions?.shouldUndoBoardDeletion == true
             Button(restoresBoard ? "Undo Delete Board" : (actions?.undoTitle ?? "Undo")) { actions?.undo() }
                 .keyboardShortcut("z")
-                .disabled(!restoresBoard && (actions?.canvas == nil || actions?.canUndo != true))
+                .disabled(
+                    actions?.findFieldHasFocus != true && !restoresBoard
+                        && (actions?.canvas == nil || actions?.canUndo != true))
             Button(actions?.redoTitle ?? "Redo") { actions?.redo() }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
-                .disabled(actions?.canRedo != true)
+                .disabled(actions?.findFieldHasFocus != true && actions?.canRedo != true)
+        }
+        CommandGroup(after: .pasteboard) {
+            Button("Find Topics…") { actions?.showFind() }
+                .keyboardShortcut("f")
+                .disabled(actions?.targetBoardID == nil)
         }
         CommandMenu("Node") {
             Button("Add Child") { actions?.addChild() }.disabled(actions?.canEdit != true)
@@ -184,6 +221,11 @@ struct MindMapCommands: Commands {
             Button("Zoom Out") { actions?.zoomOut() }.keyboardShortcut("-")
             Button("Actual Size") { actions?.actualSize() }.keyboardShortcut("0")
             Button("Fit Content") { actions?.fit() }.keyboardShortcut("0", modifiers: [.command, .shift])
+            Button(actions?.isBranchFocused == true ? "Exit Branch Focus" : "Focus on Branch") {
+                actions?.toggleBranchFocus()
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .disabled(actions?.canFocusBranch != true)
         }
         SidebarCommands()
         ToolbarCommands()

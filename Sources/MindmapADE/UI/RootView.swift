@@ -44,6 +44,7 @@ struct RootView: View {
             }
         }
         .onChange(of: selectedBoardID) { _, id in
+            actions.isFinding = false
             actions.targetBoardID = id
             workspace.select(id)
         }
@@ -155,7 +156,8 @@ private struct BoardCanvasContent: View {
                 MindMapCanvas(
                     session: session, workspace: workspace, actions: actions, revision: session.revision,
                     runtimeDetails: runtimeDetails, activeAgentID: terminalAddress?.nodeID,
-                    agentEditedTopics: session.agentEditedTopics
+                    agentEditedTopics: session.agentEditedTopics,
+                    agentRunStates: workspace.agentRunStates(in: session.id)
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let address = terminalAddress {
@@ -174,6 +176,12 @@ private struct BoardCanvasContent: View {
             }
         }
         .navigationTitle(session.name)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Find Topics", systemImage: "magnifyingglass") { actions.showFind() }
+                    .help("Find topics in this board (⌘F)")
+            }
+        }
         .task(
             id: CheckoutRefresh(
                 boardID: session.id, locations: session.gitProjectLocations, activationCount: activationCount
@@ -184,8 +192,19 @@ private struct BoardCanvasContent: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             activationCount += 1
         }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if actions.isFinding {
+                BoardFindBar(session: session, actions: actions)
+                    .id(session.id)
+            }
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack {
+                if actions.isBranchFocused {
+                    Button("Exit Focus", systemImage: "scope") { actions.toggleBranchFocus() }
+                        .buttonStyle(.borderless)
+                        .help("Exit branch focus (Esc)")
+                }
                 Text(canvasHint).lineLimit(1).help(canvasHint)
                 Spacer(minLength: CanvasStyle.statusHorizontalPadding)
                 Text(actions.zoomLabel)
@@ -205,6 +224,7 @@ private struct BoardCanvasContent: View {
     }
 
     private var canvasHint: String {
+        if let hint = actions.dropHint { return hint }
         guard actions.hint == EditorActions.defaultHint, let notice = session.agentEditNotice else {
             return actions.hint
         }

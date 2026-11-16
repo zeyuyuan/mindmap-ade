@@ -41,15 +41,14 @@ nonisolated enum MapSearch {
         }
     }
 
-    struct Match: Sendable {
+    struct Match: Identifiable, Sendable {
         let id: UUID
         let snippet: String
     }
 
     @concurrent static func page(
-        for query: String, in board: MindMapBoard, from start: Traversal
+        for query: String, in board: MindMapBoard, from start: Traversal, pageSize: Int = 8
     ) async throws -> (matches: [Match], next: Traversal?) {
-        let pageSize = 8
         var traversal = start
         var matches: [Match] = []
         if let first = traversal.buffered {

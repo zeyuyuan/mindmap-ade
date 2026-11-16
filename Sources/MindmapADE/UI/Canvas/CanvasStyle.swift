@@ -11,6 +11,18 @@ enum CanvasStyle {
     static let minimumFitPadding: CGFloat = 16
     static let fitPaddingFraction: CGFloat = 0.10
     static let dragThreshold: CGFloat = 4
+    static let dropHorizontalReach: CGFloat = 24
+    static let dropVerticalReach: CGFloat = 12
+    static let dropOutlinePadding: CGFloat = 4
+    static let draggedTopicOpacity: Float = 0.72
+    static let unfocusedBranchOpacity: Float = 0.24
+    static let dragPanEdge: CGFloat = 36
+    static let dragPanSpeed: CGFloat = 680
+    static let findBarPadding: CGFloat = 12
+    static let findRowPadding: CGFloat = 8
+    static let findResultRowHeight: CGFloat = 40
+    static let findResultsMaximumHeight: CGFloat = 192
+    static let findSelectionOpacity = 0.18
     static let selectionOpacity: CGFloat = 0.08
     static let resourceIconPointSize: CGFloat = 16
     static let activeAgentTintFraction: CGFloat = 0.18
@@ -47,6 +59,10 @@ enum CanvasStyle {
     static let disclosureCountPadding: CGFloat = 4
     static let disclosureMaximumWidth = MapMetrics.horizontalGap - disclosureGap - disclosureHitPadding * 2
     static let disclosureCountFont = NSFont.monospacedDigitSystemFont(ofSize: disclosureCountFontSize, weight: .medium)
+    static let agentSummaryGap: CGFloat = 8
+    static let agentSummaryHeight: CGFloat = 20
+    static let agentSummaryPadding: CGFloat = 8
+    static let agentSummaryFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
     private static let disclosureDigitWidth = ("0" as NSString).size(withAttributes: [.font: disclosureCountFont]).width
 
     static func disclosureFrame(for topic: CGRect, hiddenCount: Int = 0) -> CGRect {
@@ -66,6 +82,27 @@ enum CanvasStyle {
     static func disclosureHitFrame(for topic: CGRect, hiddenCount: Int = 0) -> CGRect {
         disclosureFrame(for: topic, hiddenCount: hiddenCount).insetBy(
             dx: -disclosureHitPadding, dy: -disclosureHitPadding)
+    }
+
+    static func agentSummaryFrame(for topic: CGRect, hiddenCount: Int, width: CGFloat) -> CGRect {
+        let disclosure = disclosureFrame(for: topic, hiddenCount: hiddenCount)
+        return CGRect(
+            x: disclosure.maxX + agentSummaryGap, y: topic.midY - agentSummaryHeight / 2,
+            width: width, height: agentSummaryHeight)
+    }
+
+    static func dragPanVelocity(at point: CGPoint, in viewport: CGRect) -> CGVector {
+        guard viewport.contains(point) else { return .zero }
+        func velocity(at position: CGFloat, minimum: CGFloat, maximum: CGFloat) -> CGFloat {
+            let edge = min(dragPanEdge, (maximum - minimum) / 3)
+            guard edge > 0 else { return 0 }
+            let start = max(0, 1 - (position - minimum) / edge)
+            let end = max(0, 1 - (maximum - position) / edge)
+            return (start * start - end * end) * dragPanSpeed
+        }
+        return CGVector(
+            dx: velocity(at: point.x, minimum: viewport.minX, maximum: viewport.maxX),
+            dy: velocity(at: point.y, minimum: viewport.minY, maximum: viewport.maxY))
     }
 
     static func font(root: Bool) -> NSFont {

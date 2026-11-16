@@ -13,7 +13,9 @@ actor TextLayoutService {
 
     private var sizes: [Key: CGSize] = [:]
 
-    func layout(board: MindMapBoard, regularFont: String, rootFont: String) throws -> MapLayout {
+    func layout(
+        board: MindMapBoard, regularFont: String, rootFont: String, expandedAncestors: Set<UUID> = []
+    ) throws -> MapLayout {
         let roots = Set(board.roots.map(\.id))
         var metrics: [UUID: CGSize] = [:]
         for node in board.nodes.values {
@@ -31,7 +33,7 @@ actor TextLayoutService {
             metrics[node.id] = size
         }
         if sizes.count > 20_000 { sizes.removeAll(keepingCapacity: true) }
-        return TreeLayout.make(board: board, sizes: metrics)
+        return TreeLayout.make(board: board, sizes: metrics, expandedAncestors: expandedAncestors)
     }
 
     private func measure(_ key: Key) -> CGSize {

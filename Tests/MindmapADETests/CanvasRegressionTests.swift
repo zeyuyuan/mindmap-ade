@@ -54,6 +54,15 @@ private final class CanvasFixture {
         throw CocoaError(.coderReadCorrupt)
     }
 
+    func waitForSelectedTopic(_ title: String) async throws {
+        for _ in 0..<100 {
+            let topics = view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement } ?? []
+            if topics.contains(where: { $0.accessibilityLabel() == title && $0.isAccessibilitySelected() }) { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        Issue.record("The canvas did not reveal \(title).")
+    }
+
     var editor: NSTextView? { view.accessibilityChildren()?.compactMap { $0 as? NSTextView }.first }
 
     func worktreeNameField() async throws -> NSTextField {
@@ -733,5 +742,134 @@ struct CanvasRegressionTests {
         #expect(session.board == board)
         #expect(session.board.parents[branch.id] == root)
         #expect(!session.canUndo)
+    }
+
+    @Test func findingATopicRevealsNestedFoldsWithoutEditingTheBoard() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Planning"))
+        let root = board.roots[0].id
+        let section = try #require(board.inserting(text: "Release", parent: root))
+        board.apply(section.edit)
+        let topic = try #require(board.inserting(text: "发布 checklist", parent: section.id))
+        board.apply(topic.edit)
+        board.apply(try #require(board.togglingCollapse(section.id)))
+        board.apply(try #require(board.togglingCollapse(root)))
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        session.isReadOnly = true
+        workspace.cameras[session.id] = MapCamera(scale: 0.15, translation: CGPoint(x: 100, y: 100))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        let page = try await MapSearch.page(for: "CHECKLIST", in: session.board, from: .init(root: nil), pageSize: 32)
+        #expect(page.matches.map(\.id) == [topic.id])
+        canvas.view.jumpToTopic(topic.id)
+        try await canvas.waitForSelectedTopic("发布 checklist")
+        #expect(canvas.actions.zoomLabel == "100%")
+        #expect(session.board == board)
+        #expect(!session.canUndo)
+
+        let firstFold = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicDisclosureAccessibilityElement }
+                .first { $0.accessibilityLabel() == "Collapse Planning" })
+        #expect(firstFold.accessibilityPerformPress())
+        try await canvas.waitForSelectedTopic("Planning")
+        #expect(session.board == board)
+    }
+
+    @Test func exitingBranchFocusRestoresTheOriginalCamera() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Planning"))
+        let branch = try #require(board.inserting(text: "Release", parent: board.roots[0].id))
+        board.apply(branch.edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let camera = MapCamera(scale: 0.5, translation: CGPoint(x: 140, y: 120))
+        workspace.cameras[session.id] = camera
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        try canvas.click(CGPoint(x: 244, y: 129))
+        #expect(canvas.view.selected == [branch.id])
+
+        canvas.view.toggleBranchFocus()
+        #expect(canvas.actions.isBranchFocused)
+        #expect(canvas.actions.zoomLabel != "50%")
+        canvas.view.zoom(by: 1.25)
+        #expect(workspace.cameras[session.id] == camera)
+        canvas.view.toggleBranchFocus()
+        #expect(!canvas.actions.isBranchFocused)
+        #expect(canvas.actions.zoomLabel == "50%")
+        #expect(workspace.cameras[session.id] == camera)
+        #expect(session.board == board)
+    }
+
+    @Test func aFoldedBranchSummarizesHiddenAgentsAndCanRevealOne() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Planning"))
+        let root = board.roots[0].id
+        let branch = try #require(board.inserting(text: "Release", parent: root))
+        board.apply(branch.edit)
+        let active = MapNode(content: .agent(AgentTopic(task: "Build")))
+        let failed = MapNode(content: .agent(AgentTopic(task: "Checks")))
+        for node in [active, failed] {
+            board.apply(try #require(board.inserting(node, parent: branch.id)).edit)
+        }
+        board.apply(try #require(board.togglingCollapse(branch.id)))
+        board.apply(try #require(board.togglingCollapse(root)))
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        canvas.view.updatePresentation(
+            runtimeDetails: [:], activeAgentID: nil, agentRunStates: [active.id: .running, failed.id: .failed])
+        let badge = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAgentSummaryAccessibilityElement }.first)
+        #expect(badge.accessibilityLabel() == "Agents in Planning")
+        #expect(badge.isAccessibilityEnabled())
+        #expect(badge.accessibilityValue() as? String == "1 active · 1 failed")
+
+        canvas.view.updatePresentation(
+            runtimeDetails: [:], activeAgentID: nil, agentRunStates: [active.id: .exited, failed.id: .failed])
+        #expect(badge.accessibilityValue() as? String == "1 failed")
+        #expect(badge.accessibilityPerformPress())
+        try await canvas.waitForSelectedTopic("Checks")
+        #expect(session.board == board)
+    }
+
+    @Test func aStationaryDragAtTheEdgePansAndFindsAnOffscreenTarget() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Moving"))
+        let moving = board.roots[0].id
+        let target = try #require(
+            board.inserting(text: "Destination", parent: nil, position: CGPoint(x: 934, y: 0)))
+        board.apply(target.edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let camera = MapCamera(translation: CGPoint(x: 100, y: 100))
+        workspace.cameras[session.id] = camera
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        let start = CGPoint(x: 148, y: 118)
+        let edge = CGPoint(x: 995, y: 118)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: start))
+        canvas.view.mouseDragged(with: try canvas.event(.leftMouseDragged, at: edge))
+        #expect(canvas.actions.dropHint == "Release to move")
+        let deadline = ContinuousClock.now + .seconds(2)
+        while canvas.actions.dropHint != "Release to attach as a child", ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(canvas.actions.dropHint == "Release to attach as a child")
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: edge))
+        #expect(session.board.parents[moving] == target.id)
+        let after = try #require(workspace.cameras[session.id])
+        #expect(after.translation.x < camera.translation.x)
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(workspace.cameras[session.id] == after)
     }
 }

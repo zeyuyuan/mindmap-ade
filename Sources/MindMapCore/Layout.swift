@@ -60,7 +60,12 @@ public struct MapLayout: Sendable {
 
 public enum TreeLayout {
     /// Iterative passes support very deep maps without recursive stack growth.
-    public static func make(board: MindMapBoard, sizes: [UUID: CGSize]) -> MapLayout {
+    public static func make(
+        board: MindMapBoard, sizes: [UUID: CGSize], expandedAncestors: Set<UUID> = []
+    ) -> MapLayout {
+        func visibleChildren(of node: MapNode) -> [UUID] {
+            !node.isCollapsed || expandedAncestors.contains(node.id) ? node.children : []
+        }
         // Include folded branches once per snapshot; pointer and camera updates reuse these totals.
         var allIDs: [UUID] = []
         var uncounted = board.roots.map(\.id)
@@ -79,16 +84,14 @@ public enum TreeLayout {
         while let (id, root, depth) = pending.popLast() {
             guard let node = board.nodes[id] else { continue }
             traversal.append((id, root, depth))
-            if !node.isCollapsed {
-                pending.append(contentsOf: node.children.reversed().map { ($0, root, depth + 1) })
-            }
+            pending.append(contentsOf: visibleChildren(of: node).reversed().map { ($0, root, depth + 1) })
         }
 
         let fallback = CGSize(width: MapMetrics.minimumNodeWidth, height: MapMetrics.minimumNodeHeight)
         var heights: [UUID: CGFloat] = [:]
         for (id, _, _) in traversal.reversed() {
             guard let node = board.nodes[id] else { continue }
-            let children = node.isCollapsed ? [] : node.children
+            let children = visibleChildren(of: node)
             let total =
                 children.reduce(CGFloat.zero) { $0 + (heights[$1] ?? fallback.height) }
                 + CGFloat(max(0, children.count - 1)) * MapMetrics.verticalGap
@@ -101,12 +104,13 @@ public enum TreeLayout {
             frames[root.id] = CGRect(origin: root.position, size: size)
         }
         for (id, _, _) in traversal {
-            guard let frame = frames[id], let node = board.nodes[id], !node.isCollapsed else { continue }
+            guard let frame = frames[id], let node = board.nodes[id] else { continue }
+            let children = visibleChildren(of: node)
             let total =
-                node.children.reduce(CGFloat.zero) { $0 + (heights[$1] ?? fallback.height) }
-                + CGFloat(max(0, node.children.count - 1)) * MapMetrics.verticalGap
+                children.reduce(CGFloat.zero) { $0 + (heights[$1] ?? fallback.height) }
+                + CGFloat(max(0, children.count - 1)) * MapMetrics.verticalGap
             var y = frame.midY - total / 2
-            for child in node.children {
+            for child in children {
                 let size = sizes[child] ?? fallback
                 let height = heights[child] ?? size.height
                 frames[child] = CGRect(
@@ -120,7 +124,7 @@ public enum TreeLayout {
         var placed: [UUID: PlacedNode] = [:]
         for (id, root, depth) in traversal.reversed() {
             guard let frame = frames[id], let node = board.nodes[id] else { continue }
-            let children = node.isCollapsed ? [] : node.children
+            let children = visibleChildren(of: node)
             var bounds = frame
             for child in children {
                 if let subtree = placed[child]?.subtreeBounds { bounds = bounds.union(subtree) }

@@ -35,6 +35,7 @@ final class TopicLayer {
     private var previousCount = -1
     private var previousCountColor: CGColor?
     private var attributedCount = NSAttributedString(string: "")
+    private var agentSummaryText: TopicTextRenderer?
 
     init() {
         layer.anchorPoint = .zero
@@ -50,8 +51,9 @@ final class TopicLayer {
     }
 
     func configure(
-        node: MapNode, descendantCount: Int, root: Bool, selected: Bool,
-        scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool
+        node: MapNode, descendantCount: Int, isCollapsed: Bool, root: Bool, selected: Bool,
+        scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool,
+        agentSummary: AgentBranchSummary?
     ) {
         let title = node.title
         let detail = runtimeDetail ?? node.detail
@@ -115,13 +117,13 @@ final class TopicLayer {
         layer.borderWidth = (selected ? CanvasStyle.selectedBorderWidth : CanvasStyle.borderWidth) / max(scale, 0.5)
         let hidesDisclosure = node.children.isEmpty || scale < CanvasStyle.textDetailScale
         disclosureLayer.isHidden = hidesDisclosure
-        disclosureGlyph.isHidden = hidesDisclosure || node.isCollapsed
-        disclosureCount.layer.isHidden = hidesDisclosure || !node.isCollapsed
+        disclosureGlyph.isHidden = hidesDisclosure || isCollapsed
+        disclosureCount.layer.isHidden = hidesDisclosure || !isCollapsed
         disclosureLayer.fillColor = NSColor.controlBackgroundColor.cgColor
         disclosureLayer.strokeColor = NSColor.separatorColor.cgColor
         disclosureGlyph.strokeColor = NSColor.secondaryLabelColor.cgColor
         if !hidesDisclosure {
-            let frame = CanvasStyle.disclosureFrame(for: bounds, hiddenCount: node.isCollapsed ? descendantCount : 0)
+            let frame = CanvasStyle.disclosureFrame(for: bounds, hiddenCount: isCollapsed ? descendantCount : 0)
             disclosureLayer.frame = frame
             disclosureGlyph.frame = frame
             disclosureLayer.path = CGPath(
@@ -132,7 +134,7 @@ final class TopicLayer {
             let path = CGMutablePath()
             path.move(to: CGPoint(x: center.x - CanvasStyle.disclosureGlyphRadius, y: center.y))
             path.addLine(to: CGPoint(x: center.x + CanvasStyle.disclosureGlyphRadius, y: center.y))
-            if node.isCollapsed {
+            if isCollapsed {
                 let countColor = NSColor.secondaryLabelColor.cgColor
                 if previousCount != descendantCount || previousCountColor != countColor {
                     let paragraph = NSMutableParagraphStyle()
@@ -155,6 +157,37 @@ final class TopicLayer {
             }
             disclosureGlyph.path = path
         }
+        configureAgentSummary(
+            hidesDisclosure || !isCollapsed ? nil : agentSummary, hiddenCount: descendantCount,
+            contentsScale: contentsScale)
+    }
+
+    private func configureAgentSummary(_ summary: AgentBranchSummary?, hiddenCount: Int, contentsScale: CGFloat) {
+        guard let summary else {
+            agentSummaryText?.layer.superlayer?.isHidden = true
+            return
+        }
+        let text = agentSummaryText ?? TopicTextRenderer()
+        if agentSummaryText == nil {
+            let badge = CALayer()
+            badge.cornerRadius = CanvasStyle.agentSummaryHeight / 2
+            badge.borderWidth = CanvasStyle.borderWidth
+            badge.addSublayer(text.layer)
+            layer.addSublayer(badge)
+            agentSummaryText = text
+        }
+        guard let badge = text.layer.superlayer else { return }
+        let padding = CanvasStyle.agentSummaryPadding
+        badge.isHidden = false
+        badge.frame = CanvasStyle.agentSummaryFrame(for: layer.bounds, hiddenCount: hiddenCount, width: summary.width)
+        badge.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        badge.borderColor = NSColor.separatorColor.cgColor
+        text.configure(
+            NSAttributedString(
+                string: summary.label,
+                attributes: [.font: CanvasStyle.agentSummaryFont, .foregroundColor: NSColor.secondaryLabelColor]),
+            size: CGSize(width: badge.bounds.width - padding * 2, height: badge.bounds.height),
+            contentsScale: contentsScale, padding: CGSize(width: padding, height: 0))
     }
 
     func configureBackground(isActiveAgent: Bool, editDeadline: ContinuousClock.Instant?, now: ContinuousClock.Instant)
@@ -218,8 +251,12 @@ final class MapRenderer {
         let start: CGPoint
         let end: CGPoint
     }
-    private struct BatchKey: Hashable {
+    private struct EdgeGroup: Hashable {
         let rootID: UUID
+        let dimmed: Bool
+    }
+    private struct BatchKey: Hashable {
+        let group: EdgeGroup
         let index: Int
     }
     private final class ConnectorBatch {
@@ -290,7 +327,8 @@ final class MapRenderer {
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
         runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil,
-        agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
+        agentEditedTopics: [UUID: ContinuousClock.Instant] = [:], focusedTopics: Set<UUID>? = nil,
+        agentSummaries: [UUID: AgentBranchSummary] = [:]
     ) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -355,24 +393,29 @@ final class MapRenderer {
                 frame = frame.offsetBy(dx: drag.offset.width, dy: drag.offset.height)
             }
             topic.layer.frame = frame
-            topic.layer.opacity = drag?.movedIDs.contains(id) == true ? CanvasStyle.draggedTopicOpacity : 1
+            if drag?.movedIDs.contains(id) == true {
+                topic.layer.opacity = CanvasStyle.draggedTopicOpacity
+            } else {
+                topic.layer.opacity = focusedTopics?.contains(id) == false ? CanvasStyle.unfocusedBranchOpacity : 1
+            }
             let kind = node.content.kind
             let isActiveAgent = kind == .agent && id == activeAgentID
             if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
                 icons = resourceIcons(contentsScale: contentsScale)
             }
             topic.configure(
-                node: node, descendantCount: placement.descendantCount, root: placement.depth == 0,
+                node: node, descendantCount: placement.descendantCount,
+                isCollapsed: placement.children.isEmpty && !node.children.isEmpty, root: placement.depth == 0,
                 selected: selection.contains(id),
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
                 resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
-                isEditingTitle: editingTitleID == id
+                isEditingTitle: editingTitleID == id, agentSummary: agentSummaries[id]
             )
             topic.configureBackground(isActiveAgent: isActiveAgent, editDeadline: agentEditedTopics[id], now: now)
         }
 
         // Query edges separately: a connector can cross the viewport while both endpoints are outside it.
-        var edgesByRoot: [UUID: [EdgeGeometry]] = [:]
+        var edgeGroups: [EdgeGroup: [EdgeGeometry]] = [:]
         func branchOffset(_ placement: PlacedNode) -> CGSize {
             guard let drag, drag.movedIDs.contains(placement.id), !drag.rootIDs.contains(placement.rootID) else {
                 return .zero
@@ -406,15 +449,17 @@ final class MapRenderer {
                 guard box.intersects(rootQuery), drag?.topLevelIDs.contains(childID) != true else { continue }
                 let a = CGPoint(x: start.x - rootOrigin.x, y: start.y - rootOrigin.y)
                 let b = CGPoint(x: end.x - rootOrigin.x, y: end.y - rootOrigin.y)
-                edgesByRoot[parent.rootID, default: []].append(EdgeGeometry(start: a, end: b))
+                let dimmed = focusedTopics.map { !$0.contains(id) || !$0.contains(childID) } ?? false
+                let group = EdgeGroup(rootID: parent.rootID, dimmed: dimmed)
+                edgeGroups[group, default: []].append(EdgeGeometry(start: a, end: b))
             }
         }
         var activeBatches = Set<BatchKey>()
         let edgeColor = NSColor.separatorColor.cgColor
-        for (rootID, segments) in edgesByRoot {
-            guard let tree = trees[rootID] else { continue }
+        for (group, segments) in edgeGroups {
+            guard let tree = trees[group.rootID] else { continue }
             for start in stride(from: 0, to: segments.count, by: edgesPerBatch) {
-                let key = BatchKey(rootID: rootID, index: start / edgesPerBatch)
+                let key = BatchKey(group: group, index: start / edgesPerBatch)
                 activeBatches.insert(key)
                 let batch = connectorBatches[key] ?? ConnectorBatch()
                 connectorBatches[key] = batch
@@ -425,6 +470,7 @@ final class MapRenderer {
                 batch.update(
                     segments[start..<min(start + edgesPerBatch, segments.count)],
                     color: edgeColor, width: CanvasStyle.edgeWidth / camera.scale)
+                batch.layer.opacity = group.dimmed ? CanvasStyle.unfocusedBranchOpacity : 1
             }
         }
         for key in Set(connectorBatches.keys).subtracting(activeBatches) {

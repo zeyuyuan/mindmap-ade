@@ -50,6 +50,10 @@ final class TopicLayer {
         disclosureLayer.addSublayer(disclosureCount.layer)
     }
 
+    func displayTitleIfNeeded() {
+        if !text.layer.isHidden { text.layer.displayIfNeeded() }
+    }
+
     func configure(
         node: MapNode, descendantCount: Int, isCollapsed: Bool, root: Bool, selected: Bool,
         scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool,
@@ -321,6 +325,10 @@ final class MapRenderer {
             }
         }
         return resourceIconImages
+    }
+
+    func displayTitleIfNeeded(for id: UUID) {
+        topics[id]?.displayTitleIfNeeded()
     }
 
     func render(

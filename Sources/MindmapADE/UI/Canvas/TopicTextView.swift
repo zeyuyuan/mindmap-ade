@@ -34,18 +34,12 @@ final class TopicTextView: NSTextView {
                 let attributed = line.attributedString.attributedSubstring(from: line.characterRange)
                 let coreLine = CTLineCreateWithAttributedString(attributed)
                 let ink = CTLineGetBoundsWithOptions(coreLine, [.useGlyphPathBounds])
-                let bounds: CGRect
-                if ink.isEmpty || ink.isNull {
-                    // Empty and trailing lines still need room for the native insertion point.
-                    bounds = line.typographicBounds.offsetBy(
-                        dx: fragment.layoutFragmentFrame.minX, dy: fragment.layoutFragmentFrame.minY)
-                } else {
-                    bounds = CGRect(
+                guard !ink.isEmpty, !ink.isNull else { continue }
+                visualBounds = visualBounds.union(
+                    CGRect(
                         x: lineOrigin.x + line.glyphOrigin.x + ink.minX,
                         y: lineOrigin.y + line.glyphOrigin.y - ink.maxY,
-                        width: ink.width, height: ink.height)
-                }
-                visualBounds = visualBounds.union(bounds)
+                        width: ink.width, height: ink.height))
             }
             return true
         }
@@ -54,11 +48,14 @@ final class TopicTextView: NSTextView {
     }
 
     @discardableResult
-    func centerContentVertically(using layout: ContentLayout, in viewportHeight: CGFloat, padding: CGFloat) -> Bool {
+    func centerContentVertically(
+        using layout: ContentLayout, in viewportHeight: CGFloat, centeringWithin centerHeight: CGFloat, padding: CGFloat
+    ) -> Bool {
         let documentHeight = max(viewportHeight, ceil(layout.height + padding * 2))
         if frame.height != documentHeight { setFrameSize(NSSize(width: frame.width, height: documentHeight)) }
         let fits = layout.height + padding * 2 <= viewportHeight
-        let originY = fits && !layout.visualBounds.isNull ? viewportHeight / 2 - layout.visualBounds.midY : padding
+        // The document still includes empty lines for caret movement and scrolling.
+        let originY = fits && !layout.visualBounds.isNull ? centerHeight / 2 - layout.visualBounds.midY : padding
         if centeredOriginY != originY {
             centeredOriginY = originY
             invalidateTextContainerOrigin()

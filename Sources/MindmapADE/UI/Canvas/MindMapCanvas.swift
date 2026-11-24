@@ -269,7 +269,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 self.requestedLayout = nil
                 guard self.layoutRequest == request else { return }
                 self.presentation = LayoutPresentation(request: request, board: session.board, layout: result)
-                self.clearCommittedEditors()
                 self.refreshAgentSummaries()
                 if !self.selected.isEmpty {
                     self.selected.formIntersection(result.nodes.keys)
@@ -369,6 +368,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard renderer != nil else { return }
         if renderedLayout?.revision == session.layoutRevision { presentation?.board = session.board }
         positionCommittedEditors()
+        let retiringEditors = !committedEditors.isEmpty && renderedLayout == layoutRequest ? committedEditors : [:]
+        if !retiringEditors.isEmpty { committedEditors.removeAll() }
         var editingTitleIDs = Set(committedEditors.keys)
         if let editingID { editingTitleIDs.insert(editingID) }
         effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -381,6 +382,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 focusedTopics: branchFocus?.topics, agentSummaries: agentSummaries
             )
             renderer.showDropTarget(dropIndicator)
+            for (id, preview) in retiringEditors {
+                renderer.displayTitleIfNeeded(for: id)
+                preview.backdrop.removeFromSuperview()
+            }
         }
         updateAccessibility()
     }
@@ -809,9 +814,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         text.backgroundColor = .controlBackgroundColor
         text.textColor = .labelColor
         text.insertionPointColor = .controlAccentColor
-        text.font = NSFont.systemFont(
-            ofSize: MapMetrics.fontSize * camera.scale,
-            weight: session.board.roots.contains(where: { $0.id == id }) ? .semibold : .regular)
+        text.font = CanvasStyle.font(root: session.board.roots.contains(where: { $0.id == id }))
         text.string = node.text
         text.delegate = self
         text.setAccessibilityLabel("Topic text")
@@ -824,8 +827,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         let backdrop = TopicEditorBackdrop()
         backdrop.wantsLayer = true
         backdrop.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        backdrop.layer?.cornerRadius = CanvasStyle.nodeRadius * camera.scale
-        backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth
+        backdrop.layer?.cornerRadius = CanvasStyle.nodeRadius
         backdrop.layer?.borderColor = NSColor.controlAccentColor.cgColor
         backdrop.layer?.masksToBounds = true
         backdrop.addSubview(scroll)
@@ -910,22 +912,19 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard let editor, let scroll = editorScroll, let backdrop = editorBackdrop, let id = editingID,
             let worldFrame = mapLayout.nodes[id]?.frame ?? provisionalEditFrame
         else { return }
-        let frame = viewRect(worldFrame)
-        let inset = NSSize(
-            width: MapMetrics.horizontalPadding * camera.scale, height: MapMetrics.verticalPadding * camera.scale)
+        // Scale the view after laying out the text at the canvas's base font size.
+        let scale = camera.scale
+        let inset = NSSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding)
         editor.textContainerInset = inset
         editor.textContainer?.lineFragmentPadding = 0
-        let measured = NSAttributedString(
-            string: editor.string.isEmpty ? " " : editor.string,
-            attributes: [.font: editor.font ?? CanvasStyle.font(root: false)]
-        ).boundingRect(
-            with: CGSize(width: MapMetrics.maximumTextWidth * camera.scale, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        let measured = TextLayoutService.measureText(
+            NSAttributedString(string: editor.string, attributes: [.font: editor.font ?? CanvasStyle.font(root: false)])
         )
-        let availableWidth = max(bounds.width - CanvasStyle.fitPadding * 2, MapMetrics.minimumNodeWidth)
-        let baseWidth = min(availableWidth, max(frame.width, ceil(measured.width) + inset.width * 2))
-        let availableHeight = max(CanvasStyle.editorMinimumHeight, bounds.height - CanvasStyle.fitPadding * 2)
-        let maximumHeight = min(availableHeight, CanvasStyle.editorMaximumHeight)
+        let previewHeight = TextLayoutService.topicHeight(for: measured.height)
+        let availableWidth = max(bounds.width - CanvasStyle.fitPadding * 2, MapMetrics.minimumNodeWidth) / scale
+        let baseWidth = min(availableWidth, max(worldFrame.width, ceil(measured.width) + inset.width * 2))
+        let availableHeight = max(CanvasStyle.editorMinimumHeight, (bounds.height - CanvasStyle.fitPadding * 2) / scale)
+        let maximumHeight = min(availableHeight, CanvasStyle.editorMaximumHeight / scale)
 
         // Measure without a stale scrollbar gutter before deciding whether scrolling is needed.
         scroll.hasVerticalScroller = false
@@ -937,13 +936,17 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             width: measuredTextWidth, height: .greatestFiniteMagnitude)
         var content = editor.measureContent()
         let height = min(
-            maximumHeight, max(frame.height, CanvasStyle.editorMinimumHeight, ceil(content.height + inset.height * 2)))
+            maximumHeight,
+            max(worldFrame.height, previewHeight, ceil(content.height + inset.height * 2)))
         let needsScrolling = content.height + inset.height * 2 > height
         let gutter =
             needsScrolling && NSScroller.preferredScrollerStyle == .legacy
             ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
         let width = min(availableWidth, baseWidth + gutter)
-        backdrop.frame = CGRect(x: frame.minX, y: frame.minY, width: width, height: height)
+        let editorFrame = CGRect(origin: worldFrame.origin, size: CGSize(width: width, height: height))
+        backdrop.frame = viewRect(editorFrame)
+        backdrop.bounds = CGRect(origin: .zero, size: editorFrame.size)
+        backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth / max(scale, 0.5)
         scroll.hasVerticalScroller = needsScrolling
         scroll.frame = backdrop.bounds
         scroll.tile()
@@ -956,12 +959,17 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         if finalTextWidth != measuredTextWidth {
             content = editor.measureContent()
         }
-        if editor.centerContentVertically(using: content, in: scroll.contentSize.height, padding: inset.height) {
+        let viewportHeight = scroll.contentSize.height
+        let centerHeight =
+            finalTextWidth >= ceil(measured.width) && measured.height <= MapMetrics.maximumTextHeight
+            ? min(previewHeight, viewportHeight) : viewportHeight
+        if editor.centerContentVertically(
+            using: content, in: viewportHeight, centeringWithin: centerHeight, padding: inset.height)
+        {
             scroll.contentView.scroll(to: .zero)
             scroll.reflectScrolledClipView(scroll.contentView)
         }
-        reveal(
-            CGRect(origin: worldFrame.origin, size: CGSize(width: width / camera.scale, height: height / camera.scale)))
+        reveal(editorFrame)
     }
 
     private func positionCommittedEditors() {

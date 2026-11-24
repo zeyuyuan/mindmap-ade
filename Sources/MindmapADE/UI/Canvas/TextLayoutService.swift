@@ -46,25 +46,30 @@ actor TextLayoutService {
             string: key.text,
             attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
         )
-        let framesetter = CTFramesetterCreateWithAttributedString(string)
-        let measured = CTFramesetterSuggestFrameSizeWithConstraints(
-            framesetter, CFRange(location: 0, length: 0), nil,
-            CGSize(width: MapMetrics.maximumTextWidth, height: .greatestFiniteMagnitude), nil
-        )
+        let measured = Self.measureText(string)
         let size = CGSize(
             width: max(
                 key.resource ? MapMetrics.resourceMinimumWidth : MapMetrics.minimumNodeWidth,
                 ceil(measured.width) + MapMetrics.horizontalPadding * 2
                     + (key.resource ? MapMetrics.resourceIconInset : 0)
             ),
-            height: key.resource
-                ? MapMetrics.resourceHeight
-                : max(
-                    MapMetrics.minimumNodeHeight,
-                    min(MapMetrics.maximumTextHeight, ceil(measured.height)) + MapMetrics.verticalPadding * 2
-                )
+            height: key.resource ? MapMetrics.resourceHeight : Self.topicHeight(for: measured.height)
         )
         sizes[key] = size
         return size
+    }
+
+    nonisolated static func measureText(_ string: NSAttributedString) -> CGSize {
+        let framesetter = CTFramesetterCreateWithAttributedString(string)
+        return CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter, CFRange(location: 0, length: 0), nil,
+            CGSize(width: MapMetrics.maximumTextWidth, height: .greatestFiniteMagnitude), nil
+        )
+    }
+
+    nonisolated static func topicHeight(for textHeight: CGFloat) -> CGFloat {
+        max(
+            MapMetrics.minimumNodeHeight,
+            min(MapMetrics.maximumTextHeight, ceil(textHeight)) + MapMetrics.verticalPadding * 2)
     }
 }

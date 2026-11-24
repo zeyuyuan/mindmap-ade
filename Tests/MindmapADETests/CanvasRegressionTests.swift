@@ -109,6 +109,41 @@ private final class CanvasFixture {
 @Suite(.serialized)
 @MainActor
 struct CanvasRegressionTests {
+    @Test(arguments: [0.75, 1.04, 1.5])
+    func textEditorMatchesTheCanvasFontAndPositionAtDifferentZooms(zoom: Double) async throws {
+        let root = MapNode(text: "Hello World")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(scale: zoom, translation: CGPoint(x: 200, y: 200))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topic = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }.first)
+        let frame = canvas.view.convert(canvas.window.convertFromScreen(topic.accessibilityFrame()), from: nil)
+
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor as? TopicTextView)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        #expect(editor.font == CanvasStyle.font(root: true))
+        #expect(abs(backdrop.frame.width - frame.width) < 0.01)
+        #expect(abs(backdrop.frame.height - frame.height) < 0.01)
+        #expect(abs(backdrop.bounds.width * zoom - frame.width) < 0.01)
+        let ink = editor.measureContent().visualBounds
+        let inkCenter = canvas.view.convert(
+            CGPoint(x: ink.midX, y: editor.textContainerOrigin.y + ink.midY), from: editor)
+        #expect(abs(inkCenter.y - frame.midY) < 0.01)
+
+        try canvas.type(root.text + "\n")
+        let inkWithTrailingLine = editor.measureContent().visualBounds
+        let inkCenterWithTrailingLine = canvas.view.convert(
+            CGPoint(x: inkWithTrailingLine.midX, y: editor.textContainerOrigin.y + inkWithTrailingLine.midY),
+            from: editor)
+        #expect(backdrop.frame.height > frame.height)
+        #expect(abs(inkCenterWithTrailingLine.y - inkCenter.y) < 0.01)
+    }
+
     @Test func clickingAwayKeepsTheEditedTextVisibleUntilItsNewLayoutIsReady() async throws {
         let root = MapNode(text: "待办")
         let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))

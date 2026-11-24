@@ -36,9 +36,6 @@ struct AgentTerminalPane: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .task {
-            workspace.requestAgentResume(at: address, owner: actions.windowID, automatically: true)
-        }
         .task(id: run) {
             guard let run else { return }
             let latest = await workspace.agentFiles.snapshot(for: run.id)

@@ -930,7 +930,10 @@ struct AgentWorkspaceTests {
         await stopped.loadIfNeeded()
         defer { stopped.stopAgent(at: address) }
         let stoppedRun = try #require(stopped.agentRuns[address])
-        stopped.requestAgentResume(at: address, owner: UUID(), automatically: true)
+        let stoppedActions = EditorActions()
+        stoppedActions.workspace = stopped
+        stoppedActions.showTerminal(at: address)
+        #expect(stoppedActions.terminalAddress == address)
         #expect(stopped.agentRuns[address]?.state == .stopped)
         #expect(stopped.terminals[address] == nil)
         #expect(await stopped.agentFiles.snapshot(for: stoppedRun.id) == "Original conversation resumed")

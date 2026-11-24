@@ -130,10 +130,33 @@ struct CanvasRegressionTests {
         #expect(abs(backdrop.frame.width - frame.width) < 0.01)
         #expect(abs(backdrop.frame.height - frame.height) < 0.01)
         #expect(abs(backdrop.bounds.width * zoom - frame.width) < 0.01)
-        let ink = editor.measureContent().visualBounds
-        let inkCenter = canvas.view.convert(
-            CGPoint(x: ink.midX, y: editor.textContainerOrigin.y + ink.midY), from: editor)
-        #expect(abs(inkCenter.y - frame.midY) < 0.01)
+        let line = editor.measureContent()
+        let lineCenter = canvas.view.convert(
+            CGPoint(x: 0, y: editor.textContainerOrigin.y + line.height / 2), from: editor)
+        #expect(line.lineCount == 1)
+        #expect(abs(lineCenter.y - frame.midY) < 0.01)
+    }
+
+    @Test(arguments: [true, false])
+    func newTopicKeepsTheSameCaretBaselineFromEmptyToFirstCharacters(asChild: Bool) async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.insertNode(asChild: asChild)
+        let editor = try #require(canvas.editor as? TopicTextView)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        #expect(editor.string.isEmpty)
+        let origin = editor.textContainerOrigin.y
+        #expect(origin == (backdrop.bounds.height - editor.measureContent().height) / 2)
+
+        for text in [" ", ".", ".a", ".ab", ".abc", "中文", ""] {
+            try canvas.type(text)
+            #expect(editor.measureContent().lineCount == 1)
+            #expect(editor.textContainerOrigin.y == origin)
+        }
     }
 
     @Test(

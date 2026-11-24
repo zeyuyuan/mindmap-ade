@@ -41,7 +41,7 @@ Defined in `Sources/MindMapCore/Layout.swift`, in `MapMetrics`. Sizes are world-
 | `horizontalGap` / `verticalGap` | 64 / 16 pt | Parent-to-child and sibling-subtree separation |
 | `rootGap` | 64 pt | Separation when adding a root after an existing tree |
 
-Empty text displays the secondary placeholder “New topic”. Content remains plain text. Center a single line vertically using its glyph bounds, including fallback fonts. Place multiple lines from the top inset, including explicit blank lines. Complete text is retained even when the preview is clipped. Topic width depends only on text; adding or folding children does not reserve space inside the card.
+Empty text displays the secondary placeholder “New topic”. Content remains plain text. Center the typographic line box for single-line topics and the empty editor. Place multiple lines from the top inset, including explicit blank lines. Complete text is retained even when the preview is clipped. Topic width depends only on text; adding or folding children does not reserve space inside the card.
 
 ## Canvas and Chrome Tokens
 

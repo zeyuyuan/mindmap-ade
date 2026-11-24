@@ -9,7 +9,7 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
     private var previousString: NSAttributedString?
     private var previousSize = CGSize.zero
     private var previousPadding = CGSize.zero
-    private var followsEditorLayout = false
+    private var editorTextOriginY: CGFloat?
     private var lines: [CTLine] = []
     private var origins: [CGPoint] = []
 
@@ -26,7 +26,7 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
     ) {
         let changed =
             previousString != string || previousSize != size || previousPadding != padding
-            || self.followsEditorLayout != followsEditorLayout
+            || (editorTextOriginY != nil) != followsEditorLayout
         let resolutionChanged = layer.contentsScale != contentsScale
         layer.frame = CGRect(x: padding.width, y: 0, width: size.width, height: size.height)
         layer.contentsScale = contentsScale
@@ -34,17 +34,23 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
             previousString = string
             previousSize = size
             previousPadding = padding
-            self.followsEditorLayout = followsEditorLayout
             let text = followsEditorLayout ? TextLayoutService.includingFinalEmptyLine(in: string) : string
             let framesetter = CTFramesetterCreateWithAttributedString(text)
-            let path = CGPath(
-                rect: CGRect(
-                    x: 0, y: 0, width: size.width,
-                    height: max(1, size.height - padding.height * 2)), transform: nil)
+            let textHeight = max(1, size.height - padding.height * 2)
+            let path = CGPath(rect: CGRect(x: 0, y: 0, width: size.width, height: textHeight), transform: nil)
             let frame = CTFramesetterCreateFrame(framesetter, CFRange(location: 0, length: 0), path, nil)
             lines = CTFrameGetLines(frame) as? [CTLine] ?? []
             origins = Array(repeating: .zero, count: lines.count)
             if !lines.isEmpty { CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins) }
+            var verticalInset = padding.height
+            if followsEditorLayout, lines.count == 1, let line = lines.first {
+                var ascent: CGFloat = 0
+                var descent: CGFloat = 0
+                var leading: CGFloat = 0
+                CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+                verticalInset = (size.height - ceil(ascent + descent + leading)) / 2
+            }
+            editorTextOriginY = followsEditorLayout ? textHeight + verticalInset : nil
             let visible = CTFrameGetVisibleStringRange(frame)
             if visible.location + visible.length < string.length, let last = lines.last {
                 let range = CTLineGetStringRange(last)
@@ -68,8 +74,8 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
         context.saveGState()
         defer { context.restoreGState() }
         context.textMatrix = .identity
-        if followsEditorLayout && lines.count > 1 {
-            context.translateBy(x: 0, y: layer.bounds.height - previousPadding.height)
+        if let editorTextOriginY {
+            context.translateBy(x: 0, y: editorTextOriginY)
         } else {
             var ink = CGRect.null
             for (line, origin) in zip(lines, origins) {

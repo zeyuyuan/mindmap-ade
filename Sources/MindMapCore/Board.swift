@@ -286,32 +286,9 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
 
     /// A nil parent detaches the subtree as a new root; indices refer to the destination after removal.
     public func moving(_ id: UUID, to parent: UUID?, at index: Int? = nil, position: CGPoint = .zero) -> BoardEdit? {
-        guard nodes[id] != nil else { return nil }
-        if let parent {
-            guard nodes[parent] != nil, !descendants(of: id).contains(parent) else { return nil }
-        }
-        let oldParent = parents[id]
-        guard oldParent == parent || resourceMoveProblem(for: resources(in: [id]), to: parent) == nil else {
-            return nil
-        }
-        var changed: [UUID: MapNode] = [:]
-        if let oldParent, var node = nodes[oldParent] {
-            node.children.removeAll { $0 == id }
-            changed[oldParent] = node
-        }
-        var nextRoots = roots.filter { $0.id != id }
-        if let parent, var owner = changed[parent] ?? nodes[parent] {
-            owner.children.insert(id, at: min(max(0, index ?? owner.children.count), owner.children.count))
-            owner.isCollapsed = false
-            changed[parent] = owner
-        } else {
-            let target = min(max(0, index ?? nextRoots.count), nextRoots.count)
-            nextRoots.insert(RootPlacement(id: id, position: position), at: target)
-        }
-        return BoardEdit(
-            nodes: changed.map { NodeReplacement(id: $0.key, node: $0.value) },
-            roots: nextRoots == roots ? nil : nextRoots
-        )
+        movingBranches(
+            [id], to: parent, at: parent == nil ? index ?? roots.count : index,
+            positions: parent == nil ? [id: position] : [:])
     }
 
     public func movingRoot(_ id: UUID, to position: CGPoint) -> BoardEdit? {

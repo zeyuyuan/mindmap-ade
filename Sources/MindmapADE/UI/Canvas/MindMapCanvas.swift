@@ -90,24 +90,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var contextPoint = CGPoint.zero
     private var tracking: NSTrackingArea?
     private var isSpaceDown = false
-    private var dragStart: CGPoint?
-    private var dragWorldStart: CGPoint?
-    private var lastDrag: CGPoint?
+    private var pointerGesture: PointerGesture?
     private var dragPanTask: Task<Void, Never>?
-    private var didPanDuringDrag = false
-    private var pressedNode: UUID?
-    private var pressedWithoutModifiers = false
-    private var dragStarted = false
-    private var isMarquee = false
-    private var isPanning = false
-    private var selectionBeforeMarquee = Set<UUID>()
-    private var draggedBranches: [UUID] = []
-    private var draggedBranchIDs = Set<UUID>()
-    private var draggedRootIDs = Set<UUID>()
-    private var draggedResources: [UUID: BranchResources] = [:]
-    private var dragOffset = CGSize.zero
-    private var forbiddenTargets = Set<UUID>()
-    private var dropTarget: DropTarget?
     private var accessibilityNodes: [UUID: TopicAccessibilityElement] = [:]
     private var accessibilityDisclosures: [UUID: TopicDisclosureAccessibilityElement] = [:]
     private var accessibilityAgentSummaries: [UUID: TopicAgentSummaryAccessibilityElement] = [:]
@@ -134,11 +118,30 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         case blur, submit, keepDraft, cancel
     }
 
-    private enum DropTarget {
-        case root
-        case child(UUID)
-        case sibling(UUID, after: Bool)
-        case invalid(ResourcePlacementProblem?)
+    private struct PointerGesture {
+        enum Mode {
+            case pan
+            case marquee(Set<UUID>)
+            case branches
+        }
+
+        enum Phase {
+            case pressed(node: UUID?, selectsOnRelease: Bool, mode: Mode)
+            case panning
+            case marquee(Set<UUID>)
+            case dragging(BranchDrag)
+            case ignored
+        }
+
+        let start: CGPoint
+        let worldStart: CGPoint
+        var last: CGPoint
+        var phase: Phase
+
+        var branch: BranchDrag? {
+            if case .dragging(let drag) = phase { return drag }
+            return nil
+        }
     }
 
     override var isFlipped: Bool { true }
@@ -172,7 +175,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     func update(session: BoardSession, revision: Int) {
         if self.session !== session {
-            if dragStart != nil { resetPointerGesture() }
+            if pointerGesture != nil { resetPointerGesture() }
             closeNodeForm()
             configureAfterLayout = nil
             revealAfterTerminalResize = nil
@@ -278,7 +281,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     func prepareForRemoval() {
-        if dragStart != nil { resetPointerGesture() }
+        if pointerGesture != nil { resetPointerGesture() }
         closeNodeForm()
         finishEditing(.keepDraft)
         persistCamera()
@@ -333,11 +336,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             renderer.render(
                 board: session.board, layout: mapLayout, camera: camera, viewport: bounds,
                 selection: selected, backingScale: window?.backingScaleFactor ?? 2,
-                drag: draggedBranches.isEmpty
-                    ? nil
-                    : MapDragPreview(
-                        topLevelIDs: draggedBranchIDs, rootIDs: draggedRootIDs,
-                        movedIDs: forbiddenTargets, offset: dragOffset),
+                drag: pointerGesture?.branch?.preview,
                 runtimeDetails: runtimeDetails, editingTitleID: worktreeNameField == nil ? nil : editingID,
                 activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics,
                 focusedTopics: branchFocus?.topics, agentSummaries: agentSummaries
@@ -444,8 +443,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private func cameraChanged(persist: Bool = true) {
-        if !draggedBranches.isEmpty, let lastDrag {
-            updateBranchDrag(at: lastDrag)
+        if let gesture = pointerGesture, gesture.branch != nil {
+            updateBranchDrag(at: gesture.last)
         }
         render()
         positionEditor()
@@ -1150,7 +1149,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     func prepareForFind() {
         closeNodeForm()
         finishEditing(restoringFocus: false)
-        if dragStart != nil {
+        if pointerGesture != nil {
             resetPointerGesture()
             render()
         }
@@ -1242,15 +1241,18 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             if let id { select(id, edit: true) } else { insertRoot(at: world) }
             return
         }
-        dragStart = point
-        dragWorldStart = world
-        lastDrag = point
-        pressedNode = id
-        pressedWithoutModifiers = plainClick
-        dragStarted = false
-        isPanning = isSpaceDown || event.buttonNumber == 2 || (id == nil && !event.modifierFlags.contains(.shift))
-        isMarquee = id == nil && !isPanning && event.modifierFlags.contains(.shift)
-        selectionBeforeMarquee = selected
+        let isPanning = isSpaceDown || event.buttonNumber == 2 || (id == nil && !event.modifierFlags.contains(.shift))
+        let mode: PointerGesture.Mode
+        if isPanning {
+            mode = .pan
+        } else if id == nil {
+            mode = .marquee(selected)
+        } else {
+            mode = .branches
+        }
+        pointerGesture = PointerGesture(
+            start: point, worldStart: world, last: point,
+            phase: .pressed(node: id, selectsOnRelease: plainClick, mode: mode))
         if let id, !isPanning {
             if event.modifierFlags.contains(.command) {
                 if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
@@ -1267,41 +1269,51 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     override func otherMouseUp(with event: NSEvent) { mouseUp(with: event) }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let start = dragStart, let previous = lastDrag else { return }
+        guard var gesture = pointerGesture else { return }
         let point = localPoint(event)
-        let distance = hypot(point.x - start.x, point.y - start.y)
-        guard dragStarted || distance >= CanvasStyle.dragThreshold else { return }
-        lastDrag = point
-        if !dragStarted {
-            dragStarted = true
-            if !isPanning && !isMarquee, !session.isReadOnly, let id = pressedNode, session.board.nodes[id] != nil {
-                if !selected.contains(id) { selected = [id] }
-                draggedBranches = session.board.topLevelSelection(selected)
-                draggedBranchIDs = Set(draggedBranches)
-                draggedRootIDs = draggedBranchIDs.intersection(session.board.roots.map(\.id))
-                draggedResources = session.board.resources(in: draggedBranches)
-                forbiddenTargets = []
-                for branch in draggedBranches { forbiddenTargets.formUnion(session.board.descendants(of: branch)) }
-            }
+        let start = gesture.start
+        if case .pressed(let node, _, let mode) = gesture.phase {
+            guard hypot(point.x - start.x, point.y - start.y) >= CanvasStyle.dragThreshold else { return }
+            gesture.phase = beginPointerDrag(from: node, mode: mode)
         }
-        if isPanning {
+        let previous = gesture.last
+        gesture.last = point
+        pointerGesture = gesture
+        switch gesture.phase {
+        case .panning:
             camera.translation.x += point.x - previous.x
             camera.translation.y += point.y - previous.y
             hasCamera = true
             cameraChanged()
             NSCursor.closedHand.set()
-        } else if isMarquee {
+        case .marquee(let originalSelection):
             let rect = CGRect(
                 x: min(start.x, point.x), y: min(start.y, point.y), width: abs(point.x - start.x),
                 height: abs(point.y - start.y))
-            selected = selectionBeforeMarquee.union(mapLayout.visibleNodes(in: camera.worldRect(rect)))
+            selected = originalSelection.union(mapLayout.visibleNodes(in: camera.worldRect(rect)))
             renderer.showMarquee(rect)
             render()
             updateActions()
-        } else if !draggedBranches.isEmpty {
+        case .dragging:
             updateBranchDrag(at: point)
             updateDragPan(at: point)
             render()
+        case .pressed, .ignored:
+            break
+        }
+    }
+
+    private func beginPointerDrag(from node: UUID?, mode: PointerGesture.Mode) -> PointerGesture.Phase {
+        switch mode {
+        case .pan:
+            return .panning
+        case .marquee(let originalSelection):
+            return .marquee(originalSelection)
+        case .branches:
+            guard !session.isReadOnly, let node, session.board.nodes[node] != nil else { return .ignored }
+            if !selected.contains(node) { selected = [node] }
+            guard let drag = BranchDrag(selection: selected, board: session.board) else { return .ignored }
+            return .dragging(drag)
         }
     }
 
@@ -1334,26 +1346,29 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private func panDuringDrag(seconds: CGFloat) -> Bool {
-        guard !draggedBranches.isEmpty, let lastDrag else { return false }
-        let velocity = CanvasStyle.dragPanVelocity(at: lastDrag, in: bounds)
+        guard let gesture = pointerGesture, var drag = gesture.branch else { return false }
+        let velocity = CanvasStyle.dragPanVelocity(at: gesture.last, in: bounds)
         guard velocity != .zero else { return false }
         camera.translation.x += velocity.dx * seconds
         camera.translation.y += velocity.dy * seconds
-        didPanDuringDrag = true
+        drag.didPan = true
+        pointerGesture?.phase = .dragging(drag)
         cameraChanged(persist: false)
         return true
     }
 
-    private func updateBranchDrag(at point: CGPoint) {
-        guard let dragWorldStart else { return }
+    @discardableResult
+    private func updateBranchDrag(at point: CGPoint) -> BranchDrag? {
+        guard let gesture = pointerGesture, var drag = gesture.branch else { return nil }
         let world = camera.worldPoint(point)
-        dragOffset = CGSize(width: world.x - dragWorldStart.x, height: world.y - dragWorldStart.y)
-        let target = resolveDropTarget(at: world)
-        dropTarget = target
+        drag.offset = CGSize(width: world.x - gesture.worldStart.x, height: world.y - gesture.worldStart.y)
+        let target = drag.target(at: world, layout: mapLayout, board: session.board, scale: camera.scale)
+        drag.target = target
+        pointerGesture?.phase = .dragging(drag)
         let hint: String
         switch target {
         case .root:
-            hint = draggedRootIDs == draggedBranchIDs ? "Release to move" : "Release to make a root topic"
+            hint = drag.rootIDs == drag.ids ? "Release to move" : "Release to make a root topic"
         case .child:
             hint = "Release to attach as a child"
         case .sibling:
@@ -1367,52 +1382,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             NSCursor.arrow.set()
         }
         if actions?.dropHint != hint { actions?.dropHint = hint }
-    }
-
-    private func resolveDropTarget(at world: CGPoint) -> DropTarget {
-        let hit = mapLayout.hitTest(world, excluding: draggedBranchIDs)
-        if let hit, forbiddenTargets.contains(hit) { return .invalid(nil) }
-        guard let target = hit.flatMap({ mapLayout.nodes[$0] }) ?? nearbyDropNode(at: world) else {
-            return validatedDrop(.root, under: nil)
-        }
-        let relativeY = (world.y - target.frame.minY) / target.frame.height
-        let parent = session.board.parents[target.id]
-        if (parent != nil || hit != nil) && (relativeY < 0.25 || relativeY > 0.75) {
-            return validatedDrop(.sibling(target.id, after: relativeY > 0.75), under: parent)
-        }
-        return validatedDrop(.child(target.id), under: target.id)
-    }
-
-    private func nearbyDropNode(at world: CGPoint) -> PlacedNode? {
-        // Keep the reach comfortable at regular zoom and local to the branch at overview zoom.
-        let dx = min(CanvasStyle.dropHorizontalReach / camera.scale, MapMetrics.horizontalGap / 2)
-        let dy = min(CanvasStyle.dropVerticalReach / camera.scale, MapMetrics.verticalGap)
-        let query = CGRect(x: world.x - dx, y: world.y - dy, width: dx * 2, height: dy * 2)
-        var nearest: PlacedNode?
-        var nearestDistance = CGFloat.infinity
-        for id in mapLayout.visibleNodes(in: query).reversed() {
-            guard !forbiddenTargets.contains(id), session.board.nodes[id] != nil, let node = mapLayout.nodes[id]
-            else { continue }
-            let frame = node.frame
-            let distance = hypot(
-                max(frame.minX - world.x, world.x - frame.maxX, 0),
-                max(frame.minY - world.y, world.y - frame.maxY, 0))
-            guard distance < nearestDistance else { continue }
-            nearest = node
-            nearestDistance = distance
-        }
-        return nearest
-    }
-
-    private func validatedDrop(_ target: DropTarget, under parent: UUID?) -> DropTarget {
-        if let problem = session.board.resourceMoveProblem(for: draggedResources, to: parent) {
-            return .invalid(problem)
-        }
-        return target
+        return drag
     }
 
     private var dropIndicator: MapDropIndicator? {
-        switch dropTarget {
+        switch pointerGesture?.branch?.target {
         case .child(let id):
             return mapLayout.nodes[id].map {
                 .child(viewRect($0.frame), radius: CanvasStyle.nodeRadius * camera.scale)
@@ -1430,21 +1404,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private func resetPointerGesture() {
         dragPanTask?.cancel()
         dragPanTask = nil
-        if didPanDuringDrag { persistCamera() }
-        didPanDuringDrag = false
-        dragStart = nil
-        dragWorldStart = nil
-        lastDrag = nil
-        pressedNode = nil
-        pressedWithoutModifiers = false
-        draggedBranches = []
-        draggedBranchIDs = []
-        draggedRootIDs = []
-        draggedResources = [:]
-        forbiddenTargets = []
-        dragStarted = false
-        dragOffset = .zero
-        dropTarget = nil
+        if pointerGesture?.branch?.didPan == true { persistCamera() }
+        pointerGesture = nil
         actions?.dropHint = nil
         renderer.showMarquee(nil)
         renderer.showDropTarget(nil)
@@ -1457,9 +1418,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             render()
             updateActions()
         }
-        guard dragStarted else {
-            if pressedWithoutModifiers {
-                if let id = pressedNode {
+        if case .pressed(let node, let selectsOnRelease, _) = pointerGesture?.phase {
+            if selectsOnRelease {
+                if let id = node {
                     if session.board.nodes[id] != nil {
                         selected = [id]
                     } else {
@@ -1471,31 +1432,31 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             }
             return
         }
-        guard !draggedBranches.isEmpty else { return }
-        updateBranchDrag(at: localPoint(event))
+        guard let drag = updateBranchDrag(at: localPoint(event)) else { return }
         let positions = Dictionary(
-            uniqueKeysWithValues: draggedBranches.compactMap { id -> (UUID, CGPoint)? in
+            uniqueKeysWithValues: drag.ids.compactMap { id -> (UUID, CGPoint)? in
                 guard let placement = mapLayout.nodes[id] else { return nil }
                 return (
-                    id, CGPoint(x: placement.frame.minX + dragOffset.width, y: placement.frame.minY + dragOffset.height)
+                    id,
+                    CGPoint(x: placement.frame.minX + drag.offset.width, y: placement.frame.minY + drag.offset.height)
                 )
             })
         let edit: BoardEdit?
-        switch dropTarget {
+        switch drag.target {
         case .child(let parent):
-            edit = session.board.movingBranches(draggedBranchIDs, to: parent)
+            edit = session.board.movingBranches(drag.ids, to: parent)
         case .sibling(let target, let after):
             guard session.board.nodes[target] != nil else { return }
             let parent = session.board.parents[target]
             let siblings = parent.flatMap { session.board.nodes[$0]?.children } ?? session.board.roots.map(\.id)
-            let filtered = siblings.filter { !draggedBranchIDs.contains($0) }
+            let filtered = siblings.filter { !drag.ids.contains($0) }
             let index = (filtered.firstIndex(of: target) ?? filtered.count) + (after ? 1 : 0)
-            edit = session.board.movingBranches(draggedBranchIDs, to: parent, at: index, positions: positions)
+            edit = session.board.movingBranches(drag.ids, to: parent, at: index, positions: positions)
         case .invalid(let problem):
             if let problem { actions?.hint = problem.message }
             return
         case .root:
-            edit = session.board.movingBranches(draggedBranchIDs, to: nil, positions: positions)
+            edit = session.board.movingBranches(drag.ids, to: nil, positions: positions)
         case nil:
             return
         }
@@ -1597,7 +1558,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             return
         }
         actions?.activateTarget()
-        if event.keyCode == 53, !draggedBranches.isEmpty {
+        if event.keyCode == 53, pointerGesture?.branch != nil {
             resetPointerGesture()
             render()
             return
@@ -1641,7 +1602,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     override func resignFirstResponder() -> Bool {
         isSpaceDown = false
-        if !draggedBranches.isEmpty {
+        if pointerGesture?.branch != nil {
             resetPointerGesture()
             render()
         }

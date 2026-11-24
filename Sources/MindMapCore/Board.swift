@@ -107,6 +107,8 @@ public enum BoardValidationError: Error, Equatable {
 }
 
 public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
+    public static let maximumNodeCount = 100_000
+
     public var id: UUID
     public var name: String
     public private(set) var roots: [RootPlacement]
@@ -147,7 +149,7 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func validated() throws -> Self {
-        guard !roots.isEmpty, nodes.count <= 100_000 else { throw BoardValidationError.invalidStructure }
+        guard !roots.isEmpty, nodes.count <= Self.maximumNodeCount else { throw BoardValidationError.invalidStructure }
         var visited = Set<UUID>()
         var pending = roots.map(\.id)
         guard roots.allSatisfy({ $0.position.x.isFinite && $0.position.y.isFinite }) else {

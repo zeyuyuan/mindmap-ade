@@ -482,7 +482,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         )
         guard let result = session.board.inserting(parent: parent, after: asChild ? nil : current, position: position)
         else { return }
-        session.apply(result.edit, named: asChild ? "Add Child" : "Add Sibling")
+        guard session.apply(result.edit, named: asChild ? "Add Child" : "Add Sibling") else {
+            changed()
+            return
+        }
         selected = [result.id]
         changed()
         let frame = CGRect(
@@ -499,7 +502,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         let center = camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY))
         let position = point ?? CGPoint(x: center.x, y: max(center.y, mapLayout.bounds.maxY + MapMetrics.rootGap))
         guard let result = session.board.inserting(parent: nil, position: position) else { return }
-        session.apply(result.edit, named: "Add Root")
+        guard session.apply(result.edit, named: "Add Root") else {
+            changed()
+            return
+        }
         selected = [result.id]
         changed()
         beginEditing(
@@ -670,9 +676,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         let position = point ?? CGPoint(x: center.x, y: max(center.y, mapLayout.bounds.maxY + MapMetrics.rootGap))
         guard
             let result = session.board.inserting(
-                MapNode(content: content), parent: parent, position: position),
-            session.apply(result.edit, named: "Add \(kind.title)")
+                MapNode(content: content), parent: parent, position: position)
         else { return }
+        guard session.apply(result.edit, named: "Add \(kind.title)") else {
+            changed()
+            return
+        }
         selected = [result.id]
         configureAfterLayout = result.id
         revealAfterLayout = result.id
@@ -1717,7 +1726,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             let result = session.board.inserting(
                 text: text, parent: parent, position: camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY)))
         else { return }
-        session.apply(result.edit, named: "Paste Topic")
+        guard session.apply(result.edit, named: "Paste Topic") else {
+            changed()
+            return
+        }
         selected = [result.id]
         changed()
     }

@@ -326,7 +326,7 @@ final class MapRenderer {
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
-        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil,
+        runtimeDetails: [UUID: String] = [:], editingTitleIDs: Set<UUID> = [], activeAgentID: UUID? = nil,
         agentEditedTopics: [UUID: ContinuousClock.Instant] = [:], focusedTopics: Set<UUID>? = nil,
         agentSummaries: [UUID: AgentBranchSummary] = [:]
     ) {
@@ -409,7 +409,7 @@ final class MapRenderer {
                 selected: selection.contains(id),
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
                 resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
-                isEditingTitle: editingTitleID == id, agentSummary: agentSummaries[id]
+                isEditingTitle: editingTitleIDs.contains(id), agentSummary: agentSummaries[id]
             )
             topic.configureBackground(isActiveAgent: isActiveAgent, editDeadline: agentEditedTopics[id], now: now)
         }

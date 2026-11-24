@@ -37,6 +37,14 @@ final class NativeNodeHostView: NSView {
     }
 }
 
+private final class TopicEditorBackdrop: NSView {
+    var acceptsInput = true
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        acceptsInput ? super.hitTest(point) : nil
+    }
+}
+
 final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, NSUserInterfaceValidations,
     NSPopoverDelegate
 {
@@ -49,13 +57,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private let layoutService = TextLayoutService()
     private var layoutTask: Task<Void, Never>?
     private var appliedRevision = -1
-    private var renderedLayout: LayoutRequest?
+    private var presentation: LayoutPresentation?
     private var requestedLayout: LayoutRequest?
     private var expandedAncestors = Set<UUID>()
     private var jumpAfterLayout: UUID?
     private var branchFocus: BranchFocus?
     private var pendingFit = false
-    private var mapLayout = MapLayout.empty
+    private var mapLayout: MapLayout { presentation?.layout ?? .empty }
     private var renderer: MapRenderer!
     private let nativeHost = NativeNodeHostView()
     private var camera = MapCamera()
@@ -79,7 +87,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var agentSummaries: [UUID: AgentBranchSummary] = [:]
     private var agentSummaryReach: CGFloat = 0
     private var editorScroll: NSScrollView?
-    private var editorBackdrop: NSView?
+    private var editorBackdrop: TopicEditorBackdrop?
+    private var committedEditors: [UUID: CommittedEditor] = [:]
     private var provisionalEditFrame: CGRect?
     private var revealAfterLayout: UUID?
     private var revealAfterTerminalResize: UUID?
@@ -104,6 +113,19 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         let expandedAncestors: Set<UUID>
     }
 
+    private struct LayoutPresentation {
+        let request: LayoutRequest
+        var board: MindMapBoard
+        let layout: MapLayout
+    }
+
+    private struct CommittedEditor {
+        let backdrop: TopicEditorBackdrop
+        let worldFrame: CGRect
+        let bounds: CGRect
+        let text: String
+    }
+
     private struct BranchFocus {
         let root: UUID
         let previousCamera: MapCamera
@@ -112,6 +134,14 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private var layoutRequest: LayoutRequest {
         LayoutRequest(revision: session.layoutRevision, expandedAncestors: expandedAncestors)
+    }
+
+    private var renderedLayout: LayoutRequest? { presentation?.request }
+
+    private var displayedBoard: MindMapBoard {
+        // Camera and selection redraws can run while a new layout is being measured.
+        if let presentation, presentation.request.revision != session.layoutRevision { return presentation.board }
+        return session.board
     }
 
     private enum EditingCompletion {
@@ -182,25 +212,27 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             revealAfterLayout = nil
             jumpAfterLayout = nil
             finishEditing(restoringFocus: false)
+            clearCommittedEditors()
             persistCamera()
             self.session = session
             actions?.hint = EditorActions.defaultHint
             branchFocus = nil
             expandedAncestors.removeAll()
             appliedRevision = -1
-            renderedLayout = nil
+            presentation = nil
             requestedLayout = nil
             pendingFit = false
-            mapLayout = .empty
             activeAgentID = nil
             agentEditedTopics.removeAll()
             agentRunStates.removeAll()
+            refreshAgentSummaries()
             camera = workspace?.cameras[session.id] ?? MapCamera()
             hasCamera = workspace?.cameras[session.id] != nil
             selected = workspace?.selections[session.id] ?? Set(session.board.roots.prefix(1).map(\.id))
             accessibilityNodes.removeAll()
             accessibilityDisclosures.removeAll()
             accessibilityAgentSummaries.removeAll()
+            render()
         }
         actions?.canvas = self
         if let address = formAddress, session.board.nodes[address.nodeID] == nil { closeNodeForm() }
@@ -211,14 +243,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         appliedRevision = revision
         if renderedLayout?.revision != session.layoutRevision {
             expandedAncestors = expandedAncestors.filter { session.board.nodes[$0]?.isCollapsed == true }
-            if let root = branchFocus?.root {
-                if session.board.nodes[root] != nil {
-                    branchFocus?.topics = session.board.descendants(of: root)
-                } else {
-                    endBranchFocus()
-                }
-            }
-            refreshAgentSummaries()
         }
         if renderedLayout == layoutRequest {
             render()
@@ -233,6 +257,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard requestedLayout != request else { return }
         requestedLayout = request
         layoutTask?.cancel()
+        let session = self.session
         let board = session.board
         let regular = CanvasStyle.font(root: false).fontName
         let root = CanvasStyle.font(root: true).fontName
@@ -240,11 +265,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             do {
                 let result = try await layoutService.layout(
                     board: board, regularFont: regular, rootFont: root, expandedAncestors: request.expandedAncestors)
-                guard let self, !Task.isCancelled, self.session === session,
-                    self.layoutRequest == request
-                else { return }
-                self.mapLayout = result
-                self.renderedLayout = request
+                guard let self, !Task.isCancelled, self.session === session else { return }
+                self.requestedLayout = nil
+                guard self.layoutRequest == request else { return }
+                self.presentation = LayoutPresentation(request: request, board: session.board, layout: result)
+                self.clearCommittedEditors()
+                self.refreshAgentSummaries()
                 if !self.selected.isEmpty {
                     self.selected.formIntersection(result.nodes.keys)
                     if self.selected.isEmpty, let first = self.session.board.roots.first {
@@ -252,6 +278,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                     }
                 }
                 self.initializeCameraIfNeeded()
+                if let root = self.branchFocus?.root {
+                    if board.nodes[root] != nil {
+                        self.branchFocus?.topics = board.descendants(of: root)
+                    } else {
+                        self.endBranchFocus()
+                    }
+                }
                 if let id = self.jumpAfterLayout, let frame = result.nodes[id]?.frame {
                     self.centerTopic(frame)
                 } else {
@@ -274,8 +307,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 }
             } catch is CancellationError {
             } catch {
-                self?.requestedLayout = nil
-                self?.actions?.hint = "The map could not be laid out."
+                guard let self, !Task.isCancelled, self.session === session else { return }
+                self.requestedLayout = nil
+                self.actions?.hint = "The map could not be laid out."
             }
         }
     }
@@ -284,6 +318,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         if pointerGesture != nil { resetPointerGesture() }
         closeNodeForm()
         finishEditing(.keepDraft)
+        clearCommittedEditors()
         persistCamera()
         layoutTask?.cancel()
         if actions?.canvas === self { actions?.canvas = nil }
@@ -332,12 +367,16 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private func render() {
         guard renderer != nil else { return }
+        if renderedLayout?.revision == session.layoutRevision { presentation?.board = session.board }
+        positionCommittedEditors()
+        var editingTitleIDs = Set(committedEditors.keys)
+        if let editingID { editingTitleIDs.insert(editingID) }
         effectiveAppearance.performAsCurrentDrawingAppearance {
             renderer.render(
-                board: session.board, layout: mapLayout, camera: camera, viewport: bounds,
+                board: displayedBoard, layout: mapLayout, camera: camera, viewport: bounds,
                 selection: selected, backingScale: window?.backingScaleFactor ?? 2,
                 drag: pointerGesture?.branch?.preview,
-                runtimeDetails: runtimeDetails, editingTitleID: worktreeNameField == nil ? nil : editingID,
+                runtimeDetails: runtimeDetails, editingTitleIDs: editingTitleIDs,
                 activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics,
                 focusedTopics: branchFocus?.topics, agentSummaries: agentSummaries
             )
@@ -368,7 +407,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private func refreshAgentSummaries() {
         agentSummaries = AgentBranchSummary.make(
-            states: agentRunStates, in: session.board, expandedAncestors: expandedAncestors)
+            states: agentRunStates, in: displayedBoard, expandedAncestors: renderedLayout?.expandedAncestors ?? [])
         agentSummaryReach = agentSummaries.values.map(\.width).max() ?? 0
         accessibilityRevision = -1
     }
@@ -531,7 +570,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         finishEditing()
         guard selected.count == 1, let id = selected.first else { return }
         if expandedAncestors.remove(id) != nil {
-            refreshAgentSummaries()
             requestLayout()
             return
         }
@@ -783,7 +821,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
         scroll.documentView = text
-        let backdrop = NSView()
+        let backdrop = TopicEditorBackdrop()
         backdrop.wantsLayer = true
         backdrop.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         backdrop.layer?.cornerRadius = CanvasStyle.nodeRadius * camera.scale
@@ -926,13 +964,34 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             CGRect(origin: worldFrame.origin, size: CGSize(width: width / camera.scale, height: height / camera.scale)))
     }
 
+    private func positionCommittedEditors() {
+        for (id, preview) in committedEditors {
+            guard session.board.nodes[id]?.text == preview.text else {
+                preview.backdrop.removeFromSuperview()
+                committedEditors.removeValue(forKey: id)
+                continue
+            }
+            let frame = viewRect(preview.worldFrame)
+            if preview.backdrop.frame != frame {
+                preview.backdrop.frame = frame
+                preview.backdrop.bounds = preview.bounds
+            }
+        }
+    }
+
+    private func clearCommittedEditors() {
+        for preview in committedEditors.values { preview.backdrop.removeFromSuperview() }
+        committedEditors.removeAll()
+    }
+
     private func finishEditing(_ completion: EditingCompletion = .blur, restoringFocus: Bool = true) {
         guard !finishingEdit, let id = editingID else { return }
         finishingEdit = true
         let commit = completion != .cancel
         let field = worktreeNameField
+        let textView = editor
+        let backdrop = editorBackdrop
         let text = editingTextView?.string ?? field?.stringValue ?? originalText
-        if commit && text != originalText { revealAfterLayout = id }
         editor?.delegate = nil
         field?.delegate = nil
         editor = nil
@@ -940,20 +999,38 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         editingID = nil
         field?.removeFromSuperview()
         provisionalEditFrame = nil
-        editorBackdrop?.removeFromSuperview()
         editorBackdrop = nil
         editorScroll = nil
         if let token = editingToken { workspace?.endEditing(nodeID: id, boardID: session.id, token: token) }
         editingToken = nil
+        var keepsBackdrop = false
         if commit && text != originalText {
             if field != nil, let node = session.board.nodes[id] {
                 let address = NodeAddress(boardID: session.id, nodeID: id)
                 workspace?.updateDraft(at: address, content: node.applyingInlineText(text).content)
             } else {
-                session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
+                keepsBackdrop =
+                    session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
+                    && renderedLayout?.revision != session.layoutRevision
             }
+            if renderedLayout?.revision != session.layoutRevision { revealAfterLayout = id }
         }
-        if restoringFocus { window?.makeFirstResponder(self) }
+        if restoringFocus {
+            window?.makeFirstResponder(self)
+        } else if let textView, window?.firstResponder === textView {
+            window?.makeFirstResponder(nil)
+        }
+        if keepsBackdrop, let backdrop {
+            // Keep the final edit visible until its text and geometry can be presented together.
+            backdrop.acceptsInput = false
+            textView?.isEditable = false
+            textView?.isSelectable = false
+            let preview = CommittedEditor(
+                backdrop: backdrop, worldFrame: camera.worldRect(backdrop.frame), bounds: backdrop.bounds, text: text)
+            committedEditors.updateValue(preview, forKey: id)?.backdrop.removeFromSuperview()
+        } else {
+            backdrop?.removeFromSuperview()
+        }
         finishingEdit = false
         actions?.hint = EditorActions.defaultHint
         if field != nil { render() }
@@ -1177,7 +1254,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         } else {
             pendingFit = false
             jumpAfterLayout = id
-            refreshAgentSummaries()
             requestLayout()
         }
     }
@@ -1483,8 +1559,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard camera.scale >= CanvasStyle.textDetailScale else { return nil }
         let reach = CanvasStyle.disclosureGap + CanvasStyle.disclosureMaximumWidth + CanvasStyle.disclosureHitPadding
         let query = CGRect(x: point.x - reach, y: point.y - 1, width: reach + 1, height: 2)
+        let board = displayedBoard
         return mapLayout.visibleNodes(in: query).last { id in
-            guard let placement = mapLayout.nodes[id], session.board.nodes[id]?.children.isEmpty == false else {
+            guard let placement = mapLayout.nodes[id], board.nodes[id]?.children.isEmpty == false else {
                 return false
             }
             guard !session.isReadOnly || expandedAncestors.contains(id) else { return false }
@@ -1873,8 +1950,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         for id in Set(accessibilityAgentSummaries.keys).subtracting(ids) {
             accessibilityAgentSummaries.removeValue(forKey: id)
         }
+        let board = displayedBoard
         for id in visible {
-            guard let node = session.board.nodes[id] else { continue }
+            guard let node = board.nodes[id] else { continue }
             let element = accessibilityNodes[id] ?? TopicAccessibilityElement(id: id, canvas: self)
             element.setAccessibilityLabel(node.title)
             element.setAccessibilityRoleDescription(node.content.kind == .project ? "project topic" : "mind map topic")

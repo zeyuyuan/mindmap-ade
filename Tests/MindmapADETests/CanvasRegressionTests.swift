@@ -109,6 +109,78 @@ private final class CanvasFixture {
 @Suite(.serialized)
 @MainActor
 struct CanvasRegressionTests {
+    @Test func clickingAwayKeepsTheEditedTextVisibleUntilItsNewLayoutIsReady() async throws {
+        let root = MapNode(text: "待办")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        let text = "整理节点编辑后的排版问题"
+        try canvas.type(text)
+        let frame = backdrop.frame
+        let point = CGPoint(x: 8, y: 8)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: point))
+
+        #expect(session.board.nodes[root.id]?.text == text)
+        #expect(canvas.editor == nil)
+        #expect(canvas.window.firstResponder === canvas.view)
+        #expect(backdrop.window === canvas.window)
+        #expect(backdrop.frame == frame)
+        #expect(canvas.view.hitTest(CGPoint(x: frame.midX, y: frame.midY)) === canvas.view)
+
+        try await canvas.waitForSelectedTopic(text)
+        #expect(backdrop.window == nil)
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: point))
+    }
+
+    @Test func committingThePlaceholderTextDoesNotLeaveAnEditorOverTheTopic() async throws {
+        let root = MapNode()
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        try canvas.type(root.title)
+        #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        #expect(session.board.nodes[root.id]?.text == root.title)
+        #expect(backdrop.window == nil)
+    }
+
+    @Test func agentRenameKeepsThePreviousTitleAndFrameTogetherUntilRelayout() async throws {
+        let root = MapNode(text: "Old")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topic = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }.first)
+        let oldFrame = topic.accessibilityFrame()
+        let title = "A substantially wider topic title"
+        let edit = try #require(session.board.replacingText(root.id, with: title))
+
+        #expect(session.applyAgentEdit(edit, change: .edited, highlighting: [root.id]))
+        canvas.view.update(session: session, revision: session.revision)
+        canvas.view.layout()
+        #expect(topic.accessibilityLabel() == root.title)
+        #expect(topic.accessibilityFrame() == oldFrame)
+
+        try await canvas.waitForSelectedTopic(title)
+        #expect(topic.accessibilityFrame().width > oldFrame.width)
+    }
+
     @Test func resourceMenusAndCommandsRespectProjectAndWorktreePlacement() async throws {
         var project = ProjectTopic()
         project.location = ProjectLocation(directory: "/project", gitCommonDirectory: "/project/.git")

@@ -46,20 +46,22 @@ actor TextLayoutService {
             string: key.text,
             attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
         )
-        let measured = Self.measureText(string)
-        let size = CGSize(
-            width: max(
-                key.resource ? MapMetrics.resourceMinimumWidth : MapMetrics.minimumNodeWidth,
-                ceil(measured.width) + MapMetrics.horizontalPadding * 2
-                    + (key.resource ? MapMetrics.resourceIconInset : 0)
-            ),
-            height: key.resource ? MapMetrics.resourceHeight : Self.topicHeight(for: measured.height)
-        )
+        let size: CGSize
+        if key.resource {
+            size = CGSize(
+                width: max(
+                    MapMetrics.resourceMinimumWidth,
+                    ceil(Self.measureText(string).width) + MapMetrics.horizontalPadding * 2
+                        + MapMetrics.resourceIconInset),
+                height: MapMetrics.resourceHeight)
+        } else {
+            size = Self.topicSize(for: string)
+        }
         sizes[key] = size
         return size
     }
 
-    nonisolated static func measureText(_ string: NSAttributedString) -> CGSize {
+    nonisolated private static func measureText(_ string: NSAttributedString) -> CGSize {
         let framesetter = CTFramesetterCreateWithAttributedString(string)
         return CTFramesetterSuggestFrameSizeWithConstraints(
             framesetter, CFRange(location: 0, length: 0), nil,
@@ -67,9 +69,28 @@ actor TextLayoutService {
         )
     }
 
-    nonisolated static func topicHeight(for textHeight: CGFloat) -> CGFloat {
-        max(
-            MapMetrics.minimumNodeHeight,
-            min(MapMetrics.maximumTextHeight, ceil(textHeight)) + MapMetrics.verticalPadding * 2)
+    nonisolated static func topicSize(for string: NSAttributedString) -> CGSize {
+        let measured = measureText(includingFinalEmptyLine(in: string))
+        return CGSize(
+            width: max(
+                MapMetrics.minimumNodeWidth,
+                min(MapMetrics.maximumTextWidth, ceil(measured.width)) + MapMetrics.horizontalPadding * 2),
+            height: max(
+                MapMetrics.minimumNodeHeight,
+                min(MapMetrics.maximumTextHeight, ceil(measured.height)) + MapMetrics.verticalPadding * 2))
+    }
+
+    nonisolated static func includingFinalEmptyLine(in string: NSAttributedString) -> NSAttributedString {
+        switch string.string.utf16.last {
+        case 0x000A, 0x000D, 0x0085, 0x2028, 0x2029:
+            // Core Text omits the final empty line unless there is a character after the break.
+            let padded = NSMutableAttributedString(attributedString: string)
+            padded.append(
+                NSAttributedString(
+                    string: "\u{200B}", attributes: string.attributes(at: string.length - 1, effectiveRange: nil)))
+            return padded
+        default:
+            return string
+        }
     }
 }

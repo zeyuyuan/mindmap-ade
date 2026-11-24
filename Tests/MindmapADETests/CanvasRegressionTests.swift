@@ -134,14 +134,69 @@ struct CanvasRegressionTests {
         let inkCenter = canvas.view.convert(
             CGPoint(x: ink.midX, y: editor.textContainerOrigin.y + ink.midY), from: editor)
         #expect(abs(inkCenter.y - frame.midY) < 0.01)
+    }
 
-        try canvas.type(root.text + "\n")
-        let inkWithTrailingLine = editor.measureContent().visualBounds
-        let inkCenterWithTrailingLine = canvas.view.convert(
-            CGPoint(x: inkWithTrailingLine.midX, y: editor.textContainerOrigin.y + inkWithTrailingLine.midY),
-            from: editor)
-        #expect(backdrop.frame.height > frame.height)
-        #expect(abs(inkCenterWithTrailingLine.y - inkCenter.y) < 0.01)
+    @Test(
+        arguments: [
+            "短一点\nSecond line",
+            "短一点\nSecond line\n",
+            "中英文混排，这段文字应该自动换行。The line break should stay put after finishing the edit.",
+            String(repeating: "Long text\n", count: 20),
+        ])
+    func multilineTopicKeepsItsDraftHeightAfterCommit(text: String) async throws {
+        let root = MapNode(text: "First line\nSecond line\nThird line\nFourth line")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topic = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }.first)
+        let originalHeight = topic.accessibilityFrame().height
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor as? TopicTextView)
+        let scroll = try #require(editor.enclosingScrollView)
+        let backdrop = try #require(scroll.superview)
+
+        try canvas.type(text)
+        let draftFrame = backdrop.frame
+        let content = editor.measureContent()
+        let fullHeight = content.height + MapMetrics.verticalPadding * 2
+        let maxHeight = MapMetrics.maximumTextHeight + MapMetrics.verticalPadding * 2
+        #expect(abs(draftFrame.height - min(fullHeight, maxHeight)) < 0.01)
+        #expect(editor.textContainerOrigin.y == MapMetrics.verticalPadding)
+        #expect(scroll.hasVerticalScroller == (fullHeight > maxHeight))
+        if text == "短一点\nSecond line" {
+            #expect(draftFrame.height < originalHeight)
+        }
+        #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        try await canvas.waitForSelectedTopic(text)
+        #expect(abs(topic.accessibilityFrame().height - draftFrame.height) < 0.01)
+        #expect(session.board.nodes[root.id]?.text == text)
+    }
+
+    @Test func fractionalZoomDoesNotMoveAWordToTheNextLine() async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(scale: 1.04, translation: CGPoint(x: 100.25, y: 90))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let manager = try #require(editor.textLayoutManager)
+        try canvas.type("中英文混排，这段文字需要自动换行。The same wrapping should appear after the node is saved.")
+
+        var lines: [String] = []
+        manager.enumerateTextLayoutFragments(from: nil, options: [.ensuresLayout]) { fragment in
+            for line in fragment.textLineFragments {
+                lines.append(line.attributedString.attributedSubstring(from: line.characterRange).string)
+            }
+            return true
+        }
+        #expect(lines == ["中英文混排，这段文字需要自动换行。", "The same wrapping should appear ", "after the node is saved."])
     }
 
     @Test func clickingAwayKeepsTheEditedTextVisibleUntilItsNewLayoutIsReady() async throws {

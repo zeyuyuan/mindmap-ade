@@ -9,6 +9,7 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
     private var previousString: NSAttributedString?
     private var previousSize = CGSize.zero
     private var previousPadding = CGSize.zero
+    private var followsEditorLayout = false
     private var lines: [CTLine] = []
     private var origins: [CGPoint] = []
 
@@ -20,9 +21,12 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
 
     func configure(
         _ string: NSAttributedString, size: CGSize, contentsScale: CGFloat,
-        padding: CGSize = CGSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding)
+        padding: CGSize = CGSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding),
+        followsEditorLayout: Bool = false
     ) {
-        let changed = previousString != string || previousSize != size || previousPadding != padding
+        let changed =
+            previousString != string || previousSize != size || previousPadding != padding
+            || self.followsEditorLayout != followsEditorLayout
         let resolutionChanged = layer.contentsScale != contentsScale
         layer.frame = CGRect(x: padding.width, y: 0, width: size.width, height: size.height)
         layer.contentsScale = contentsScale
@@ -30,7 +34,9 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
             previousString = string
             previousSize = size
             previousPadding = padding
-            let framesetter = CTFramesetterCreateWithAttributedString(string)
+            self.followsEditorLayout = followsEditorLayout
+            let text = followsEditorLayout ? TextLayoutService.includingFinalEmptyLine(in: string) : string
+            let framesetter = CTFramesetterCreateWithAttributedString(text)
             let path = CGPath(
                 rect: CGRect(
                     x: 0, y: 0, width: size.width,
@@ -62,14 +68,18 @@ final class TopicTextRenderer: NSObject, @MainActor CALayerDelegate {
         context.saveGState()
         defer { context.restoreGState() }
         context.textMatrix = .identity
-        var ink = CGRect.null
-        for (line, origin) in zip(lines, origins) {
-            // Glyph bounds include fallback fonts, so mixed scripts share the same visual center.
-            let bounds = CTLineGetImageBounds(line, context)
-            if !bounds.isNull && !bounds.isEmpty { ink = ink.union(bounds.offsetBy(dx: origin.x, dy: origin.y)) }
+        if followsEditorLayout && lines.count > 1 {
+            context.translateBy(x: 0, y: layer.bounds.height - previousPadding.height)
+        } else {
+            var ink = CGRect.null
+            for (line, origin) in zip(lines, origins) {
+                // Glyph bounds include fallback fonts, so mixed scripts share the same visual center.
+                let bounds = CTLineGetImageBounds(line, context)
+                if !bounds.isNull && !bounds.isEmpty { ink = ink.union(bounds.offsetBy(dx: origin.x, dy: origin.y)) }
+            }
+            guard !ink.isNull else { return }
+            context.translateBy(x: 0, y: layer.bounds.midY + ink.midY)
         }
-        guard !ink.isNull else { return }
-        context.translateBy(x: 0, y: layer.bounds.midY + ink.midY)
         context.scaleBy(x: 1, y: -1)
         for (line, origin) in zip(lines, origins) {
             context.textPosition = origin

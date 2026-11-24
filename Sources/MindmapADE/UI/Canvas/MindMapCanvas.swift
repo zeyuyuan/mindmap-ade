@@ -810,6 +810,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         text.allowsUndo = true
         text.isVerticallyResizable = true
         text.isHorizontallyResizable = false
+        text.textContainer?.widthTracksTextView = false
+        text.textContainer?.lineFragmentPadding = 0
         text.drawsBackground = true
         text.backgroundColor = .controlBackgroundColor
         text.textColor = .labelColor
@@ -913,58 +915,47 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             let worldFrame = mapLayout.nodes[id]?.frame ?? provisionalEditFrame
         else { return }
         // Scale the view after laying out the text at the canvas's base font size.
-        let scale = camera.scale
         let inset = NSSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding)
         editor.textContainerInset = inset
-        editor.textContainer?.lineFragmentPadding = 0
-        let measured = TextLayoutService.measureText(
-            NSAttributedString(string: editor.string, attributes: [.font: editor.font ?? CanvasStyle.font(root: false)])
-        )
-        let previewHeight = TextLayoutService.topicHeight(for: measured.height)
-        let availableWidth = max(bounds.width - CanvasStyle.fitPadding * 2, MapMetrics.minimumNodeWidth) / scale
-        let baseWidth = min(availableWidth, max(worldFrame.width, ceil(measured.width) + inset.width * 2))
-        let availableHeight = max(CanvasStyle.editorMinimumHeight, (bounds.height - CanvasStyle.fitPadding * 2) / scale)
-        let maximumHeight = min(availableHeight, CanvasStyle.editorMaximumHeight / scale)
-
-        // Measure without a stale scrollbar gutter before deciding whether scrolling is needed.
-        scroll.hasVerticalScroller = false
-        scroll.frame = CGRect(x: 0, y: 0, width: baseWidth, height: maximumHeight)
-        scroll.tile()
-        editor.setFrameSize(NSSize(width: scroll.contentSize.width, height: maximumHeight))
-        let measuredTextWidth = max(scroll.contentSize.width - inset.width * 2, 1)
-        editor.textContainer?.containerSize = CGSize(
-            width: measuredTextWidth, height: .greatestFiniteMagnitude)
-        var content = editor.measureContent()
-        let height = min(
-            maximumHeight,
-            max(worldFrame.height, previewHeight, ceil(content.height + inset.height * 2)))
-        let needsScrolling = content.height + inset.height * 2 > height
+        let draft = NSAttributedString(
+            string: editor.string, attributes: [.font: editor.font ?? CanvasStyle.font(root: false)])
+        let draftSize = TextLayoutService.topicSize(for: draft)
+        let availableWidth = max(bounds.width - fitPadding * 2, MapMetrics.minimumNodeWidth)
+        let availableHeight = max(
+            CanvasStyle.editorMinimumHeight, min(bounds.height - fitPadding * 2, CanvasStyle.editorMaximumHeight))
+        var editingScale = camera.scale
+        if draftSize.width * editingScale > availableWidth {
+            editingScale = availableWidth / (MapMetrics.maximumTextWidth + inset.width * 2)
+        }
+        if draftSize.height * editingScale > availableHeight {
+            editingScale = availableHeight / (MapMetrics.maximumTextHeight + inset.height * 2)
+        }
+        if editingScale < camera.scale {
+            camera.zoom(to: editingScale, around: camera.viewPoint(worldFrame.origin))
+            cameraChanged()
+            return
+        }
+        // A clip view can round its bounds at fractional zoom. Wrap at the exact topic width.
+        let textSize = CGSize(width: draftSize.width - inset.width * 2, height: .greatestFiniteMagnitude)
+        if editor.textContainer?.size != textSize { editor.textContainer?.size = textSize }
+        let content = editor.measureContent()
+        let needsScrolling = content.height + inset.height * 2 > draftSize.height
         let gutter =
             needsScrolling && NSScroller.preferredScrollerStyle == .legacy
             ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
-        let width = min(availableWidth, baseWidth + gutter)
-        let editorFrame = CGRect(origin: worldFrame.origin, size: CGSize(width: width, height: height))
+        let editorFrame = CGRect(
+            origin: worldFrame.origin, size: CGSize(width: draftSize.width + gutter, height: draftSize.height))
         backdrop.frame = viewRect(editorFrame)
         backdrop.bounds = CGRect(origin: .zero, size: editorFrame.size)
-        backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth / max(scale, 0.5)
+        backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth / max(editingScale, 0.5)
         scroll.hasVerticalScroller = needsScrolling
         scroll.frame = backdrop.bounds
         scroll.tile()
-        editor.setFrameSize(
-            NSSize(width: scroll.contentSize.width, height: max(height, content.height + inset.height * 2)))
-        let finalTextWidth = max(scroll.contentSize.width - inset.width * 2, 1)
-        if editor.textContainer?.containerSize.width != finalTextWidth {
-            editor.textContainer?.containerSize = CGSize(width: finalTextWidth, height: .greatestFiniteMagnitude)
+        if editor.frame.width != draftSize.width {
+            editor.setFrameSize(CGSize(width: draftSize.width, height: editor.frame.height))
         }
-        if finalTextWidth != measuredTextWidth {
-            content = editor.measureContent()
-        }
-        let viewportHeight = scroll.contentSize.height
-        let centerHeight =
-            finalTextWidth >= ceil(measured.width) && measured.height <= MapMetrics.maximumTextHeight
-            ? min(previewHeight, viewportHeight) : viewportHeight
-        if editor.centerContentVertically(
-            using: content, in: viewportHeight, centeringWithin: centerHeight, padding: inset.height)
+        if editor.positionContent(
+            using: content, in: scroll.contentSize.height, topicHeight: draftSize.height, padding: inset.height)
         {
             scroll.contentView.scroll(to: .zero)
             scroll.reflectScrolledClipView(scroll.contentView)

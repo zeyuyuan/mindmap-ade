@@ -41,7 +41,7 @@ Defined in `Sources/MindMapCore/Layout.swift`, in `MapMetrics`. Sizes are world-
 | `horizontalGap` / `verticalGap` | 64 / 16 pt | Parent-to-child and sibling-subtree separation |
 | `rootGap` | 64 pt | Separation when adding a root after an existing tree |
 
-Empty text displays the secondary placeholder “New topic”. Content remains plain text. Center the visible text block vertically using its glyph bounds, including fallback fonts and multiline text. Complete text is retained even when the preview is clipped. Topic width depends only on text; adding or folding children does not reserve space inside the card.
+Empty text displays the secondary placeholder “New topic”. Content remains plain text. Center a single line vertically using its glyph bounds, including fallback fonts. Place multiple lines from the top inset, including explicit blank lines. Complete text is retained even when the preview is clipped. Topic width depends only on text; adding or folding children does not reserve space inside the card.
 
 ## Canvas and Chrome Tokens
 
@@ -102,7 +102,7 @@ Place hidden Agent status beside the outermost collapsed branch that contains ea
 
 Resource cards use a leading SF Symbol on a tertiary system fill. Use the folder, branching arrows, and terminal symbols for projects, worktrees, and agents. A Git Project shows its current branch beneath its name. A bound folder without Git shows its name centered beside the icon. An unbound Project keeps its Draft label. Worktree cards show their branch and directory name. The enclosing Project or parent Worktree identifies a new checkout’s source. Hide the symbols with the text at overview zoom. Keep the popover anchored to the node at system control size. Close or Keep Draft keeps a new draft available to complete later. A new Worktree has a focused name field inside its card, with the generated branch name as the placeholder. Tab accepts the name. Return or leaving the field creates the checkout. Keep the terminal at its own text size inside the board window.
 
-Lay out the native text editor in world coordinates at the canvas font size and scale the editor view with the camera. Center the visible glyphs within the topic preview height when the text fits. Reserve space for empty and trailing lines so the insertion point stays visible. Once the text requires scrolling, use normal top and bottom padding. Keep native caret, selection, and input-method geometry in the same text-container coordinate system.
+Lay out the native text editor in world coordinates at the canvas font size and scale the editor view with the camera. Use the dimensions and vertical alignment of the draft topic. Reserve space for empty and trailing lines so the insertion point stays visible. Scroll the editor when the draft exceeds the topic preview height. Keep native caret, selection, and input-method geometry in the same text-container coordinate system.
 
 The Agent terminal opens to the right of the canvas at half the board width. Keep its controls in the pane header, with icon buttons and help labels so they fit at the minimum window size. The divider adjusts the two pane widths without changing the terminal font size.
 

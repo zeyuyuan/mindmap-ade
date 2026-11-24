@@ -62,6 +62,7 @@ public struct AgentRun: Identifiable, Codable, Equatable, Sendable {
     public var exitCode: Int32?
     public var error: String?
     public var conversationID: UUID?
+    public var conversationRecoveryError: String?
     public let checkout: String?
     public let worktreeIdentity: String?
     public var previousSnapshotID: UUID?

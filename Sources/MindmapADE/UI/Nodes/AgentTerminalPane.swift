@@ -101,7 +101,7 @@ struct AgentTerminalPane: View {
                 if let message = shellError ?? recoveryIssue?.errorDescription ?? run.error {
                     Label(message, systemImage: "exclamationmark.triangle")
                         .fixedSize(horizontal: false, vertical: true)
-                } else if !hasSavedConversation, terminal?.isShell != true {
+                } else if !hasSavedConversation, terminal?.isShell != true, run.conversationRecoveryError == nil {
                     Text("There is no saved conversation for this Agent configuration.")
                         .foregroundStyle(.secondary)
                 }
@@ -207,6 +207,13 @@ struct AgentTerminalPane: View {
                         .help("Stop Conversation")
                         .disabled(run?.state != .running)
                 }
+            }
+            if let message = run?.conversationRecoveryError {
+                Label("Conversation recovery unavailable", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help(message)
+                    .accessibilityHint(Text(verbatim: message))
             }
         }
         .controlSize(.small)

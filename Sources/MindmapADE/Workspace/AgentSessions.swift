@@ -91,8 +91,15 @@ extension WorkspaceStore {
                 )
             } else {
                 let name = session.board.nodes[address.nodeID]?.title ?? "Mindmap Agent"
-                run.conversationID = try? await CodexConversation.create(
-                    executable: executable.path, environment: environment, directory: worktree.directory, name: name)
+                do {
+                    run.conversationID = try await CodexConversation.create(
+                        executable: executable.path, environment: environment, directory: worktree.directory, name: name
+                    )
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    run.conversationRecoveryError = error.localizedDescription
+                }
             }
         }
         let lastRun = agentRuns[address]

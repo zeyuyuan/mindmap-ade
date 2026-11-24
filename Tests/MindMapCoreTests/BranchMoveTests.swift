@@ -4,6 +4,23 @@ import Testing
 
 @testable import MindMapCore
 
+@Test func movingOneBranchAndMovingASelectionClearAnEmptyParentsFold() throws {
+    var board = MindMapBoard()
+    let root = board.roots[0].id
+    let child = try #require(board.inserting(text: "Child", parent: root))
+    board.apply(child.edit)
+    board.apply(try #require(board.togglingCollapse(root)))
+    let position = CGPoint(x: 20, y: 180)
+    var single = board
+    let inverse = single.apply(try #require(board.moving(child.id, to: nil, position: position)))
+    var grouped = board
+    grouped.apply(try #require(board.movingBranches([child.id], to: nil, positions: [child.id: position])))
+    #expect(single == grouped)
+    #expect(single.nodes[root]?.isCollapsed == false)
+    single.apply(inverse)
+    #expect(single == board)
+}
+
 @Test func movingMultipleRootsPreservesTheirSpacingAndHasOneInverse() throws {
     var board = MindMapBoard()
     let first = board.roots[0].id

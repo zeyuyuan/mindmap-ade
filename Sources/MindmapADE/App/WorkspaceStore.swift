@@ -3,6 +3,9 @@ import Darwin
 import MindMapCore
 import Observation
 
+private nonisolated let boardNodeLimitMessage =
+    "A board can have up to \(MindMapBoard.maximumNodeCount.formatted()) topics."
+
 enum AgentMapChange: String {
     case added = "Agent Added Topic"
     case edited = "Agent Edited Topic"
@@ -31,14 +34,32 @@ final class BoardSession: Identifiable {
 
     private struct HistoryEntry {
         let edit: BoardEdit
+        let previous: BoardEdit
         let action: String
         let agentTopics: Set<UUID>
         let time = ContinuousClock.now
 
-        init(edit: BoardEdit, action: String, agentTopics: Set<UUID> = []) {
+        init(edit: BoardEdit, previous: BoardEdit, action: String, agentTopics: Set<UUID> = []) {
             self.edit = edit
+            self.previous = previous
             self.action = action
             self.agentTopics = agentTopics
+        }
+
+        func replay(on board: MindMapBoard) -> BoardEdit {
+            var replay = edit
+            // Draft updates can change fields outside the undo history.
+            replay.nodes = zip(edit.nodes, previous.nodes).map { replacement, original in
+                guard let target = replacement.node, let source = original.node,
+                    var current = board.nodes[replacement.id]
+                else { return replacement }
+                if source.text != target.text { current.text = target.text }
+                if source.content != target.content { current.content = target.content }
+                if source.children != target.children { current.children = target.children }
+                if source.isCollapsed != target.isCollapsed { current.isCollapsed = target.isCollapsed }
+                return NodeReplacement(id: replacement.id, node: current)
+            }
+            return replay
         }
     }
 
@@ -91,7 +112,7 @@ final class BoardSession: Identifiable {
     func apply(_ edit: BoardEdit?, named action: String, recordHistory: Bool = true) -> Bool {
         guard let edit, let inverse = applyChange(edit) else { return false }
         if recordHistory {
-            record(HistoryEntry(edit: inverse, action: action))
+            record(HistoryEntry(edit: inverse, previous: edit, action: action))
         }
         didChange?()
         return true
@@ -99,7 +120,7 @@ final class BoardSession: Identifiable {
 
     func applyAgentEdit(_ edit: BoardEdit, change: AgentMapChange, highlighting topics: Set<UUID>) -> Bool {
         guard let inverse = applyChange(edit) else { return false }
-        let entry = HistoryEntry(edit: inverse, action: change.rawValue, agentTopics: topics)
+        let entry = HistoryEntry(edit: inverse, previous: edit, action: change.rawValue, agentTopics: topics)
         record(entry)
         let duration = CanvasStyle.agentEditHighlightDuration + .seconds(CanvasStyle.agentEditFadeDuration)
         let deadline = entry.time.advanced(by: duration)
@@ -111,18 +132,22 @@ final class BoardSession: Identifiable {
     }
 
     func undo() {
-        guard let entry = undoStack.last, let inverse = applyChange(entry.edit) else { return }
+        guard let entry = undoStack.last else { return }
+        let edit = entry.replay(on: board)
+        guard let inverse = applyChange(edit) else { return }
         undoStack.removeLast()
-        redoStack.append(HistoryEntry(edit: inverse, action: entry.action))
+        redoStack.append(HistoryEntry(edit: inverse, previous: edit, action: entry.action))
         for id in entry.agentTopics { clearAgentHighlight(for: id) }
         if agentEditNotice?.undoTime == entry.time { agentEditNotice = nil }
         didChange?()
     }
 
     func redo() {
-        guard let entry = redoStack.last, let inverse = applyChange(entry.edit) else { return }
+        guard let entry = redoStack.last else { return }
+        let edit = entry.replay(on: board)
+        guard let inverse = applyChange(edit) else { return }
         redoStack.removeLast()
-        undoStack.append(HistoryEntry(edit: inverse, action: entry.action))
+        undoStack.append(HistoryEntry(edit: inverse, previous: edit, action: entry.action))
         didChange?()
     }
 
@@ -134,6 +159,17 @@ final class BoardSession: Identifiable {
 
     private func applyChange(_ edit: BoardEdit) -> BoardEdit? {
         guard !isReadOnly else { return nil }
+        if board.nodes.count + edit.nodes.count > MindMapBoard.maximumNodeCount {
+            var existsAfterEdit: [UUID: Bool] = [:]
+            for replacement in edit.nodes { existsAfterEdit[replacement.id] = replacement.node != nil }
+            let count = existsAfterEdit.reduce(board.nodes.count) { count, replacement in
+                count + (replacement.value ? 1 : 0) - (board.nodes[replacement.key] != nil ? 1 : 0)
+            }
+            guard count <= MindMapBoard.maximumNodeCount else {
+                editError = boardNodeLimitMessage
+                return nil
+            }
+        }
         editError = rejectEdit?(board, edit)
         guard editError == nil else { return nil }
         let inverse = board.apply(edit)
@@ -219,6 +255,9 @@ actor WorkspaceDisk: WorkspacePersistence {
 
     func save(_ archive: WorkspaceArchive) throws {
         guard hasWriteAccess else { throw CocoaError(.fileWriteNoPermission) }
+        guard archive.boards.allSatisfy({ $0.nodes.count <= MindMapBoard.maximumNodeCount }) else {
+            throw WorkspaceIssue(boardNodeLimitMessage)
+        }
         let data = try JSONEncoder().encode(archive)
         try data.write(to: directory.appendingPathComponent("workspace.json"), options: .atomic)
     }
@@ -473,18 +512,8 @@ final class WorkspaceStore {
         saveTask?.cancel()
         guard !isReadOnly, !isLoading else { return }
         saveRevision += 1
-        let revision = saveRevision
         saveState = .saving
-        do {
-            try await disk.save(archive())
-            if revision == saveRevision {
-                errorMessage = nil
-                saveState = .saved
-            }
-        } catch {
-            if revision == saveRevision { recordSaveFailure(error) }
-            throw error
-        }
+        try await writeArchive(revision: saveRevision)
     }
 
     private func makeSession(_ board: MindMapBoard) -> BoardSession {
@@ -523,24 +552,26 @@ final class WorkspaceStore {
         let revision = saveRevision
         saveTask?.cancel()
         saveTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .milliseconds(350))
-                guard let self, !Task.isCancelled, self.saveRevision == revision else { return }
-                try await self.disk.save(self.archive())
-                guard !Task.isCancelled, self.saveRevision == revision else { return }
-                self.errorMessage = nil
-                self.saveState = .saved
-            } catch is CancellationError {
-            } catch {
-                guard let self, !Task.isCancelled, self.saveRevision == revision else { return }
-                self.recordSaveFailure(error)
-            }
+            do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+            guard let self, !Task.isCancelled, self.saveRevision == revision else { return }
+            try? await self.writeArchive(revision: revision)
         }
     }
 
-    private func recordSaveFailure(_ error: any Error) {
-        errorMessage = "Changes could not be saved: \(error.localizedDescription)"
-        saveState = .failed
+    private func writeArchive(revision: Int) async throws {
+        do {
+            try await disk.save(archive())
+            if revision == saveRevision {
+                errorMessage = nil
+                saveState = .saved
+            }
+        } catch {
+            if revision == saveRevision {
+                errorMessage = "Changes could not be saved: \(error.localizedDescription)"
+                saveState = .failed
+            }
+            throw error
+        }
     }
 }
 

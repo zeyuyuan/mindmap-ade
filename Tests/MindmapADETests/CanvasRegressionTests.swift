@@ -363,6 +363,61 @@ struct CanvasRegressionTests {
         #expect(session.board.nodes[root]?.text == "Before deletion")
     }
 
+    @Test func undoAndRedoPreserveDraftsDuringStructuralEdits() async throws {
+        let root = MapNode(content: .project(ProjectTopic()))
+        let board = MindMapBoard(root: root)
+        let disk = MemoryWorkspaceDisk(board: board)
+        let workspace = WorkspaceStore(disk: disk)
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let address = NodeAddress(boardID: board.id, nodeID: root.id)
+        let insertion = try #require(session.board.inserting(text: "Child", parent: root.id))
+        #expect(session.apply(insertion.edit, named: "Add Child"))
+
+        var draft = ProjectTopic()
+        draft.name = "Before Undo"
+        workspace.updateDraft(at: address, content: .project(draft))
+        session.undo()
+        #expect(session.board.nodes[root.id]?.content == .project(draft))
+        #expect(session.board.nodes[root.id]?.children.isEmpty == true)
+
+        draft.name = "Before Redo"
+        workspace.updateDraft(at: address, content: .project(draft))
+        session.redo()
+        #expect(session.board.nodes[root.id]?.content == .project(draft))
+        #expect(session.board.nodes[root.id]?.children == [insertion.id])
+        try await workspace.flush()
+        #expect(await disk.snapshot().boards[0] == session.board)
+    }
+
+    @Test func topicLimitAllowsEditsAndProtectsTheSavedArchive() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("MindmapADE-limit-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let disk = WorkspaceDisk(directory: directory)
+        _ = try await disk.load()
+        var board = MindMapBoard()
+        var root = try #require(board.nodes[board.roots[0].id])
+        let children = (1..<MindMapBoard.maximumNodeCount).map { _ in MapNode() }
+        root.children = children.map(\.id)
+        let replacements = children.map { NodeReplacement(id: $0.id, node: $0) }
+        board.apply(BoardEdit(nodes: replacements + [NodeReplacement(id: root.id, node: root)]))
+        let session = BoardSession(board)
+        let extra = try #require(board.inserting(text: "Extra", parent: root.id))
+        #expect(!session.apply(extra.edit, named: "Add Child"))
+        #expect(session.editError != nil)
+        #expect(session.board.nodes.count == MindMapBoard.maximumNodeCount)
+        #expect(session.apply(board.replacingText(root.id, with: "Edited at the limit"), named: "Edit Text"))
+        #expect(session.editError == nil)
+
+        let saved = WorkspaceArchive(boards: [session.board])
+        try await disk.save(saved)
+        board.apply(extra.edit)
+        await #expect(throws: WorkspaceIssue.self) { try await disk.save(WorkspaceArchive(boards: [board])) }
+        let reopened = WorkspaceDisk(directory: directory)
+        let (archive, _) = try await reopened.load()
+        #expect(archive?.boards.first == saved.boards.first)
+    }
+
     @Test func autosaveFailureRemainsFailedUntilAWriteSucceeds() async throws {
         let disk = MemoryWorkspaceDisk()
         let workspace = WorkspaceStore(disk: disk)

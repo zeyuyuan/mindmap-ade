@@ -18,8 +18,11 @@ actor TextLayoutService {
     ) throws -> MapLayout {
         let roots = Set(board.roots.map(\.id))
         var metrics: [UUID: CGSize] = [:]
-        for node in board.nodes.values {
+        var pending = board.roots.map(\.id)
+        while let id = pending.popLast() {
             try Task.checkCancellation()
+            guard let node = board.nodes[id] else { continue }
+            pending.append(contentsOf: node.displayedChildren(expandedAncestors: expandedAncestors))
             let key = Key(
                 text: node.title,
                 fontName: roots.contains(node.id) || node.content.kind != .text ? rootFont : regularFont,
@@ -30,7 +33,7 @@ actor TextLayoutService {
                 size.width = max(
                     size.width, measure(Key(text: suggestion, fontName: key.fontName, resource: true)).width)
             }
-            metrics[node.id] = size
+            metrics[id] = size
         }
         if sizes.count > 20_000 { sizes.removeAll(keepingCapacity: true) }
         return TreeLayout.make(board: board, sizes: metrics, expandedAncestors: expandedAncestors)

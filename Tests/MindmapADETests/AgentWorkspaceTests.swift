@@ -817,6 +817,49 @@ struct AgentWorkspaceTests {
         try await restored.interruptAllAgents()
     }
 
+    @Test func codexStartsAndRecordsWhenConversationRecoveryIsUnavailable() async throws {
+        _ = NSApplication.shared
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let executable = try fixture.cliStub(
+            "test-codex",
+            """
+            #!/bin/sh
+            if [ "$1" = app-server ]; then exit 1; fi
+            exec /bin/sleep 30
+            """)
+        let git = GitWorkspace()
+        var project = ProjectTopic()
+        let projectLocation = try await git.project(at: fixture.repository.path)
+        project.location = projectLocation
+        let location = try await git.existing(fixture.repository.path, in: projectLocation)
+        let root = MapNode(content: .project(project))
+        let tree = MapNode(content: .worktree(WorktreeTopic(location: location)))
+        let topic = AgentTopic(cli: .codex)
+        let agent = MapNode(content: .agent(topic))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(tree, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(agent, parent: tree.id)).edit)
+        let disk = LaunchTestDisk(directory: fixture.data, board: board)
+        let workspace = WorkspaceStore(disk: disk)
+        await workspace.loadIfNeeded()
+        let address = NodeAddress(boardID: board.id, nodeID: agent.id)
+
+        try await workspace.launchAgent(topic, at: address) { _ in
+            .init(path: executable.path, supportsSessionIntegration: true)
+        }
+        defer { workspace.stopAgent(at: address) }
+        #expect(workspace.agentRuns[address]?.state == .running)
+        #expect(workspace.savedConversation(at: address) == nil)
+        let message = try #require(workspace.agentRuns[address]?.conversationRecoveryError)
+        #expect(!message.isEmpty)
+        try await workspace.interruptAllAgents()
+        try await workspace.flush()
+        let archive = try JSONDecoder().decode(
+            WorkspaceArchive.self, from: JSONEncoder().encode(await disk.snapshot()))
+        #expect(archive.agentRuns?.first?.conversationRecoveryError == message)
+    }
+
     @Test func agentRecoveryRestoresThePaneAndRequiresConfirmationAfterASwitch() async throws {
         _ = NSApplication.shared
         let fixture = try ScratchRepository()

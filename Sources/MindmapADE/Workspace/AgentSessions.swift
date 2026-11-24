@@ -34,12 +34,11 @@ extension WorkspaceStore {
         return run
     }
 
-    func requestAgentResume(at address: NodeAddress, owner: UUID, automatically: Bool = false) {
+    func requestAgentResume(at address: NodeAddress, owner: UUID) {
         guard !isReadOnly, !isQuitting, !operations.contains(address),
             let run = savedConversation(at: address), !run.state.isActive
         else { return }
         let issue = recoveryIssues[address]
-        guard !automatically || (run.state == .interrupted && issue == nil && terminals[address] == nil) else { return }
         Task {
             guard !operations.contains(address), agentRuns[address]?.id == run.id else { return }
             do {
@@ -157,7 +156,7 @@ extension WorkspaceStore {
         guard let run = agentRuns[address], run.state == .running else { return }
         agentRuns[address]?.state = .stopping
         Task {
-            // Persist the user's stop before signaling the process so a relaunch won't resume it.
+            // Persist the user's stop before signaling the process so its restored state reflects the explicit stop.
             try? await flush()
             guard agentRuns[address]?.id == run.id, agentRuns[address]?.state == .stopping else { return }
             terminals[address]?.stop()

@@ -387,7 +387,7 @@ struct CanvasRegressionTests {
         #expect(await disk.snapshot().boards[0].nodes[root]?.text == "Unsaved edit")
     }
 
-    @Test func plainAgentClicksShowTerminalsWithoutInterruptingCanvasGestures() async throws {
+    @Test func agentSelectionAndExplicitTerminalOpeningAreSeparate() async throws {
         let root = MapNode(text: "Tasks")
         let first = MapNode(content: .agent(AgentTopic(task: "First session")))
         let second = MapNode(content: .agent(AgentTopic(task: "Second session")))
@@ -421,13 +421,16 @@ struct CanvasRegressionTests {
         canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: firstPoint))
         #expect(canvas.actions.terminalAddress == nil)
         canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: firstPoint))
-        #expect(canvas.actions.terminalAddress == firstAddress)
+        #expect(canvas.actions.terminalAddress == nil)
+        #expect(canvas.view.selected == [first.id])
+        #expect(workspace.terminals[firstAddress]?.owner == nil)
         #expect(canvas.window.firstResponder === canvas.view)
 
-        // A second click from the same double click can land on blank space after the pane opens.
-        let blank = CGPoint(x: 8, y: 8)
-        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: blank, clickCount: 2))
-        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: blank, clickCount: 2))
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: firstPoint, clickCount: 2))
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: firstPoint, clickCount: 2))
+        #expect(canvas.actions.terminalAddress == firstAddress)
+        #expect(workspace.terminals[firstAddress]?.owner == canvas.actions.windowID)
+        #expect(canvas.window.firstResponder === canvas.view)
         #expect(session.board == board)
 
         let secondPoint = try center(of: second)
@@ -436,6 +439,23 @@ struct CanvasRegressionTests {
         #expect(canvas.actions.terminalAddress == firstAddress)
         try canvas.click(secondPoint)
         #expect(canvas.view.selected == [second.id])
+        #expect(canvas.actions.terminalAddress == firstAddress)
+        #expect(workspace.terminals[firstAddress]?.owner == canvas.actions.windowID)
+        #expect(workspace.terminals[secondAddress]?.owner == nil)
+
+        let menu = try #require(canvas.view.menu(for: try canvas.event(.rightMouseDown, at: secondPoint)))
+        let openIndex = try #require(menu.items.firstIndex(where: { $0.title == "Open Terminal" }))
+        #expect(canvas.actions.terminalAddress == firstAddress)
+        menu.performActionForItem(at: openIndex)
+        #expect(canvas.actions.terminalAddress == secondAddress)
+
+        canvas.actions.hideTerminal()
+        let f2 = try #require(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: canvas.window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
+                isARepeat: false, keyCode: 120))
+        canvas.view.keyDown(with: f2)
         #expect(canvas.actions.terminalAddress == secondAddress)
 
         try canvas.click(try center(of: root))
@@ -445,6 +465,7 @@ struct CanvasRegressionTests {
         #expect(canvas.window.firstResponder === canvas.view)
         _ = canvas.view.menu(for: try canvas.event(.rightMouseDown, at: try center(of: first)))
         try canvas.click(try center(of: draft))
+        let blank = CGPoint(x: 8, y: 8)
         try canvas.click(blank)
         #expect(canvas.actions.terminalAddress == secondAddress)
 

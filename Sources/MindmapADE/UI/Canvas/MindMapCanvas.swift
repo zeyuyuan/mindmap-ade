@@ -291,7 +291,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                     self.positionEditor()
                 }
                 self.jumpAfterLayout = nil
-                if let id = self.editingID ?? self.revealAfterLayout, let frame = result.nodes[id]?.frame {
+                let worktreeBeingEdited = self.worktreeNameField == nil ? nil : self.editingID
+                if let id = worktreeBeingEdited ?? self.revealAfterLayout, let frame = result.nodes[id]?.frame {
                     self.reveal(frame)
                 }
                 self.revealAfterLayout = nil
@@ -911,15 +912,20 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 width: max(1, frame.maxX - titleX - padding / 2), height: titleHeight)
             return
         }
-        guard let editor, let scroll = editorScroll, let backdrop = editorBackdrop, let id = editingID,
-            let worldFrame = mapLayout.nodes[id]?.frame ?? provisionalEditFrame
-        else { return }
+        guard let editor, let scroll = editorScroll, let backdrop = editorBackdrop, let id = editingID else { return }
+        let placement = mapLayout.nodes[id]
+        guard let worldFrame = placement?.frame ?? provisionalEditFrame else { return }
         // Scale the view after laying out the text at the canvas's base font size.
         let inset = NSSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding)
         editor.textContainerInset = inset
         let draft = NSAttributedString(
             string: editor.string, attributes: [.font: editor.font ?? CanvasStyle.font(root: false)])
         let draftSize = TextLayoutService.topicSize(for: draft)
+        var origin = worldFrame.origin
+        if let placement, placement.depth > 0 {
+            // A child's center depends on its siblings' heights. Its own height grows around that center.
+            origin.y = worldFrame.midY - draftSize.height / 2
+        }
         let availableWidth = max(bounds.width - fitPadding * 2, MapMetrics.minimumNodeWidth)
         let availableHeight = max(
             CanvasStyle.editorMinimumHeight, min(bounds.height - fitPadding * 2, CanvasStyle.editorMaximumHeight))
@@ -931,7 +937,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             editingScale = availableHeight / (MapMetrics.maximumTextHeight + inset.height * 2)
         }
         if editingScale < camera.scale {
-            camera.zoom(to: editingScale, around: camera.viewPoint(worldFrame.origin))
+            camera.zoom(to: editingScale, around: camera.viewPoint(origin))
             cameraChanged()
             return
         }
@@ -944,7 +950,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             needsScrolling && NSScroller.preferredScrollerStyle == .legacy
             ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
         let editorFrame = CGRect(
-            origin: worldFrame.origin, size: CGSize(width: draftSize.width + gutter, height: draftSize.height))
+            origin: origin, size: CGSize(width: draftSize.width + gutter, height: draftSize.height))
         backdrop.frame = viewRect(editorFrame)
         backdrop.bounds = CGRect(origin: .zero, size: editorFrame.size)
         backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth / max(editingScale, 0.5)
@@ -1007,12 +1013,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             if field != nil, let node = session.board.nodes[id] {
                 let address = NodeAddress(boardID: session.id, nodeID: id)
                 workspace?.updateDraft(at: address, content: node.applyingInlineText(text).content)
+                if renderedLayout?.revision != session.layoutRevision { revealAfterLayout = id }
             } else {
                 keepsBackdrop =
                     session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
                     && renderedLayout?.revision != session.layoutRevision
             }
-            if renderedLayout?.revision != session.layoutRevision { revealAfterLayout = id }
         }
         if restoringFocus {
             window?.makeFirstResponder(self)

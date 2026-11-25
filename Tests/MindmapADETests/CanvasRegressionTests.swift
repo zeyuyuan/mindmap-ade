@@ -199,6 +199,43 @@ struct CanvasRegressionTests {
         #expect(session.board.nodes[root.id]?.text == text)
     }
 
+    @Test func committingAMultilineChildNearTheViewportEdgeKeepsTheCanvasAndTopicInPlace() async throws {
+        let root = MapNode(text: "Fixed root")
+        var board = MindMapBoard(root: root)
+        let parent = try #require(board.inserting(text: "Parent", parent: root.id))
+        board.apply(parent.edit)
+        let child = try #require(board.inserting(text: "Editable child", parent: parent.id))
+        board.apply(child.edit)
+        board.apply(try #require(board.inserting(text: "Sibling", parent: parent.id)).edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 112))
+        workspace.rememberSelection([child.id], for: session.id)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topics = try #require(canvas.view.accessibilityChildren()).compactMap { $0 as? TopicAccessibilityElement }
+        let fixedRoot = try #require(topics.first { $0.accessibilityLabel() == root.title })
+        let editable = try #require(topics.first { $0.accessibilityLabel() == "Editable child" })
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+
+        let text = "第一行\nSecond line\n第三行\nFourth line\n第五行\n"
+        try canvas.type(text)
+        let draftFrame = backdrop.frame
+        let before = fixedRoot.accessibilityFrame()
+        let point = CGPoint(x: 8, y: 8)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: point))
+        try await canvas.waitForSelectedTopic(text)
+
+        #expect(fixedRoot.accessibilityFrame() == before)
+        let savedFrame = canvas.view.convert(canvas.window.convertFromScreen(editable.accessibilityFrame()), from: nil)
+        #expect(savedFrame == draftFrame)
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: point))
+    }
+
     @Test func fractionalZoomDoesNotMoveAWordToTheNextLine() async throws {
         let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
         await workspace.loadIfNeeded()

@@ -282,6 +282,7 @@ struct CanvasRegressionTests {
             canvas.window.convertToScreen(canvas.view.convert(backdrop.frame, to: nil))
         }
 
+        try canvas.type("First draft\nAnother line\nOne more line")
         try canvas.type(String(repeating: "A long replacement line that wraps.\n", count: 14))
         #expect(editorScreenFrame() == editedTopic.accessibilityFrame())
         #expect(original.allSatisfy { !$0.intersects(editorScreenFrame()) })
@@ -295,6 +296,30 @@ struct CanvasRegressionTests {
 
         #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
         #expect(neighbors.map { $0.accessibilityFrame() } == original)
+    }
+
+    @Test func cappedTextFitsBesideAnAlwaysVisibleScrollbar() async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let scroll = try #require(editor.enclosingScrollView)
+        scroll.scrollerStyle = .legacy
+        let line = "iiiiiiiiiiiiiiiiiiiiiiiMMMMMMMMMMMMM"
+        try canvas.type(String(repeating: line + "\n", count: 20))
+        try await canvas.waitForDraftLayout()
+        let textWidth = try #require(editor.textContainer?.size.width)
+
+        #expect(scroll.hasVerticalScroller)
+        #expect(scroll.contentSize.width >= editor.textContainerInset.width + textWidth)
+        let caret = NSRange(location: line.utf16.count, length: 0)
+        editor.setSelectedRange(caret)
+        editor.scrollRangeToVisible(caret)
+        #expect(scroll.contentView.bounds.minX == 0)
     }
 
     @Test func fractionalZoomDoesNotMoveAWordToTheNextLine() async throws {

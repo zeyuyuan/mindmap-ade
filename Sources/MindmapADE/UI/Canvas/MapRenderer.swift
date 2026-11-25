@@ -77,7 +77,9 @@ final class TopicLayer {
         }
         let bounds = layer.bounds
         let textX = MapMetrics.horizontalPadding + (isResource ? MapMetrics.resourceIconInset : 0)
-        let textWidth = bounds.width - textX - MapMetrics.horizontalPadding
+        let trailingPadding =
+            isResource ? MapMetrics.horizontalPadding : MapMetrics.textTrailingPadding(at: bounds.height)
+        let textWidth = bounds.width - textX - trailingPadding
         let titleHeight =
             isResource
             ? bounds.height - MapMetrics.resourceDetailHeight - MapMetrics.verticalPadding * 2 : bounds.height

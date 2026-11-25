@@ -38,6 +38,7 @@ Defined in `Sources/MindMapCore/Layout.swift`, in `MapMetrics`. Sizes are world-
 | `resourceIconSize` / `resourceIconGap` | 28 / 8 pt | Leading resource icon tile and space between the tile and the text |
 | `maximumTextHeight` | 144 pt | Maximum nonediting text preview height |
 | `horizontalPadding` / `verticalPadding` | 12 / 8 pt | Topic content insets |
+| `cappedTextTrailingPadding` | 20 pt | Trailing inset at the text height limit, with room for a native vertical scrollbar |
 | `horizontalGap` / `verticalGap` | 64 / 16 pt | Parent-to-child and sibling-subtree separation |
 | `rootGap` | 64 pt | Separation when adding a root after an existing tree |
 
@@ -102,7 +103,7 @@ Place hidden Agent status beside the outermost collapsed branch that contains ea
 
 Resource cards use a leading SF Symbol on a tertiary system fill. Use the folder, branching arrows, and terminal symbols for projects, worktrees, and agents. A Git Project shows its current branch beneath its name. A bound folder without Git shows its name centered beside the icon. An unbound Project keeps its Draft label. Worktree cards show their branch and directory name. The enclosing Project or parent Worktree identifies a new checkout’s source. Hide the symbols with the text at overview zoom. Keep the popover anchored to the node at system control size. Close or Keep Draft keeps a new draft available to complete later. A new Worktree has a focused name field inside its card, with the generated branch name as the placeholder. Tab accepts the name. Return or leaving the field creates the checkout. Keep the terminal at its own text size inside the board window.
 
-Lay out the native text editor in world coordinates at the canvas font size and scale the editor view with the camera. Use the draft dimensions to lay out the tree, including neighboring topics and connectors, as text changes. Keep the editor clipped to the space the current tree layout has assigned, including while a new layout is pending. Preserve the viewport when committing an inline text edit. Reserve space for empty and trailing lines so the insertion point stays visible. Scroll overflowing text within the topic. Keep native caret, selection, and input-method geometry in the same text-container coordinate system.
+Lay out the native text editor in world coordinates at the canvas font size and scale the editor view with the camera. Use the draft dimensions to lay out the tree, including neighboring topics and connectors, as text changes. Keep the editor clipped to the space the current tree layout has assigned, including while a new layout is pending. Preserve the viewport when committing an inline text edit. Reserve space for empty and trailing lines so the insertion point stays visible. Scroll overflowing text within the topic and reserve the same trailing inset in the editor and preview. Keep native caret, selection, and input-method geometry in the same text-container coordinate system.
 
 The Agent terminal opens to the right of the canvas at half the board width. Keep its controls in the pane header, with icon buttons and help labels so they fit at the minimum window size. The divider adjusts the two pane widths without changing the terminal font size.
 

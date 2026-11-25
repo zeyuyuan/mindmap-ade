@@ -18,11 +18,7 @@ actor TextLayoutService {
         draft: (id: UUID, size: CGSize, baseline: MapLayout?)? = nil
     ) throws -> MapLayout {
         if let draft, let baseline = draft.baseline {
-            // The board revision and visible branches match, so every other topic keeps its measured size.
-            var metrics = baseline.nodes.mapValues { $0.frame.size }
-            metrics[draft.id] = draft.size
-            try Task.checkCancellation()
-            return TreeLayout.make(board: board, sizes: metrics, expandedAncestors: expandedAncestors)
+            return try TreeLayout.resizing(draft.id, to: draft.size, in: baseline, parents: board.parents)
         }
         let roots = Set(board.roots.map(\.id))
         var metrics: [UUID: CGSize] = [:]
@@ -83,13 +79,15 @@ actor TextLayoutService {
 
     nonisolated static func topicSize(for string: NSAttributedString) -> CGSize {
         let measured = measureText(includingFinalEmptyLine(in: string))
+        let height = max(
+            MapMetrics.minimumNodeHeight,
+            min(MapMetrics.maximumTextHeight, ceil(measured.height)) + MapMetrics.verticalPadding * 2)
         return CGSize(
             width: max(
                 MapMetrics.minimumNodeWidth,
-                min(MapMetrics.maximumTextWidth, ceil(measured.width)) + MapMetrics.horizontalPadding * 2),
-            height: max(
-                MapMetrics.minimumNodeHeight,
-                min(MapMetrics.maximumTextHeight, ceil(measured.height)) + MapMetrics.verticalPadding * 2))
+                min(MapMetrics.maximumTextWidth, ceil(measured.width)) + MapMetrics.horizontalPadding
+                    + MapMetrics.textTrailingPadding(at: height)),
+            height: height)
     }
 
     nonisolated static func includingFinalEmptyLine(in string: NSAttributedString) -> NSAttributedString {

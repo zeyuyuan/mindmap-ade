@@ -101,6 +101,51 @@ import Testing
     #expect(camera.scale == 4)
 }
 
+@Test func resizingATopicMatchesAFullLayoutAcrossBranchesAndFolds() throws {
+    var board = MindMapBoard(root: MapNode(text: "Root"))
+    var ids = [try #require(board.roots.first?.id)]
+    for index in 0..<96 {
+        let parent = index == 12 || index == 60 ? nil : ids[index / 4]
+        let position = CGPoint(x: CGFloat(index) * 20 + 0.4, y: CGFloat(index) * 17 + 0.25)
+        let inserted = try #require(board.inserting(text: "\(index)", parent: parent, position: position))
+        board.apply(inserted.edit)
+        ids.append(inserted.id)
+    }
+    for id in [ids[1], ids[2], ids[12]] { board.apply(try #require(board.togglingCollapse(id))) }
+    let expanded: Set<UUID> = [ids[1]]
+    let sizes = Dictionary(
+        uniqueKeysWithValues: ids.enumerated().map { index, id in
+            (id, CGSize(width: 96 + 7 * (index % 9), height: 36 + 16 * (index % 8)))
+        })
+    let baseline = TreeLayout.make(board: board, sizes: sizes, expandedAncestors: expanded)
+    for id in baseline.orderedIDs {
+        let oldSize = try #require(sizes[id])
+        for size in [
+            CGSize(width: 244, height: oldSize.height), CGSize(width: oldSize.width, height: 144),
+            CGSize(width: 96, height: 36),
+        ] {
+            let result = try TreeLayout.resizing(id, to: size, in: baseline, parents: board.parents)
+            var nextSizes = sizes
+            nextSizes[id] = size
+            let rebuilt = TreeLayout.make(board: board, sizes: nextSizes, expandedAncestors: expanded)
+            #expect(result.orderedIDs == rebuilt.orderedIDs)
+            #expect(result.roots == rebuilt.roots)
+            func matches(_ a: CGRect, _ b: CGRect) -> Bool {
+                abs(a.minX - b.minX) < 0.0001 && abs(a.minY - b.minY) < 0.0001
+                    && abs(a.maxX - b.maxX) < 0.0001 && abs(a.maxY - b.maxY) < 0.0001
+            }
+            #expect(matches(result.bounds, rebuilt.bounds))
+            for (id, expected) in rebuilt.nodes {
+                let actual = try #require(result.nodes[id])
+                #expect(matches(actual.frame, expected.frame))
+                #expect(matches(actual.subtreeBounds, expected.subtreeBounds))
+                #expect(actual.children == expected.children)
+                #expect(actual.descendantCount == expected.descendantCount)
+            }
+        }
+    }
+}
+
 @Test func archiveRoundTripsAndRejectsBrokenGraphs() throws {
     let board = MindMapBoard(name: "Persistence")
     let archive = WorkspaceArchive(boards: [board], cameras: [board.id: MapCamera(scale: 1.5)])

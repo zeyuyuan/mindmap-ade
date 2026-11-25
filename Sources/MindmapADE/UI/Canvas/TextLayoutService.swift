@@ -14,8 +14,12 @@ actor TextLayoutService {
     private var sizes: [Key: CGSize] = [:]
 
     func layout(
-        board: MindMapBoard, regularFont: String, rootFont: String, expandedAncestors: Set<UUID> = []
+        board: MindMapBoard, regularFont: String, rootFont: String, expandedAncestors: Set<UUID> = [],
+        draft: (id: UUID, size: CGSize, baseline: MapLayout?)? = nil
     ) throws -> MapLayout {
+        if let draft, let baseline = draft.baseline {
+            return try TreeLayout.resizing(draft.id, to: draft.size, in: baseline, parents: board.parents)
+        }
         let roots = Set(board.roots.map(\.id))
         var metrics: [UUID: CGSize] = [:]
         var pending = board.roots.map(\.id)
@@ -23,6 +27,10 @@ actor TextLayoutService {
             try Task.checkCancellation()
             guard let node = board.nodes[id] else { continue }
             pending.append(contentsOf: node.displayedChildren(expandedAncestors: expandedAncestors))
+            if let draft, draft.id == id {
+                metrics[id] = draft.size
+                continue
+            }
             let key = Key(
                 text: node.title,
                 fontName: roots.contains(node.id) || node.content.kind != .text ? rootFont : regularFont,
@@ -46,25 +54,53 @@ actor TextLayoutService {
             string: key.text,
             attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
         )
+        let size: CGSize
+        if key.resource {
+            size = CGSize(
+                width: max(
+                    MapMetrics.resourceMinimumWidth,
+                    ceil(Self.measureText(string).width) + MapMetrics.horizontalPadding * 2
+                        + MapMetrics.resourceIconInset),
+                height: MapMetrics.resourceHeight)
+        } else {
+            size = Self.topicSize(for: string)
+        }
+        sizes[key] = size
+        return size
+    }
+
+    nonisolated private static func measureText(_ string: NSAttributedString) -> CGSize {
         let framesetter = CTFramesetterCreateWithAttributedString(string)
-        let measured = CTFramesetterSuggestFrameSizeWithConstraints(
+        return CTFramesetterSuggestFrameSizeWithConstraints(
             framesetter, CFRange(location: 0, length: 0), nil,
             CGSize(width: MapMetrics.maximumTextWidth, height: .greatestFiniteMagnitude), nil
         )
-        let size = CGSize(
+    }
+
+    nonisolated static func topicSize(for string: NSAttributedString) -> CGSize {
+        let measured = measureText(includingFinalEmptyLine(in: string))
+        let height = max(
+            MapMetrics.minimumNodeHeight,
+            min(MapMetrics.maximumTextHeight, ceil(measured.height)) + MapMetrics.verticalPadding * 2)
+        return CGSize(
             width: max(
-                key.resource ? MapMetrics.resourceMinimumWidth : MapMetrics.minimumNodeWidth,
-                ceil(measured.width) + MapMetrics.horizontalPadding * 2
-                    + (key.resource ? MapMetrics.resourceIconInset : 0)
-            ),
-            height: key.resource
-                ? MapMetrics.resourceHeight
-                : max(
-                    MapMetrics.minimumNodeHeight,
-                    min(MapMetrics.maximumTextHeight, ceil(measured.height)) + MapMetrics.verticalPadding * 2
-                )
-        )
-        sizes[key] = size
-        return size
+                MapMetrics.minimumNodeWidth,
+                min(MapMetrics.maximumTextWidth, ceil(measured.width)) + MapMetrics.horizontalPadding
+                    + MapMetrics.textTrailingPadding(at: height)),
+            height: height)
+    }
+
+    nonisolated static func includingFinalEmptyLine(in string: NSAttributedString) -> NSAttributedString {
+        switch string.string.utf16.last {
+        case 0x000A, 0x000D, 0x0085, 0x2028, 0x2029:
+            // Core Text omits the final empty line unless there is a character after the break.
+            let padded = NSMutableAttributedString(attributedString: string)
+            padded.append(
+                NSAttributedString(
+                    string: "\u{200B}", attributes: string.attributes(at: string.length - 1, effectiveRange: nil)))
+            return padded
+        default:
+            return string
+        }
     }
 }

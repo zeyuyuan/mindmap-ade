@@ -50,6 +50,10 @@ final class TopicLayer {
         disclosureLayer.addSublayer(disclosureCount.layer)
     }
 
+    func displayTitleIfNeeded() {
+        if !text.layer.isHidden { text.layer.displayIfNeeded() }
+    }
+
     func configure(
         node: MapNode, descendantCount: Int, isCollapsed: Bool, root: Bool, selected: Bool,
         scale: CGFloat, contentsScale: CGFloat, runtimeDetail: String?, resourceIcon: CGImage?, isEditingTitle: Bool,
@@ -73,14 +77,16 @@ final class TopicLayer {
         }
         let bounds = layer.bounds
         let textX = MapMetrics.horizontalPadding + (isResource ? MapMetrics.resourceIconInset : 0)
-        let textWidth = bounds.width - textX - MapMetrics.horizontalPadding
+        let trailingPadding =
+            isResource ? MapMetrics.horizontalPadding : MapMetrics.textTrailingPadding(at: bounds.height)
+        let textWidth = bounds.width - textX - trailingPadding
         let titleHeight =
             isResource
             ? bounds.height - MapMetrics.resourceDetailHeight - MapMetrics.verticalPadding * 2 : bounds.height
         let titlePadding = CGSize(width: textX, height: isResource ? 0 : MapMetrics.verticalPadding)
         text.configure(
             attributedTitle, size: CGSize(width: textWidth, height: titleHeight),
-            contentsScale: contentsScale, padding: titlePadding)
+            contentsScale: contentsScale, padding: titlePadding, followsEditorLayout: !isResource)
         let hidesText = scale < CanvasStyle.textDetailScale
         text.layer.isHidden = hidesText || isEditingTitle
         configureIcon(resourceIcon)
@@ -114,7 +120,9 @@ final class TopicLayer {
         }
         layer.borderColor =
             (selected ? NSColor.controlAccentColor : root ? NSColor.secondaryLabelColor : .separatorColor).cgColor
-        layer.borderWidth = (selected ? CanvasStyle.selectedBorderWidth : CanvasStyle.borderWidth) / max(scale, 0.5)
+        layer.borderWidth =
+            isEditingTitle && !isResource
+            ? 0 : (selected ? CanvasStyle.selectedBorderWidth : CanvasStyle.borderWidth) / max(scale, 0.5)
         let hidesDisclosure = node.children.isEmpty || scale < CanvasStyle.textDetailScale
         disclosureLayer.isHidden = hidesDisclosure
         disclosureGlyph.isHidden = hidesDisclosure || isCollapsed
@@ -190,12 +198,13 @@ final class TopicLayer {
             contentsScale: contentsScale, padding: CGSize(width: padding, height: 0))
     }
 
-    func configureBackground(isActiveAgent: Bool, editDeadline: ContinuousClock.Instant?, now: ContinuousClock.Instant)
-    {
+    func configureBackground(
+        showsCard: Bool, isActiveAgent: Bool, editDeadline: ContinuousClock.Instant?, now: ContinuousClock.Instant
+    ) {
         let background = isActiveAgent ? CanvasStyle.activeAgentBackground : .controlBackgroundColor
-        let normalColor = background.cgColor
+        let normalColor = showsCard ? background.cgColor : nil
         if layer.backgroundColor != normalColor { layer.backgroundColor = normalColor }
-        guard let editDeadline, editDeadline > now else {
+        guard showsCard, let editDeadline, editDeadline > now else {
             if agentEditDeadline != nil {
                 layer.removeAnimation(forKey: Self.agentEditFadeKey)
                 agentEditDeadline = nil
@@ -323,10 +332,14 @@ final class MapRenderer {
         return resourceIconImages
     }
 
+    func displayTitleIfNeeded(for id: UUID) {
+        topics[id]?.displayTitleIfNeeded()
+    }
+
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
-        runtimeDetails: [UUID: String] = [:], editingTitleID: UUID? = nil, activeAgentID: UUID? = nil,
+        runtimeDetails: [UUID: String] = [:], editingTitleIDs: Set<UUID> = [], activeAgentID: UUID? = nil,
         agentEditedTopics: [UUID: ContinuousClock.Instant] = [:], focusedTopics: Set<UUID>? = nil,
         agentSummaries: [UUID: AgentBranchSummary] = [:]
     ) {
@@ -399,6 +412,7 @@ final class MapRenderer {
                 topic.layer.opacity = focusedTopics?.contains(id) == false ? CanvasStyle.unfocusedBranchOpacity : 1
             }
             let kind = node.content.kind
+            let isEditingTitle = editingTitleIDs.contains(id)
             let isActiveAgent = kind == .agent && id == activeAgentID
             if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
                 icons = resourceIcons(contentsScale: contentsScale)
@@ -409,9 +423,11 @@ final class MapRenderer {
                 selected: selection.contains(id),
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
                 resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
-                isEditingTitle: editingTitleID == id, agentSummary: agentSummaries[id]
+                isEditingTitle: isEditingTitle, agentSummary: agentSummaries[id]
             )
-            topic.configureBackground(isActiveAgent: isActiveAgent, editDeadline: agentEditedTopics[id], now: now)
+            topic.configureBackground(
+                showsCard: !isEditingTitle || kind != .text, isActiveAgent: isActiveAgent,
+                editDeadline: agentEditedTopics[id], now: now)
         }
 
         // Query edges separately: a connector can cross the viewport while both endpoints are outside it.

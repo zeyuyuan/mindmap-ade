@@ -14,10 +14,15 @@ public enum MapMetrics {
     public static let resourceIconInset = resourceIconSize + resourceIconGap
     public static let maximumTextHeight: CGFloat = 144
     public static let horizontalPadding: CGFloat = 12
+    public static let cappedTextTrailingPadding: CGFloat = 20
     public static let verticalPadding: CGFloat = 8
     public static let horizontalGap: CGFloat = 64
     public static let verticalGap: CGFloat = 16
     public static let rootGap: CGFloat = 64
+
+    public static func textTrailingPadding(at height: CGFloat) -> CGFloat {
+        height >= maximumTextHeight + verticalPadding * 2 ? cappedTextTrailingPadding : horizontalPadding
+    }
 }
 
 public struct PlacedNode: Sendable {
@@ -113,16 +118,10 @@ public enum TreeLayout {
             let total =
                 children.reduce(CGFloat.zero) { $0 + (heights[$1] ?? fallback.height) }
                 + CGFloat(max(0, children.count - 1)) * MapMetrics.verticalGap
-            var y = frame.midY - total / 2
-            for child in children {
-                let size = sizes[child] ?? fallback
-                let height = heights[child] ?? size.height
-                frames[child] = CGRect(
-                    x: frame.maxX + MapMetrics.horizontalGap, y: y + (height - size.height) / 2,
-                    width: size.width, height: size.height
-                )
-                y += height + MapMetrics.verticalGap
-            }
+            placeChildren(
+                children, of: frame, totalHeight: total,
+                size: { sizes[$0] ?? fallback }, span: { heights[$0] ?? fallback.height },
+                place: { frames[$0] = $1 })
         }
 
         var placed: [UUID: PlacedNode] = [:]
@@ -143,6 +142,113 @@ public enum TreeLayout {
             nodes: placed, orderedIDs: traversal.map { $0.0 }, roots: board.roots,
             bounds: bounds.isNull ? .zero : bounds
         )
+    }
+
+    /// Reuse the visible topology and move only the parts affected by one topic's new size.
+    public static func resizing(
+        _ id: UUID, to size: CGSize, in baseline: MapLayout, parents: [UUID: UUID]
+    ) throws -> MapLayout {
+        try Task.checkCancellation()
+        guard let topic = baseline.nodes[id], topic.frame.size != size,
+            let root = baseline.nodes[topic.rootID]
+        else { return baseline }
+
+        // A subtree's allocated height is the greater of its topic and its centered child stack.
+        func childStackHeight(_ node: PlacedNode) -> CGFloat {
+            guard let first = node.children.first.flatMap({ baseline.nodes[$0] }),
+                let last = node.children.last.flatMap({ baseline.nodes[$0] })
+            else { return 0 }
+            return last.subtreeBounds.maxY - first.subtreeBounds.minY
+        }
+
+        var spans: [UUID: CGFloat] = [:]
+        var pathChildren: [UUID: UUID] = [:]
+        var path = [id]
+        var childDelta: CGFloat = 0
+        while let current = path.last, let node = baseline.nodes[current] {
+            let span = max(current == id ? size.height : node.frame.height, childStackHeight(node) + childDelta)
+            spans[current] = span
+            childDelta = span - node.subtreeBounds.height
+            guard let parent = parents[current], baseline.nodes[parent] != nil else { break }
+            pathChildren[parent] = current
+            path.append(parent)
+        }
+
+        func topicSize(_ idInTree: UUID) -> CGSize {
+            idInTree == id ? size : baseline.nodes[idInTree]?.frame.size ?? .zero
+        }
+        var result = baseline
+        var pending = [(root.id, CGRect(origin: root.frame.origin, size: topicSize(root.id)))]
+        while let (current, frame) = pending.popLast(), let old = baseline.nodes[current] {
+            try Task.checkCancellation()
+            let dx = frame.minX - old.frame.minX
+            let dy = frame.minY - old.frame.minY
+            if spans[current] == nil {
+                guard dx != 0 || dy != 0 else { continue }
+                result.nodes[current] = PlacedNode(
+                    id: old.id, rootID: old.rootID, frame: frame,
+                    subtreeBounds: old.subtreeBounds.offsetBy(dx: dx, dy: dy),
+                    depth: old.depth, children: old.children, descendantCount: old.descendantCount)
+                for childID in old.children {
+                    if let child = baseline.nodes[childID] {
+                        pending.append((childID, child.frame.offsetBy(dx: dx, dy: dy)))
+                    }
+                }
+                continue
+            }
+
+            let pathChild = pathChildren[current].flatMap { baseline.nodes[$0] }
+            let spanDelta = pathChild.map { (spans[$0.id] ?? 0) - $0.subtreeBounds.height } ?? 0
+            result.nodes[current] = PlacedNode(
+                id: old.id, rootID: old.rootID, frame: frame, subtreeBounds: frame,
+                depth: old.depth, children: old.children, descendantCount: old.descendantCount)
+            if frame.maxX != old.frame.maxX || frame.midY != old.frame.midY || spanDelta != 0 {
+                placeChildren(
+                    old.children, of: frame, totalHeight: childStackHeight(old) + spanDelta, size: topicSize,
+                    span: { spans[$0] ?? baseline.nodes[$0]?.subtreeBounds.height ?? 0 },
+                    place: { pending.append(($0, $1)) })
+            } else if let child = pathChild {
+                let childSize = topicSize(child.id)
+                pending.append(
+                    (
+                        child.id,
+                        CGRect(
+                            x: child.frame.minX, y: child.frame.midY - childSize.height / 2,
+                            width: childSize.width, height: childSize.height)
+                    ))
+            }
+        }
+
+        for id in path {
+            try Task.checkCancellation()
+            guard let node = result.nodes[id] else { continue }
+            let bounds = node.children.reduce(node.frame) { bounds, child in
+                result.nodes[child].map { bounds.union($0.subtreeBounds) } ?? bounds
+            }
+            result.nodes[id] = PlacedNode(
+                id: id, rootID: node.rootID, frame: node.frame, subtreeBounds: bounds,
+                depth: node.depth, children: node.children, descendantCount: node.descendantCount)
+        }
+        let bounds = result.roots.compactMap { result.nodes[$0.id]?.subtreeBounds }.reduce(CGRect.null) { $0.union($1) }
+        result.bounds = bounds.isNull ? .zero : bounds
+        return result
+    }
+
+    private static func placeChildren(
+        _ children: [UUID], of parent: CGRect, totalHeight: CGFloat,
+        size: (UUID) -> CGSize, span: (UUID) -> CGFloat, place: (UUID, CGRect) -> Void
+    ) {
+        var y = parent.midY - totalHeight / 2
+        for child in children {
+            let size = size(child)
+            let height = span(child)
+            place(
+                child,
+                CGRect(
+                    x: parent.maxX + MapMetrics.horizontalGap, y: y + (height - size.height) / 2,
+                    width: size.width, height: size.height))
+            y += height + MapMetrics.verticalGap
+        }
     }
 }
 

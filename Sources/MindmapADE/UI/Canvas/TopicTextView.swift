@@ -1,10 +1,9 @@
 import AppKit
-import CoreText
 
 final class TopicTextView: NSTextView {
     struct ContentLayout {
         let height: CGFloat
-        let visualBounds: CGRect
+        let lineCount: Int
     }
 
     private let editingUndo = UndoManager()
@@ -20,45 +19,29 @@ final class TopicTextView: NSTextView {
 
     func measureContent() -> ContentLayout {
         guard let manager = textLayoutManager, let range = manager.textContentManager?.documentRange else {
-            return ContentLayout(height: 0, visualBounds: .null)
+            return ContentLayout(height: 0, lineCount: 0)
         }
-        var visualBounds = CGRect.null
+        var lineCount = 0
         manager.enumerateTextLayoutFragments(
             from: range.location, options: [.ensuresLayout, .ensuresExtraLineFragment]
         ) {
             fragment in
-            for line in fragment.textLineFragments {
-                let lineOrigin = CGPoint(
-                    x: fragment.layoutFragmentFrame.minX + line.typographicBounds.minX,
-                    y: fragment.layoutFragmentFrame.minY + line.typographicBounds.minY)
-                let attributed = line.attributedString.attributedSubstring(from: line.characterRange)
-                let coreLine = CTLineCreateWithAttributedString(attributed)
-                let ink = CTLineGetBoundsWithOptions(coreLine, [.useGlyphPathBounds])
-                let bounds: CGRect
-                if ink.isEmpty || ink.isNull {
-                    // Empty and trailing lines still need room for the native insertion point.
-                    bounds = line.typographicBounds.offsetBy(
-                        dx: fragment.layoutFragmentFrame.minX, dy: fragment.layoutFragmentFrame.minY)
-                } else {
-                    bounds = CGRect(
-                        x: lineOrigin.x + line.glyphOrigin.x + ink.minX,
-                        y: lineOrigin.y + line.glyphOrigin.y - ink.maxY,
-                        width: ink.width, height: ink.height)
-                }
-                visualBounds = visualBounds.union(bounds)
-            }
+            lineCount += fragment.textLineFragments.count
             return true
         }
 
-        return ContentLayout(height: manager.usageBoundsForTextContainer.maxY, visualBounds: visualBounds)
+        return ContentLayout(height: manager.usageBoundsForTextContainer.maxY, lineCount: lineCount)
     }
 
     @discardableResult
-    func centerContentVertically(using layout: ContentLayout, in viewportHeight: CGFloat, padding: CGFloat) -> Bool {
+    func positionContent(
+        using layout: ContentLayout, in viewportHeight: CGFloat, topicHeight: CGFloat, padding: CGFloat
+    ) -> Bool {
         let documentHeight = max(viewportHeight, ceil(layout.height + padding * 2))
         if frame.height != documentHeight { setFrameSize(NSSize(width: frame.width, height: documentHeight)) }
         let fits = layout.height + padding * 2 <= viewportHeight
-        let originY = fits && !layout.visualBounds.isNull ? viewportHeight / 2 - layout.visualBounds.midY : padding
+        // Center the native line box, including the empty line that holds the initial caret.
+        let originY = fits && layout.lineCount == 1 ? (topicHeight - layout.height) / 2 : padding
         if centeredOriginY != originY {
             centeredOriginY = originY
             invalidateTextContainerOrigin()

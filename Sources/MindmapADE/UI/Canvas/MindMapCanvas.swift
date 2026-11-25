@@ -37,6 +37,14 @@ final class NativeNodeHostView: NSView {
     }
 }
 
+private final class TopicEditorBackdrop: NSView {
+    var acceptsInput = true
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        acceptsInput ? super.hitTest(point) : nil
+    }
+}
+
 final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, NSUserInterfaceValidations,
     NSPopoverDelegate
 {
@@ -49,20 +57,23 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private let layoutService = TextLayoutService()
     private var layoutTask: Task<Void, Never>?
     private var appliedRevision = -1
-    private var renderedLayout: LayoutRequest?
+    private var presentation: LayoutPresentation?
+    private var savedLayout: (request: LayoutRequest, layout: MapLayout)?
     private var requestedLayout: LayoutRequest?
     private var expandedAncestors = Set<UUID>()
     private var jumpAfterLayout: UUID?
     private var branchFocus: BranchFocus?
     private var pendingFit = false
-    private var mapLayout = MapLayout.empty
+    private var mapLayout: MapLayout { presentation?.layout ?? .empty }
     private var renderer: MapRenderer!
     private let nativeHost = NativeNodeHostView()
     private var camera = MapCamera()
     private var hasCamera = false
     private(set) var selected = Set<UUID>()
-    private var editor: TopicTextView?
-    private var worktreeNameField: NSTextField?
+    private var edit: InlineEdit?
+    private var editingID: UUID? { edit?.id }
+    private var editor: TopicTextView? { edit?.topic?.view }
+    private var worktreeNameField: NSTextField? { edit?.worktreeField }
     private var pendingWorktreeCreations = Set<NodeAddress>()
     private var editingTextView: NSTextView? {
         editor ?? (worktreeNameField?.currentEditor() as? NSTextView)
@@ -78,14 +89,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var agentRunStates: [UUID: AgentRun.State] = [:]
     private var agentSummaries: [UUID: AgentBranchSummary] = [:]
     private var agentSummaryReach: CGFloat = 0
-    private var editorScroll: NSScrollView?
-    private var editorBackdrop: NSView?
-    private var provisionalEditFrame: CGRect?
+    private var committedEditors: [UUID: CommittedEditor] = [:]
     private var revealAfterLayout: UUID?
     private var revealAfterTerminalResize: UUID?
-    private var editingID: UUID?
-    private var editingToken: UUID?
-    private var originalText = ""
     private var finishingEdit = false
     private var contextPoint = CGPoint.zero
     private var tracking: NSTrackingArea?
@@ -102,6 +108,71 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private struct LayoutRequest: Equatable {
         let revision: Int
         let expandedAncestors: Set<UUID>
+        let draft: DraftGeometry?
+
+        func isAnotherFrameOfSameEdit(as other: Self) -> Bool {
+            revision == other.revision && expandedAncestors == other.expandedAncestors
+                && draft != nil && draft?.editID == other.draft?.editID
+        }
+    }
+
+    private struct DraftGeometry: Equatable {
+        let id: UUID
+        let editID: UUID
+        let size: CGSize
+    }
+
+    private struct InlineEdit {
+        enum Input {
+            case topic(TopicEditor)
+            case worktree(NSTextField)
+        }
+
+        let id: UUID
+        let token: UUID?
+        let generation = UUID()
+        let originalText: String
+        let input: Input
+        var draft: DraftGeometry?
+
+        var topic: TopicEditor? {
+            if case .topic(let editor) = input { return editor }
+            return nil
+        }
+
+        var worktreeField: NSTextField? {
+            if case .worktree(let field) = input { return field }
+            return nil
+        }
+    }
+
+    private final class TopicEditor {
+        let view: TopicTextView
+        let scroll: NSScrollView
+        let backdrop: TopicEditorBackdrop
+        let provisionalFrame: CGRect
+        var draftSize: CGSize
+
+        init(view: TopicTextView, scroll: NSScrollView, backdrop: TopicEditorBackdrop, frame: CGRect) {
+            self.view = view
+            self.scroll = scroll
+            self.backdrop = backdrop
+            provisionalFrame = frame
+            draftSize = frame.size
+        }
+    }
+
+    private struct LayoutPresentation {
+        let request: LayoutRequest
+        var board: MindMapBoard
+        let layout: MapLayout
+    }
+
+    private struct CommittedEditor {
+        let backdrop: TopicEditorBackdrop
+        let worldFrame: CGRect
+        let bounds: CGRect
+        let text: String
     }
 
     private struct BranchFocus {
@@ -111,7 +182,15 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private var layoutRequest: LayoutRequest {
-        LayoutRequest(revision: session.layoutRevision, expandedAncestors: expandedAncestors)
+        LayoutRequest(revision: session.layoutRevision, expandedAncestors: expandedAncestors, draft: edit?.draft)
+    }
+
+    private var renderedLayout: LayoutRequest? { presentation?.request }
+
+    private var displayedBoard: MindMapBoard {
+        // Camera and selection redraws can run while a new layout is being measured.
+        if let presentation, presentation.request.revision != session.layoutRevision { return presentation.board }
+        return session.board
     }
 
     private enum EditingCompletion {
@@ -173,7 +252,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(session: BoardSession, revision: Int) {
+    func update(session: BoardSession, revision: Int, refreshingLayout: Bool = false) {
         if self.session !== session {
             if pointerGesture != nil { resetPointerGesture() }
             closeNodeForm()
@@ -182,69 +261,82 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             revealAfterLayout = nil
             jumpAfterLayout = nil
             finishEditing(restoringFocus: false)
+            clearCommittedEditors()
             persistCamera()
             self.session = session
             actions?.hint = EditorActions.defaultHint
             branchFocus = nil
             expandedAncestors.removeAll()
             appliedRevision = -1
-            renderedLayout = nil
+            presentation = nil
+            savedLayout = nil
             requestedLayout = nil
             pendingFit = false
-            mapLayout = .empty
             activeAgentID = nil
             agentEditedTopics.removeAll()
             agentRunStates.removeAll()
+            refreshAgentSummaries()
             camera = workspace?.cameras[session.id] ?? MapCamera()
             hasCamera = workspace?.cameras[session.id] != nil
             selected = workspace?.selections[session.id] ?? Set(session.board.roots.prefix(1).map(\.id))
             accessibilityNodes.removeAll()
             accessibilityDisclosures.removeAll()
             accessibilityAgentSummaries.removeAll()
+            render()
         }
         actions?.canvas = self
         if let address = formAddress, session.board.nodes[address.nodeID] == nil { closeNodeForm() }
         if worktreeNameField != nil, let editingID, session.board.nodes[editingID]?.worktreeCreationDraft == nil {
             finishEditing(.cancel)
         }
-        guard appliedRevision != revision else { return }
+        guard appliedRevision != revision || refreshingLayout else { return }
         appliedRevision = revision
         if renderedLayout?.revision != session.layoutRevision {
             expandedAncestors = expandedAncestors.filter { session.board.nodes[$0]?.isCollapsed == true }
-            if let root = branchFocus?.root {
-                if session.board.nodes[root] != nil {
-                    branchFocus?.topics = session.board.descendants(of: root)
-                } else {
-                    endBranchFocus()
-                }
-            }
-            refreshAgentSummaries()
-        }
-        if renderedLayout == layoutRequest {
-            render()
-            updateActions()
-            return
         }
         requestLayout()
+        if renderedLayout == layoutRequest || refreshingLayout {
+            render()
+            updateActions()
+        }
     }
 
     private func requestLayout() {
         let request = layoutRequest
+        if renderedLayout == request {
+            if requestedLayout != nil {
+                layoutTask?.cancel()
+                requestedLayout = nil
+            }
+            return
+        }
         guard requestedLayout != request else { return }
+        if let requestedLayout, requestedLayout.isAnotherFrameOfSameEdit(as: request) { return }
         requestedLayout = request
         layoutTask?.cancel()
+        let session = self.session
         let board = session.board
         let regular = CanvasStyle.font(root: false).fontName
         let root = CanvasStyle.font(root: true).fontName
+        let baseline =
+            savedLayout?.request.revision == request.revision
+                && savedLayout?.request.expandedAncestors == request.expandedAncestors
+            ? savedLayout?.layout : nil
         layoutTask = Task { [weak self, layoutService] in
             do {
                 let result = try await layoutService.layout(
-                    board: board, regularFont: regular, rootFont: root, expandedAncestors: request.expandedAncestors)
-                guard let self, !Task.isCancelled, self.session === session,
-                    self.layoutRequest == request
-                else { return }
-                self.mapLayout = result
-                self.renderedLayout = request
+                    board: board, regularFont: regular, rootFont: root, expandedAncestors: request.expandedAncestors,
+                    draft: request.draft.map { ($0.id, $0.size, baseline) })
+                guard let self, !Task.isCancelled, self.session === session else { return }
+                self.requestedLayout = nil
+                let latest = self.layoutRequest
+                guard latest == request || latest.isAnotherFrameOfSameEdit(as: request) else { return }
+                let topologyChanged =
+                    self.renderedLayout?.revision != request.revision
+                    || self.renderedLayout?.expandedAncestors != request.expandedAncestors
+                self.presentation = LayoutPresentation(request: request, board: session.board, layout: result)
+                if request.draft == nil { self.savedLayout = (request, result) }
+                if topologyChanged { self.refreshAgentSummaries() }
                 if !self.selected.isEmpty {
                     self.selected.formIntersection(result.nodes.keys)
                     if self.selected.isEmpty, let first = self.session.board.roots.first {
@@ -252,14 +344,22 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                     }
                 }
                 self.initializeCameraIfNeeded()
+                if topologyChanged, let root = self.branchFocus?.root {
+                    if board.nodes[root] != nil {
+                        self.branchFocus?.topics = board.descendants(of: root)
+                    } else {
+                        self.endBranchFocus()
+                    }
+                }
                 if let id = self.jumpAfterLayout, let frame = result.nodes[id]?.frame {
                     self.centerTopic(frame)
                 } else {
-                    self.render()
                     self.positionEditor()
+                    self.render()
                 }
                 self.jumpAfterLayout = nil
-                if let id = self.editingID ?? self.revealAfterLayout, let frame = result.nodes[id]?.frame {
+                let worktreeBeingEdited = self.worktreeNameField == nil ? nil : self.editingID
+                if let id = worktreeBeingEdited ?? self.revealAfterLayout, let frame = result.nodes[id]?.frame {
                     self.reveal(frame)
                 }
                 self.revealAfterLayout = nil
@@ -272,10 +372,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                     self.pendingFit = false
                     self.fitContent()
                 }
+                if self.layoutRequest != request { self.requestLayout() }
             } catch is CancellationError {
             } catch {
-                self?.requestedLayout = nil
-                self?.actions?.hint = "The map could not be laid out."
+                guard let self, !Task.isCancelled, self.session === session else { return }
+                self.requestedLayout = nil
+                self.actions?.hint = "The map could not be laid out."
             }
         }
     }
@@ -284,6 +386,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         if pointerGesture != nil { resetPointerGesture() }
         closeNodeForm()
         finishEditing(.keepDraft)
+        clearCommittedEditors()
         persistCamera()
         layoutTask?.cancel()
         if actions?.canvas === self { actions?.canvas = nil }
@@ -332,16 +435,27 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private func render() {
         guard renderer != nil else { return }
+        if renderedLayout?.revision == session.layoutRevision { presentation?.board = session.board }
+        positionCommittedEditors()
+        let retiringEditors =
+            !committedEditors.isEmpty && renderedLayout?.revision == session.layoutRevision ? committedEditors : [:]
+        if !retiringEditors.isEmpty { committedEditors.removeAll() }
+        var editingTitleIDs = Set(committedEditors.keys)
+        if let editingID { editingTitleIDs.insert(editingID) }
         effectiveAppearance.performAsCurrentDrawingAppearance {
             renderer.render(
-                board: session.board, layout: mapLayout, camera: camera, viewport: bounds,
+                board: displayedBoard, layout: mapLayout, camera: camera, viewport: bounds,
                 selection: selected, backingScale: window?.backingScaleFactor ?? 2,
                 drag: pointerGesture?.branch?.preview,
-                runtimeDetails: runtimeDetails, editingTitleID: worktreeNameField == nil ? nil : editingID,
+                runtimeDetails: runtimeDetails, editingTitleIDs: editingTitleIDs,
                 activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics,
                 focusedTopics: branchFocus?.topics, agentSummaries: agentSummaries
             )
             renderer.showDropTarget(dropIndicator)
+            for (id, preview) in retiringEditors {
+                renderer.displayTitleIfNeeded(for: id)
+                preview.backdrop.removeFromSuperview()
+            }
         }
         updateAccessibility()
     }
@@ -368,7 +482,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private func refreshAgentSummaries() {
         agentSummaries = AgentBranchSummary.make(
-            states: agentRunStates, in: session.board, expandedAncestors: expandedAncestors)
+            states: agentRunStates, in: displayedBoard, expandedAncestors: renderedLayout?.expandedAncestors ?? [])
         agentSummaryReach = agentSummaries.values.map(\.width).max() ?? 0
         accessibilityRevision = -1
     }
@@ -426,9 +540,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             && !(editor?.string ?? node?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func changed() {
-        update(session: session, revision: session.revision)
-        updateActions()
+    private func changed(refreshingLayout: Bool = false) {
+        update(session: session, revision: session.revision, refreshingLayout: refreshingLayout)
+        if !refreshingLayout { updateActions() }
         guard let actions else { return }
         if let error = session.editError {
             actions.hint = error
@@ -531,7 +645,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         finishEditing()
         guard selected.count == 1, let id = selected.first else { return }
         if expandedAncestors.remove(id) != nil {
-            refreshAgentSummaries()
             requestLayout()
             return
         }
@@ -757,23 +870,23 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             if let token { workspace?.endEditing(nodeID: id, boardID: session.id, token: token) }
             return
         }
-        editingToken = token
-        provisionalEditFrame = frame
         selected = [id]
-        revealForEditing(frame)
+        let hasPlacement = mapLayout.nodes[id] != nil
+        if hasPlacement { revealForEditing(frame) }
         let text = TopicTextView(usingTextLayoutManager: true)
         text.isRichText = false
         text.importsGraphics = false
         text.allowsUndo = true
         text.isVerticallyResizable = true
         text.isHorizontallyResizable = false
+        text.textContainer?.widthTracksTextView = false
+        text.textContainer?.lineFragmentPadding = 0
+        text.textContainerInset = NSSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding)
         text.drawsBackground = true
         text.backgroundColor = .controlBackgroundColor
         text.textColor = .labelColor
         text.insertionPointColor = .controlAccentColor
-        text.font = NSFont.systemFont(
-            ofSize: MapMetrics.fontSize * camera.scale,
-            weight: session.board.roots.contains(where: { $0.id == id }) ? .semibold : .regular)
+        text.font = CanvasStyle.font(root: session.board.roots.contains(where: { $0.id == id }))
         text.string = node.text
         text.delegate = self
         text.setAccessibilityLabel("Topic text")
@@ -783,20 +896,19 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
         scroll.documentView = text
-        let backdrop = NSView()
+        let backdrop = TopicEditorBackdrop()
+        backdrop.alphaValue = hasPlacement ? 1 : 0
         backdrop.wantsLayer = true
         backdrop.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        backdrop.layer?.cornerRadius = CanvasStyle.nodeRadius * camera.scale
-        backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth
+        backdrop.layer?.cornerRadius = CanvasStyle.nodeRadius
         backdrop.layer?.borderColor = NSColor.controlAccentColor.cgColor
         backdrop.layer?.masksToBounds = true
         backdrop.addSubview(scroll)
-        editingID = id
-        originalText = node.text
-        editor = text
-        editorScroll = scroll
-        editorBackdrop = backdrop
+        edit = InlineEdit(
+            id: id, token: token, originalText: node.text,
+            input: .topic(TopicEditor(view: text, scroll: scroll, backdrop: backdrop, frame: frame)))
         nativeHost.addSubview(backdrop)
+        updateDraftSize()
         positionEditor()
         window?.makeFirstResponder(text)
         text.setSelectedRange(NSRange(location: text.string.utf16.count, length: 0))
@@ -828,10 +940,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         field.setAccessibilityHelp(
             "Tab accepts the suggested name. Press Return or leave the field to create the worktree.")
 
-        editingID = id
-        editingToken = token
-        originalText = draft.choice.branch
-        worktreeNameField = field
+        edit = InlineEdit(id: id, token: token, originalText: draft.choice.branch, input: .worktree(field))
         pendingFit = false
         selected = [id]
         nativeHost.addSubview(field)
@@ -853,6 +962,20 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         reveal(frame)
     }
 
+    private func updateDraftSize() {
+        guard let edit, let topic = edit.topic else { return }
+        let draft = NSAttributedString(
+            string: topic.view.string, attributes: [.font: topic.view.font ?? CanvasStyle.font(root: false)])
+        let size = TextLayoutService.topicSize(for: draft)
+        topic.draftSize = size
+        let savedSize = savedLayout?.layout.nodes[edit.id]?.frame.size ?? topic.provisionalFrame.size
+        let geometry = size == savedSize ? nil : DraftGeometry(id: edit.id, editID: edit.generation, size: size)
+        if edit.draft != geometry {
+            self.edit?.draft = geometry
+            requestLayout()
+        }
+    }
+
     private func positionEditor() {
         if let field = worktreeNameField, let id = editingID, let placement = mapLayout.nodes[id] {
             let scale = camera.scale
@@ -869,95 +992,131 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 width: max(1, frame.maxX - titleX - padding / 2), height: titleHeight)
             return
         }
-        guard let editor, let scroll = editorScroll, let backdrop = editorBackdrop, let id = editingID,
-            let worldFrame = mapLayout.nodes[id]?.frame ?? provisionalEditFrame
-        else { return }
-        let frame = viewRect(worldFrame)
-        let inset = NSSize(
-            width: MapMetrics.horizontalPadding * camera.scale, height: MapMetrics.verticalPadding * camera.scale)
-        editor.textContainerInset = inset
-        editor.textContainer?.lineFragmentPadding = 0
-        let measured = NSAttributedString(
-            string: editor.string.isEmpty ? " " : editor.string,
-            attributes: [.font: editor.font ?? CanvasStyle.font(root: false)]
-        ).boundingRect(
-            with: CGSize(width: MapMetrics.maximumTextWidth * camera.scale, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        )
-        let availableWidth = max(bounds.width - CanvasStyle.fitPadding * 2, MapMetrics.minimumNodeWidth)
-        let baseWidth = min(availableWidth, max(frame.width, ceil(measured.width) + inset.width * 2))
-        let availableHeight = max(CanvasStyle.editorMinimumHeight, bounds.height - CanvasStyle.fitPadding * 2)
-        let maximumHeight = min(availableHeight, CanvasStyle.editorMaximumHeight)
-
-        // Measure without a stale scrollbar gutter before deciding whether scrolling is needed.
-        scroll.hasVerticalScroller = false
-        scroll.frame = CGRect(x: 0, y: 0, width: baseWidth, height: maximumHeight)
-        scroll.tile()
-        editor.setFrameSize(NSSize(width: scroll.contentSize.width, height: maximumHeight))
-        let measuredTextWidth = max(scroll.contentSize.width - inset.width * 2, 1)
-        editor.textContainer?.containerSize = CGSize(
-            width: measuredTextWidth, height: .greatestFiniteMagnitude)
-        var content = editor.measureContent()
-        let height = min(
-            maximumHeight, max(frame.height, CanvasStyle.editorMinimumHeight, ceil(content.height + inset.height * 2)))
-        let needsScrolling = content.height + inset.height * 2 > height
-        let gutter =
-            needsScrolling && NSScroller.preferredScrollerStyle == .legacy
-            ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
-        let width = min(availableWidth, baseWidth + gutter)
-        backdrop.frame = CGRect(x: frame.minX, y: frame.minY, width: width, height: height)
+        guard let edit, let topic = edit.topic else { return }
+        let editor = topic.view
+        let scroll = topic.scroll
+        let backdrop = topic.backdrop
+        let placement = mapLayout.nodes[edit.id]
+        let worldFrame = placement?.frame ?? topic.provisionalFrame
+        let wasUnplaced = backdrop.alphaValue == 0
+        backdrop.alphaValue = placement == nil ? 0 : 1
+        if placement != nil, wasUnplaced { revealForEditing(worldFrame) }
+        // Scale the view after laying out the text at the canvas's base font size.
+        let inset = editor.textContainerInset
+        let draftSize = topic.draftSize
+        let availableWidth = max(bounds.width - fitPadding * 2, MapMetrics.minimumNodeWidth)
+        let availableHeight = max(
+            CanvasStyle.editorMinimumHeight, min(bounds.height - fitPadding * 2, CanvasStyle.editorMaximumHeight))
+        var editingScale = camera.scale
+        if worldFrame.width * editingScale > availableWidth {
+            editingScale =
+                availableWidth / (MapMetrics.maximumTextWidth + inset.width + MapMetrics.cappedTextTrailingPadding)
+        }
+        if worldFrame.height * editingScale > availableHeight {
+            editingScale = availableHeight / (MapMetrics.maximumTextHeight + inset.height * 2)
+        }
+        if editingScale < camera.scale {
+            camera.zoom(to: editingScale, around: camera.viewPoint(worldFrame.origin))
+            cameraChanged()
+            return
+        }
+        // Lay out at the final wrapping width, but clip to the space the tree has already assigned.
+        let textWidth = draftSize.width - inset.width - MapMetrics.textTrailingPadding(at: draftSize.height)
+        let textSize = CGSize(width: textWidth, height: .greatestFiniteMagnitude)
+        if editor.textContainer?.size != textSize { editor.textContainer?.size = textSize }
+        let content = editor.measureContent()
+        let needsScrolling = content.height + inset.height * 2 > worldFrame.height
+        backdrop.frame = viewRect(worldFrame)
+        backdrop.bounds = CGRect(origin: .zero, size: worldFrame.size)
+        backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth / max(editingScale, 0.5)
         scroll.hasVerticalScroller = needsScrolling
         scroll.frame = backdrop.bounds
         scroll.tile()
-        editor.setFrameSize(
-            NSSize(width: scroll.contentSize.width, height: max(height, content.height + inset.height * 2)))
-        let finalTextWidth = max(scroll.contentSize.width - inset.width * 2, 1)
-        if editor.textContainer?.containerSize.width != finalTextWidth {
-            editor.textContainer?.containerSize = CGSize(width: finalTextWidth, height: .greatestFiniteMagnitude)
+        let documentWidth = max(scroll.contentSize.width, inset.width + textWidth)
+        if editor.frame.width != documentWidth {
+            editor.setFrameSize(CGSize(width: documentWidth, height: editor.frame.height))
         }
-        if finalTextWidth != measuredTextWidth {
-            content = editor.measureContent()
-        }
-        if editor.centerContentVertically(using: content, in: scroll.contentSize.height, padding: inset.height) {
+        if editor.positionContent(
+            using: content, in: scroll.contentSize.height, topicHeight: worldFrame.height, padding: inset.height)
+        {
             scroll.contentView.scroll(to: .zero)
             scroll.reflectScrolledClipView(scroll.contentView)
         }
-        reveal(
-            CGRect(origin: worldFrame.origin, size: CGSize(width: width / camera.scale, height: height / camera.scale)))
+        if needsScrolling || documentWidth > scroll.contentSize.width {
+            editor.scrollRangeToVisible(editor.selectedRange())
+        }
+        if placement != nil { reveal(worldFrame) }
+    }
+
+    private func positionCommittedEditors() {
+        for (id, preview) in committedEditors {
+            guard session.board.nodes[id]?.text == preview.text else {
+                preview.backdrop.removeFromSuperview()
+                committedEditors.removeValue(forKey: id)
+                continue
+            }
+            let frame = viewRect(preview.worldFrame)
+            if preview.backdrop.frame != frame {
+                preview.backdrop.frame = frame
+                preview.backdrop.bounds = preview.bounds
+            }
+        }
+    }
+
+    private func clearCommittedEditors() {
+        for preview in committedEditors.values { preview.backdrop.removeFromSuperview() }
+        committedEditors.removeAll()
     }
 
     private func finishEditing(_ completion: EditingCompletion = .blur, restoringFocus: Bool = true) {
-        guard !finishingEdit, let id = editingID else { return }
+        guard !finishingEdit, let edit else { return }
         finishingEdit = true
+        let id = edit.id
         let commit = completion != .cancel
         let field = worktreeNameField
-        let text = editingTextView?.string ?? field?.stringValue ?? originalText
-        if commit && text != originalText { revealAfterLayout = id }
+        let textView = editor
+        let backdrop = edit.topic?.backdrop
+        let text = editingTextView?.string ?? field?.stringValue ?? edit.originalText
         editor?.delegate = nil
         field?.delegate = nil
-        editor = nil
-        worktreeNameField = nil
-        editingID = nil
+        self.edit = nil
         field?.removeFromSuperview()
-        provisionalEditFrame = nil
-        editorBackdrop?.removeFromSuperview()
-        editorBackdrop = nil
-        editorScroll = nil
-        if let token = editingToken { workspace?.endEditing(nodeID: id, boardID: session.id, token: token) }
-        editingToken = nil
-        if commit && text != originalText {
+        if let token = edit.token { workspace?.endEditing(nodeID: id, boardID: session.id, token: token) }
+        var keepsBackdrop = false
+        if commit && text != edit.originalText {
             if field != nil, let node = session.board.nodes[id] {
                 let address = NodeAddress(boardID: session.id, nodeID: id)
                 workspace?.updateDraft(at: address, content: node.applyingInlineText(text).content)
+                if renderedLayout?.revision != session.layoutRevision { revealAfterLayout = id }
             } else {
-                session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
+                keepsBackdrop =
+                    session.apply(session.board.replacingText(id, with: text), named: "Edit Text")
+                    && renderedLayout?.revision != session.layoutRevision
             }
         }
-        if restoringFocus { window?.makeFirstResponder(self) }
+        if restoringFocus {
+            window?.makeFirstResponder(self)
+        } else if let textView, window?.firstResponder === textView {
+            window?.makeFirstResponder(nil)
+        }
+        if keepsBackdrop, let backdrop {
+            // Keep the final edit visible until its text and geometry can be presented together.
+            backdrop.acceptsInput = false
+            textView?.isEditable = false
+            textView?.isSelectable = false
+            let preview = CommittedEditor(
+                backdrop: backdrop, worldFrame: camera.worldRect(backdrop.frame), bounds: backdrop.bounds, text: text)
+            committedEditors.updateValue(preview, forKey: id)?.backdrop.removeFromSuperview()
+        } else {
+            backdrop?.removeFromSuperview()
+        }
         finishingEdit = false
         actions?.hint = EditorActions.defaultHint
-        if field != nil { render() }
-        changed()
+        if let savedLayout, savedLayout.request == layoutRequest {
+            presentation = LayoutPresentation(
+                request: savedLayout.request, board: session.board, layout: savedLayout.layout)
+        }
+        changed(refreshingLayout: true)
         if field != nil && (completion == .blur || completion == .submit) {
             createWorktree(id, refocusOnFailure: completion == .submit)
         }
@@ -965,10 +1124,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     func textDidChange(_ notification: Notification) {
         guard let source = notification.object as? NSTextView, source === editor else { return }
+        updateDraftSize()
         positionEditor()
-        if let editor { editor.scrollRangeToVisible(editor.selectedRange()) }
-        if let editor, let id = editingID, let token = editingToken, !editor.hasMarkedText() {
-            workspace?.rememberDraft(editor.string, nodeID: id, boardID: session.id, token: token)
+        if let edit, let token = edit.token, !source.hasMarkedText() {
+            workspace?.rememberDraft(source.string, nodeID: edit.id, boardID: session.id, token: token)
         }
         updateActions()
     }
@@ -998,10 +1157,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     func controlTextDidChange(_ notification: Notification) {
         guard let field = notification.object as? NSTextField, field === worktreeNameField,
-            let id = editingID, let token = editingToken, editingTextView?.hasMarkedText() != true
+            let edit, let token = edit.token, editingTextView?.hasMarkedText() != true
         else { return }
         workspace?.rememberDraft(
-            editingTextView?.string ?? field.stringValue, nodeID: id, boardID: session.id, token: token)
+            editingTextView?.string ?? field.stringValue, nodeID: edit.id, boardID: session.id, token: token)
         actions?.hint = Self.worktreeNameHint
         updateActions()
     }
@@ -1177,7 +1336,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         } else {
             pendingFit = false
             jumpAfterLayout = id
-            refreshAgentSummaries()
             requestLayout()
         }
     }
@@ -1483,8 +1641,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard camera.scale >= CanvasStyle.textDetailScale else { return nil }
         let reach = CanvasStyle.disclosureGap + CanvasStyle.disclosureMaximumWidth + CanvasStyle.disclosureHitPadding
         let query = CGRect(x: point.x - reach, y: point.y - 1, width: reach + 1, height: 2)
+        let board = displayedBoard
         return mapLayout.visibleNodes(in: query).last { id in
-            guard let placement = mapLayout.nodes[id], session.board.nodes[id]?.children.isEmpty == false else {
+            guard let placement = mapLayout.nodes[id], board.nodes[id]?.children.isEmpty == false else {
                 return false
             }
             guard !session.isReadOnly || expandedAncestors.contains(id) else { return false }
@@ -1873,8 +2032,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         for id in Set(accessibilityAgentSummaries.keys).subtracting(ids) {
             accessibilityAgentSummaries.removeValue(forKey: id)
         }
+        let board = displayedBoard
         for id in visible {
-            guard let node = session.board.nodes[id] else { continue }
+            guard let node = board.nodes[id] else { continue }
             let element = accessibilityNodes[id] ?? TopicAccessibilityElement(id: id, canvas: self)
             element.setAccessibilityLabel(node.title)
             element.setAccessibilityRoleDescription(node.content.kind == .project ? "project topic" : "mind map topic")

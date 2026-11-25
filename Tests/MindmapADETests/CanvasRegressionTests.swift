@@ -79,6 +79,19 @@ private final class CanvasFixture {
         view.textDidChange(Notification(name: NSText.didChangeNotification, object: textView))
     }
 
+    func waitForDraftLayout() async throws {
+        let editor = try #require(editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        let font = try #require(editor.font)
+        let size = TextLayoutService.topicSize(
+            for: NSAttributedString(string: editor.string, attributes: [.font: font]))
+        for _ in 0..<100 {
+            if backdrop.alphaValue == 1, backdrop.bounds.size == size { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        Issue.record("The tree did not allocate the draft's dimensions.")
+    }
+
     func close() {
         view.prepareForRemoval()
         window.close()
@@ -109,6 +122,301 @@ private final class CanvasFixture {
 @Suite(.serialized)
 @MainActor
 struct CanvasRegressionTests {
+    @Test(arguments: [0.75, 1.04, 1.5])
+    func textEditorMatchesTheCanvasFontAndPositionAtDifferentZooms(zoom: Double) async throws {
+        let root = MapNode(text: "Hello World")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(scale: zoom, translation: CGPoint(x: 200, y: 200))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topic = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }.first)
+        let frame = canvas.view.convert(canvas.window.convertFromScreen(topic.accessibilityFrame()), from: nil)
+
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor as? TopicTextView)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        #expect(editor.font == CanvasStyle.font(root: true))
+        #expect(abs(backdrop.frame.width - frame.width) < 0.01)
+        #expect(abs(backdrop.frame.height - frame.height) < 0.01)
+        #expect(abs(backdrop.bounds.width * zoom - frame.width) < 0.01)
+        let line = editor.measureContent()
+        let lineCenter = canvas.view.convert(
+            CGPoint(x: 0, y: editor.textContainerOrigin.y + line.height / 2), from: editor)
+        #expect(line.lineCount == 1)
+        #expect(abs(lineCenter.y - frame.midY) < 0.01)
+    }
+
+    @Test(arguments: [true, false])
+    func newTopicKeepsTheSameCaretBaselineFromEmptyToFirstCharacters(asChild: Bool) async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.insertNode(asChild: asChild)
+        let editor = try #require(canvas.editor as? TopicTextView)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        #expect(editor.string.isEmpty)
+        let origin = editor.textContainerOrigin.y
+        #expect(origin == (backdrop.bounds.height - editor.measureContent().height) / 2)
+
+        for text in [" ", ".", ".a", ".ab", ".abc", "中文", ""] {
+            try canvas.type(text)
+            #expect(editor.measureContent().lineCount == 1)
+            #expect(editor.textContainerOrigin.y == origin)
+        }
+    }
+
+    @Test(
+        arguments: [
+            "短一点\nSecond line",
+            "短一点\nSecond line\n",
+            "中英文混排，这段文字应该自动换行。The line break should stay put after finishing the edit.",
+            String(repeating: "Long text\n", count: 20),
+        ])
+    func multilineTopicKeepsItsDraftHeightAfterCommit(text: String) async throws {
+        let root = MapNode(text: "First line\nSecond line\nThird line\nFourth line")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topic = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }.first)
+        let originalHeight = topic.accessibilityFrame().height
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor as? TopicTextView)
+        let scroll = try #require(editor.enclosingScrollView)
+        let backdrop = try #require(scroll.superview)
+
+        try canvas.type(text)
+        try await canvas.waitForDraftLayout()
+        let draftFrame = backdrop.frame
+        let content = editor.measureContent()
+        let fullHeight = content.height + MapMetrics.verticalPadding * 2
+        let maxHeight = MapMetrics.maximumTextHeight + MapMetrics.verticalPadding * 2
+        #expect(abs(draftFrame.height - min(fullHeight, maxHeight)) < 0.01)
+        #expect(editor.textContainerOrigin.y == MapMetrics.verticalPadding)
+        #expect(scroll.hasVerticalScroller == (fullHeight > maxHeight))
+        if text == "短一点\nSecond line" {
+            #expect(draftFrame.height < originalHeight)
+        }
+        #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        try await canvas.waitForSelectedTopic(text)
+        #expect(abs(topic.accessibilityFrame().height - draftFrame.height) < 0.01)
+        #expect(session.board.nodes[root.id]?.text == text)
+    }
+
+    @Test func committingAMultilineChildNearTheViewportEdgeKeepsTheCanvasAndTopicInPlace() async throws {
+        let root = MapNode(text: "Fixed root")
+        var board = MindMapBoard(root: root)
+        let parent = try #require(board.inserting(text: "Parent", parent: root.id))
+        board.apply(parent.edit)
+        let child = try #require(board.inserting(text: "Editable child", parent: parent.id))
+        board.apply(child.edit)
+        board.apply(try #require(board.inserting(text: "Sibling", parent: parent.id)).edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 112))
+        workspace.rememberSelection([child.id], for: session.id)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topics = try #require(canvas.view.accessibilityChildren()).compactMap { $0 as? TopicAccessibilityElement }
+        let fixedRoot = try #require(topics.first { $0.accessibilityLabel() == root.title })
+        let editable = try #require(topics.first { $0.accessibilityLabel() == "Editable child" })
+        let sibling = try #require(topics.first { $0.accessibilityLabel() == "Sibling" })
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+
+        let text = "第一行\nSecond line\n第三行\nFourth line\n第五行\n"
+        try canvas.type(text)
+        try await canvas.waitForDraftLayout()
+        let draftFrame = backdrop.frame
+        let before = fixedRoot.accessibilityFrame()
+        let siblingBefore = sibling.accessibilityFrame()
+        let point = CGPoint(x: 8, y: 8)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: point))
+        try await canvas.waitForSelectedTopic(text)
+
+        #expect(fixedRoot.accessibilityFrame() == before)
+        #expect(sibling.accessibilityFrame() == siblingBefore)
+        let savedFrame = canvas.view.convert(canvas.window.convertFromScreen(editable.accessibilityFrame()), from: nil)
+        #expect(savedFrame == draftFrame)
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: point))
+    }
+
+    @Test func resizingAnInlineEditorReflowsItsTreeBeforeGrowing() async throws {
+        let root = MapNode(text: "Root")
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(text: "Above", parent: root.id)).edit)
+        let middle = try #require(board.inserting(text: "Edit me", parent: root.id))
+        board.apply(middle.edit)
+        board.apply(try #require(board.inserting(text: "Below", parent: root.id)).edit)
+        board.apply(try #require(board.inserting(text: "Descendant", parent: middle.id)).edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 240))
+        workspace.rememberSelection([middle.id], for: session.id)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topics = try #require(canvas.view.accessibilityChildren()).compactMap { $0 as? TopicAccessibilityElement }
+        let editedTopic = try #require(topics.first { $0.accessibilityLabel() == "Edit me" })
+        let neighbors = topics.filter { ["Above", "Below", "Descendant"].contains($0.accessibilityLabel() ?? "") }
+        try #require(neighbors.count == 3)
+        let original = neighbors.map { $0.accessibilityFrame() }
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        let editorScreenFrame = {
+            canvas.window.convertToScreen(canvas.view.convert(backdrop.frame, to: nil))
+        }
+
+        try canvas.type("First draft\nAnother line\nOne more line")
+        try canvas.type(String(repeating: "A long replacement line that wraps.\n", count: 14))
+        #expect(editorScreenFrame() == editedTopic.accessibilityFrame())
+        #expect(original.allSatisfy { !$0.intersects(editorScreenFrame()) })
+
+        try await canvas.waitForDraftLayout()
+        #expect(editorScreenFrame() == editedTopic.accessibilityFrame())
+        let during = neighbors.map { $0.accessibilityFrame() }
+        #expect(zip(original, during).allSatisfy { $0 != $1 })
+        #expect(during.allSatisfy { !$0.intersects(editorScreenFrame()) })
+        #expect(session.board.nodes[middle.id]?.text == "Edit me")
+
+        #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        #expect(neighbors.map { $0.accessibilityFrame() } == original)
+    }
+
+    @Test func cappedTextFitsBesideAnAlwaysVisibleScrollbar() async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let scroll = try #require(editor.enclosingScrollView)
+        scroll.scrollerStyle = .legacy
+        let line = "iiiiiiiiiiiiiiiiiiiiiiiMMMMMMMMMMMMM"
+        try canvas.type(String(repeating: line + "\n", count: 20))
+        try await canvas.waitForDraftLayout()
+        let textWidth = try #require(editor.textContainer?.size.width)
+
+        #expect(scroll.hasVerticalScroller)
+        #expect(scroll.contentSize.width >= editor.textContainerInset.width + textWidth)
+        let caret = NSRange(location: line.utf16.count, length: 0)
+        editor.setSelectedRange(caret)
+        editor.scrollRangeToVisible(caret)
+        #expect(scroll.contentView.bounds.minX == 0)
+    }
+
+    @Test func fractionalZoomDoesNotMoveAWordToTheNextLine() async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(scale: 1.04, translation: CGPoint(x: 100.25, y: 90))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let manager = try #require(editor.textLayoutManager)
+        try canvas.type("中英文混排，这段文字需要自动换行。The same wrapping should appear after the node is saved.")
+
+        var lines: [String] = []
+        manager.enumerateTextLayoutFragments(from: nil, options: [.ensuresLayout]) { fragment in
+            for line in fragment.textLineFragments {
+                lines.append(line.attributedString.attributedSubstring(from: line.characterRange).string)
+            }
+            return true
+        }
+        #expect(lines == ["中英文混排，这段文字需要自动换行。", "The same wrapping should appear ", "after the node is saved."])
+    }
+
+    @Test func clickingAwayKeepsTheEditedTextVisibleUntilItsNewLayoutIsReady() async throws {
+        let root = MapNode(text: "待办")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        let text = "整理节点编辑后的排版问题"
+        try canvas.type(text)
+        let frame = backdrop.frame
+        let point = CGPoint(x: 8, y: 8)
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: point))
+
+        #expect(session.board.nodes[root.id]?.text == text)
+        #expect(canvas.editor == nil)
+        #expect(canvas.window.firstResponder === canvas.view)
+        #expect(backdrop.window === canvas.window)
+        #expect(backdrop.frame == frame)
+        #expect(canvas.view.hitTest(CGPoint(x: frame.midX, y: frame.midY)) === canvas.view)
+
+        try await canvas.waitForSelectedTopic(text)
+        #expect(backdrop.window == nil)
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: point))
+    }
+
+    @Test func committingThePlaceholderTextDoesNotLeaveAnEditorOverTheTopic() async throws {
+        let root = MapNode()
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        try canvas.type(root.title)
+        #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        #expect(session.board.nodes[root.id]?.text == root.title)
+        #expect(backdrop.window == nil)
+    }
+
+    @Test func agentRenameKeepsThePreviousTitleAndFrameTogetherUntilRelayout() async throws {
+        let root = MapNode(text: "Old")
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: MindMapBoard(root: root)))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topic = try #require(
+            canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }.first)
+        let oldFrame = topic.accessibilityFrame()
+        let title = "A substantially wider topic title"
+        let edit = try #require(session.board.replacingText(root.id, with: title))
+
+        #expect(session.applyAgentEdit(edit, change: .edited, highlighting: [root.id]))
+        canvas.view.update(session: session, revision: session.revision)
+        canvas.view.layout()
+        #expect(topic.accessibilityLabel() == root.title)
+        #expect(topic.accessibilityFrame() == oldFrame)
+
+        try await canvas.waitForSelectedTopic(title)
+        #expect(topic.accessibilityFrame().width > oldFrame.width)
+    }
+
     @Test func resourceMenusAndCommandsRespectProjectAndWorktreePlacement() async throws {
         var project = ProjectTopic()
         project.location = ProjectLocation(directory: "/project", gitCommonDirectory: "/project/.git")

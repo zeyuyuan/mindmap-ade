@@ -79,6 +79,19 @@ private final class CanvasFixture {
         view.textDidChange(Notification(name: NSText.didChangeNotification, object: textView))
     }
 
+    func waitForDraftLayout() async throws {
+        let editor = try #require(editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        let font = try #require(editor.font)
+        let size = TextLayoutService.topicSize(
+            for: NSAttributedString(string: editor.string, attributes: [.font: font]))
+        for _ in 0..<100 {
+            if backdrop.alphaValue == 1, backdrop.bounds.size == size { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        Issue.record("The tree did not allocate the draft's dimensions.")
+    }
+
     func close() {
         view.prepareForRemoval()
         window.close()
@@ -183,6 +196,7 @@ struct CanvasRegressionTests {
         let backdrop = try #require(scroll.superview)
 
         try canvas.type(text)
+        try await canvas.waitForDraftLayout()
         let draftFrame = backdrop.frame
         let content = editor.measureContent()
         let fullHeight = content.height + MapMetrics.verticalPadding * 2
@@ -218,22 +232,69 @@ struct CanvasRegressionTests {
         let topics = try #require(canvas.view.accessibilityChildren()).compactMap { $0 as? TopicAccessibilityElement }
         let fixedRoot = try #require(topics.first { $0.accessibilityLabel() == root.title })
         let editable = try #require(topics.first { $0.accessibilityLabel() == "Editable child" })
+        let sibling = try #require(topics.first { $0.accessibilityLabel() == "Sibling" })
         canvas.view.editSelection()
         let editor = try #require(canvas.editor)
         let backdrop = try #require(editor.enclosingScrollView?.superview)
 
         let text = "第一行\nSecond line\n第三行\nFourth line\n第五行\n"
         try canvas.type(text)
+        try await canvas.waitForDraftLayout()
         let draftFrame = backdrop.frame
         let before = fixedRoot.accessibilityFrame()
+        let siblingBefore = sibling.accessibilityFrame()
         let point = CGPoint(x: 8, y: 8)
         canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: point))
         try await canvas.waitForSelectedTopic(text)
 
         #expect(fixedRoot.accessibilityFrame() == before)
+        #expect(sibling.accessibilityFrame() == siblingBefore)
         let savedFrame = canvas.view.convert(canvas.window.convertFromScreen(editable.accessibilityFrame()), from: nil)
         #expect(savedFrame == draftFrame)
         canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: point))
+    }
+
+    @Test func resizingAnInlineEditorReflowsItsTreeBeforeGrowing() async throws {
+        let root = MapNode(text: "Root")
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(text: "Above", parent: root.id)).edit)
+        let middle = try #require(board.inserting(text: "Edit me", parent: root.id))
+        board.apply(middle.edit)
+        board.apply(try #require(board.inserting(text: "Below", parent: root.id)).edit)
+        board.apply(try #require(board.inserting(text: "Descendant", parent: middle.id)).edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 240))
+        workspace.rememberSelection([middle.id], for: session.id)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let topics = try #require(canvas.view.accessibilityChildren()).compactMap { $0 as? TopicAccessibilityElement }
+        let editedTopic = try #require(topics.first { $0.accessibilityLabel() == "Edit me" })
+        let neighbors = topics.filter { ["Above", "Below", "Descendant"].contains($0.accessibilityLabel() ?? "") }
+        try #require(neighbors.count == 3)
+        let original = neighbors.map { $0.accessibilityFrame() }
+        canvas.view.editSelection()
+        let editor = try #require(canvas.editor)
+        let backdrop = try #require(editor.enclosingScrollView?.superview)
+        let editorScreenFrame = {
+            canvas.window.convertToScreen(canvas.view.convert(backdrop.frame, to: nil))
+        }
+
+        try canvas.type(String(repeating: "A long replacement line that wraps.\n", count: 14))
+        #expect(editorScreenFrame() == editedTopic.accessibilityFrame())
+        #expect(original.allSatisfy { !$0.intersects(editorScreenFrame()) })
+
+        try await canvas.waitForDraftLayout()
+        #expect(editorScreenFrame() == editedTopic.accessibilityFrame())
+        let during = neighbors.map { $0.accessibilityFrame() }
+        #expect(zip(original, during).allSatisfy { $0 != $1 })
+        #expect(during.allSatisfy { !$0.intersects(editorScreenFrame()) })
+        #expect(session.board.nodes[middle.id]?.text == "Edit me")
+
+        #expect(canvas.view.textView(editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        #expect(neighbors.map { $0.accessibilityFrame() } == original)
     }
 
     @Test func fractionalZoomDoesNotMoveAWordToTheNextLine() async throws {

@@ -58,7 +58,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var layoutTask: Task<Void, Never>?
     private var appliedRevision = -1
     private var presentation: LayoutPresentation?
+    private var savedLayout: (request: LayoutRequest, layout: MapLayout)?
     private var requestedLayout: LayoutRequest?
+    private var draftGeometry: DraftGeometry?
     private var expandedAncestors = Set<UUID>()
     private var jumpAfterLayout: UUID?
     private var branchFocus: BranchFocus?
@@ -111,6 +113,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private struct LayoutRequest: Equatable {
         let revision: Int
         let expandedAncestors: Set<UUID>
+        let draft: DraftGeometry?
+    }
+
+    private struct DraftGeometry: Equatable {
+        let id: UUID
+        let size: CGSize
     }
 
     private struct LayoutPresentation {
@@ -133,7 +141,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     private var layoutRequest: LayoutRequest {
-        LayoutRequest(revision: session.layoutRevision, expandedAncestors: expandedAncestors)
+        LayoutRequest(revision: session.layoutRevision, expandedAncestors: expandedAncestors, draft: draftGeometry)
     }
 
     private var renderedLayout: LayoutRequest? { presentation?.request }
@@ -220,6 +228,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             expandedAncestors.removeAll()
             appliedRevision = -1
             presentation = nil
+            savedLayout = nil
             requestedLayout = nil
             pendingFit = false
             activeAgentID = nil
@@ -254,6 +263,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private func requestLayout() {
         let request = layoutRequest
+        if renderedLayout == request {
+            if requestedLayout != nil {
+                layoutTask?.cancel()
+                requestedLayout = nil
+            }
+            return
+        }
         guard requestedLayout != request else { return }
         requestedLayout = request
         layoutTask?.cancel()
@@ -261,15 +277,24 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         let board = session.board
         let regular = CanvasStyle.font(root: false).fontName
         let root = CanvasStyle.font(root: true).fontName
+        let baseline =
+            savedLayout?.request.revision == request.revision
+                && savedLayout?.request.expandedAncestors == request.expandedAncestors
+            ? savedLayout?.layout : nil
         layoutTask = Task { [weak self, layoutService] in
             do {
                 let result = try await layoutService.layout(
-                    board: board, regularFont: regular, rootFont: root, expandedAncestors: request.expandedAncestors)
+                    board: board, regularFont: regular, rootFont: root, expandedAncestors: request.expandedAncestors,
+                    draft: request.draft.map { ($0.id, $0.size, baseline) })
                 guard let self, !Task.isCancelled, self.session === session else { return }
                 self.requestedLayout = nil
                 guard self.layoutRequest == request else { return }
+                let topologyChanged =
+                    self.renderedLayout?.revision != request.revision
+                    || self.renderedLayout?.expandedAncestors != request.expandedAncestors
                 self.presentation = LayoutPresentation(request: request, board: session.board, layout: result)
-                self.refreshAgentSummaries()
+                if request.draft == nil { self.savedLayout = (request, result) }
+                if topologyChanged { self.refreshAgentSummaries() }
                 if !self.selected.isEmpty {
                     self.selected.formIntersection(result.nodes.keys)
                     if self.selected.isEmpty, let first = self.session.board.roots.first {
@@ -277,7 +302,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                     }
                 }
                 self.initializeCameraIfNeeded()
-                if let root = self.branchFocus?.root {
+                if topologyChanged, let root = self.branchFocus?.root {
                     if board.nodes[root] != nil {
                         self.branchFocus?.topics = board.descendants(of: root)
                     } else {
@@ -287,8 +312,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 if let id = self.jumpAfterLayout, let frame = result.nodes[id]?.frame {
                     self.centerTopic(frame)
                 } else {
-                    self.render()
                     self.positionEditor()
+                    self.render()
                 }
                 self.jumpAfterLayout = nil
                 let worktreeBeingEdited = self.worktreeNameField == nil ? nil : self.editingID
@@ -804,7 +829,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         editingToken = token
         provisionalEditFrame = frame
         selected = [id]
-        revealForEditing(frame)
+        let hasPlacement = mapLayout.nodes[id] != nil
+        if hasPlacement { revealForEditing(frame) }
         let text = TopicTextView(usingTextLayoutManager: true)
         text.isRichText = false
         text.importsGraphics = false
@@ -828,6 +854,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         scroll.borderType = .noBorder
         scroll.documentView = text
         let backdrop = TopicEditorBackdrop()
+        backdrop.alphaValue = hasPlacement ? 1 : 0
         backdrop.wantsLayer = true
         backdrop.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         backdrop.layer?.cornerRadius = CanvasStyle.nodeRadius
@@ -915,44 +942,43 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard let editor, let scroll = editorScroll, let backdrop = editorBackdrop, let id = editingID else { return }
         let placement = mapLayout.nodes[id]
         guard let worldFrame = placement?.frame ?? provisionalEditFrame else { return }
+        let wasUnplaced = backdrop.alphaValue == 0
+        backdrop.alphaValue = placement == nil ? 0 : 1
+        if placement != nil, wasUnplaced { revealForEditing(worldFrame) }
         // Scale the view after laying out the text at the canvas's base font size.
         let inset = NSSize(width: MapMetrics.horizontalPadding, height: MapMetrics.verticalPadding)
         editor.textContainerInset = inset
         let draft = NSAttributedString(
             string: editor.string, attributes: [.font: editor.font ?? CanvasStyle.font(root: false)])
         let draftSize = TextLayoutService.topicSize(for: draft)
-        var origin = worldFrame.origin
-        if let placement, placement.depth > 0 {
-            // A child's center depends on its siblings' heights. Its own height grows around that center.
-            origin.y = worldFrame.midY - draftSize.height / 2
+        let savedSize = savedLayout?.layout.nodes[id]?.frame.size ?? provisionalEditFrame?.size
+        let geometry = draftSize == savedSize ? nil : DraftGeometry(id: id, size: draftSize)
+        if draftGeometry != geometry {
+            draftGeometry = geometry
+            requestLayout()
         }
         let availableWidth = max(bounds.width - fitPadding * 2, MapMetrics.minimumNodeWidth)
         let availableHeight = max(
             CanvasStyle.editorMinimumHeight, min(bounds.height - fitPadding * 2, CanvasStyle.editorMaximumHeight))
         var editingScale = camera.scale
-        if draftSize.width * editingScale > availableWidth {
+        if worldFrame.width * editingScale > availableWidth {
             editingScale = availableWidth / (MapMetrics.maximumTextWidth + inset.width * 2)
         }
-        if draftSize.height * editingScale > availableHeight {
+        if worldFrame.height * editingScale > availableHeight {
             editingScale = availableHeight / (MapMetrics.maximumTextHeight + inset.height * 2)
         }
         if editingScale < camera.scale {
-            camera.zoom(to: editingScale, around: camera.viewPoint(origin))
+            camera.zoom(to: editingScale, around: camera.viewPoint(worldFrame.origin))
             cameraChanged()
             return
         }
-        // A clip view can round its bounds at fractional zoom. Wrap at the exact topic width.
+        // Lay out at the final wrapping width, but clip to the space the tree has already assigned.
         let textSize = CGSize(width: draftSize.width - inset.width * 2, height: .greatestFiniteMagnitude)
         if editor.textContainer?.size != textSize { editor.textContainer?.size = textSize }
         let content = editor.measureContent()
-        let needsScrolling = content.height + inset.height * 2 > draftSize.height
-        let gutter =
-            needsScrolling && NSScroller.preferredScrollerStyle == .legacy
-            ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
-        let editorFrame = CGRect(
-            origin: origin, size: CGSize(width: draftSize.width + gutter, height: draftSize.height))
-        backdrop.frame = viewRect(editorFrame)
-        backdrop.bounds = CGRect(origin: .zero, size: editorFrame.size)
+        let needsScrolling = content.height + inset.height * 2 > worldFrame.height
+        backdrop.frame = viewRect(worldFrame)
+        backdrop.bounds = CGRect(origin: .zero, size: worldFrame.size)
         backdrop.layer?.borderWidth = CanvasStyle.selectedBorderWidth / max(editingScale, 0.5)
         scroll.hasVerticalScroller = needsScrolling
         scroll.frame = backdrop.bounds
@@ -961,12 +987,14 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             editor.setFrameSize(CGSize(width: draftSize.width, height: editor.frame.height))
         }
         if editor.positionContent(
-            using: content, in: scroll.contentSize.height, topicHeight: draftSize.height, padding: inset.height)
+            using: content, in: scroll.contentSize.height, topicHeight: worldFrame.height, padding: inset.height)
         {
             scroll.contentView.scroll(to: .zero)
             scroll.reflectScrolledClipView(scroll.contentView)
+        } else {
+            editor.scrollRangeToVisible(editor.selectedRange())
         }
-        reveal(editorFrame)
+        if placement != nil { reveal(worldFrame) }
     }
 
     private func positionCommittedEditors() {
@@ -1002,6 +1030,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         editor = nil
         worktreeNameField = nil
         editingID = nil
+        draftGeometry = nil
         field?.removeFromSuperview()
         provisionalEditFrame = nil
         editorBackdrop = nil
@@ -1038,8 +1067,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         }
         finishingEdit = false
         actions?.hint = EditorActions.defaultHint
-        if field != nil { render() }
+        if let savedLayout, savedLayout.request == layoutRequest {
+            presentation = LayoutPresentation(
+                request: savedLayout.request, board: session.board, layout: savedLayout.layout)
+        }
         changed()
+        requestLayout()
+        render()
         if field != nil && (completion == .blur || completion == .submit) {
             createWorktree(id, refocusOnFailure: completion == .submit)
         }

@@ -14,8 +14,16 @@ actor TextLayoutService {
     private var sizes: [Key: CGSize] = [:]
 
     func layout(
-        board: MindMapBoard, regularFont: String, rootFont: String, expandedAncestors: Set<UUID> = []
+        board: MindMapBoard, regularFont: String, rootFont: String, expandedAncestors: Set<UUID> = [],
+        draft: (id: UUID, size: CGSize, baseline: MapLayout?)? = nil
     ) throws -> MapLayout {
+        if let draft, let baseline = draft.baseline {
+            // The board revision and visible branches match, so every other topic keeps its measured size.
+            var metrics = baseline.nodes.mapValues { $0.frame.size }
+            metrics[draft.id] = draft.size
+            try Task.checkCancellation()
+            return TreeLayout.make(board: board, sizes: metrics, expandedAncestors: expandedAncestors)
+        }
         let roots = Set(board.roots.map(\.id))
         var metrics: [UUID: CGSize] = [:]
         var pending = board.roots.map(\.id)
@@ -23,6 +31,10 @@ actor TextLayoutService {
             try Task.checkCancellation()
             guard let node = board.nodes[id] else { continue }
             pending.append(contentsOf: node.displayedChildren(expandedAncestors: expandedAncestors))
+            if let draft, draft.id == id {
+                metrics[id] = draft.size
+                continue
+            }
             let key = Key(
                 text: node.title,
                 fontName: roots.contains(node.id) || node.content.kind != .text ? rootFont : regularFont,

@@ -1,7 +1,7 @@
 import Foundation
 
 public struct WorkspaceArchive: Codable, Sendable {
-    private static let currentVersion = 7
+    private static let currentVersion = 8
 
     public var schemaVersion: Int
     public var boards: [MindMapBoard]
@@ -10,10 +10,12 @@ public struct WorkspaceArchive: Codable, Sendable {
     public var agentRuns: [AgentRun]?
     public var selections: [UUID: Set<UUID>]?
     public var agentPane: AgentPaneState?
+    public var rightPane: RightPaneState?
 
     public init(
         boards: [MindMapBoard], cameras: [UUID: MapCamera] = [:], selectedBoardID: UUID? = nil,
-        agentRuns: [AgentRun] = [], selections: [UUID: Set<UUID>] = [:], agentPane: AgentPaneState? = nil
+        agentRuns: [AgentRun] = [], selections: [UUID: Set<UUID>] = [:], agentPane: AgentPaneState? = nil,
+        rightPane: RightPaneState? = nil
     ) {
         schemaVersion = Self.currentVersion
         self.boards = boards
@@ -22,6 +24,7 @@ public struct WorkspaceArchive: Codable, Sendable {
         self.agentRuns = agentRuns
         self.selections = selections
         self.agentPane = agentPane
+        self.rightPane = rightPane
     }
 
     public func validated() throws -> Self {
@@ -96,7 +99,7 @@ extension MindMapBoard {
             switch node.content {
             case .agent: return true
             case .project, .worktree: continue
-            case .text, .branch: pending.append(contentsOf: node.children)
+            case .text, .branch, .gitChanges: pending.append(contentsOf: node.children)
             }
         }
         return false
@@ -136,7 +139,7 @@ extension MindMapBoard {
                     agent.worktreeChoice.base = reference
                     node.content = .agent(agent)
                 }
-            case .text:
+            case .text, .gitChanges:
                 break
             }
             pending.append(contentsOf: original.children.map { ($0, childReference) })

@@ -69,6 +69,7 @@ final class BoardSession: Identifiable {
     private(set) var layoutRevision = 0
     private(set) var nodeCount: Int
     private(set) var gitProjectLocations: [UUID: ProjectLocation] = [:]
+    private(set) var gitChangesNodeIDs: Set<UUID> = []
     private(set) var agentEditNotice: AgentEditNotice?
     private(set) var agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     @ObservationIgnored private(set) var board: MindMapBoard
@@ -104,6 +105,9 @@ final class BoardSession: Identifiable {
         for node in board.nodes.values {
             if let location = Self.gitProjectLocation(node) {
                 gitProjectLocations[node.id] = location
+            }
+            if node.content.kind == .gitChanges {
+                gitChangesNodeIDs.insert(node.id)
             }
         }
     }
@@ -187,6 +191,11 @@ final class BoardSession: Identifiable {
             let location = Self.gitProjectLocation(replacement.node)
             if gitProjectLocations[replacement.id] != location {
                 gitProjectLocations[replacement.id] = location
+            }
+            if replacement.node?.content.kind == .gitChanges {
+                gitChangesNodeIDs.insert(replacement.id)
+            } else {
+                gitChangesNodeIDs.remove(replacement.id)
             }
             if replacement.node == nil { clearAgentHighlight(for: replacement.id) }
         }
@@ -305,8 +314,8 @@ final class WorkspaceStore {
     @ObservationIgnored var cameras: [UUID: MapCamera] = [:]
     @ObservationIgnored private(set) var selections: [UUID: Set<UUID>] = [:]
     @ObservationIgnored var lastSelectedBoardID: UUID?
-    @ObservationIgnored private var agentPane: AgentPaneState?
-    @ObservationIgnored private var agentPaneWindowID: UUID?
+    @ObservationIgnored private var rightPane: RightPaneState?
+    @ObservationIgnored private var rightPaneWindowID: UUID?
     var dataDirectory: URL { disk.directory }
     let git = GitWorkspace()
     let agentFiles: AgentRunFiles
@@ -314,6 +323,7 @@ final class WorkspaceStore {
     var agentRuns: [NodeAddress: AgentRun] = [:]
     var recoveryIssues: [NodeAddress: AgentRecoveryIssue] = [:]
     var terminals: [NodeAddress: AgentTerminal] = [:]
+    var gitChangesDetails: [GitChangesTarget: String] = [:]
     var connectedMapRuns: Set<UUID> = []
     var operations: Set<NodeAddress> = []
     @ObservationIgnored var isQuitting = false
@@ -374,7 +384,11 @@ final class WorkspaceStore {
             selections = value.selections ?? [:]
             lastSelectedBoardID = value.selectedBoardID
             boards = value.boards.map(makeSession)
-            agentPane = value.agentPane
+            rightPane =
+                value.rightPane
+                ?? value.agentPane.map {
+                    RightPaneState(address: $0.address, kind: .terminal, widthShare: $0.widthShare)
+                }
             agentRuns = restoredRuns
             saveState = .saved
             if !writable { errorMessage = "This workspace is open in another app instance. Changes are disabled." }
@@ -442,25 +456,59 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
-    func restoreAgentPane(for windowID: UUID) -> AgentPaneState? {
-        guard agentPaneWindowID == nil, let agentPane,
-            agentPane.widthShare.isFinite, (0...1).contains(agentPane.widthShare),
-            canOpenAgent(at: agentPane.address)
-        else { return nil }
-        agentPaneWindowID = windowID
-        return agentPane
+    func canOpenGitChanges(at address: NodeAddress) -> Bool {
+        board(address.boardID)?.board.nodes[address.nodeID]?.content.kind == .gitChanges
     }
 
-    func rememberAgentPane(_ pane: AgentPaneState?, from windowID: UUID) {
-        guard pane != nil || agentPaneWindowID == windowID else { return }
-        agentPaneWindowID = windowID
-        guard agentPane != pane else { return }
-        agentPane = pane
+    func canOpenRightPane(_ pane: RightPaneState) -> Bool {
+        switch pane.kind {
+        case .terminal: canOpenAgent(at: pane.address)
+        case .gitChanges: canOpenGitChanges(at: pane.address)
+        }
+    }
+
+    func restoreRightPane(for windowID: UUID) -> RightPaneState? {
+        guard rightPaneWindowID == nil, let rightPane,
+            rightPane.widthShare.isFinite, (0...1).contains(rightPane.widthShare),
+            canOpenRightPane(rightPane)
+        else { return nil }
+        rightPaneWindowID = windowID
+        return rightPane
+    }
+
+    func rememberRightPane(_ pane: RightPaneState?, from windowID: UUID) {
+        guard pane != nil || rightPaneWindowID == windowID else { return }
+        rightPaneWindowID = windowID
+        guard rightPane != pane else { return }
+        rightPane = pane
         scheduleSave()
     }
 
+    func releaseRightPane(from windowID: UUID) {
+        if rightPaneWindowID == windowID { rightPaneWindowID = nil }
+    }
+
     func releaseAgentPane(from windowID: UUID) {
-        if agentPaneWindowID == windowID { agentPaneWindowID = nil }
+        releaseRightPane(from: windowID)
+    }
+
+    func recordGitChangesSnapshot(_ snapshot: GitChangesSnapshot, for target: GitChangesTarget) {
+        if gitChangesDetails[target] != snapshot.cardDetail {
+            gitChangesDetails[target] = snapshot.cardDetail
+        }
+    }
+
+    func gitChangesTarget(for nodeID: UUID, in board: MindMapBoard) -> GitChangesTarget? {
+        guard case .gitChanges(let topic) = board.nodes[nodeID]?.content else { return nil }
+        let scope = board.context(above: nodeID)
+        guard scope.problem == nil, let worktree = scope.worktree else { return nil }
+        let base =
+            topic.baseCommit.flatMap { $0.isEmpty ? nil : $0 }
+            ?? scope.worktreeID.flatMap { id -> String? in
+                guard case .worktree(let tree) = board.nodes[id]?.content else { return nil }
+                return tree.creationCommit
+            }
+        return GitChangesTarget(directory: worktree.directory, baseCommit: base)
     }
 
     func select(_ id: UUID?) {
@@ -539,10 +587,14 @@ final class WorkspaceStore {
         let runs = agentRuns.values.filter { run in
             board(run.address.boardID)?.board.nodes[run.address.nodeID]?.content.kind == .agent
         }
+        let savedPane = rightPane.flatMap { canOpenRightPane($0) ? $0 : nil }
+        let legacyAgentPane = savedPane.flatMap {
+            $0.kind == .terminal ? AgentPaneState(address: $0.address, widthShare: $0.widthShare) : nil
+        }
         return WorkspaceArchive(
             boards: snapshots, cameras: cameras, selectedBoardID: lastSelectedBoardID, agentRuns: Array(runs),
             selections: selections.filter { board($0.key) != nil },
-            agentPane: agentPane.flatMap { canOpenAgent(at: $0.address) ? $0 : nil })
+            agentPane: legacyAgentPane, rightPane: savedPane)
     }
 
     func scheduleSave() {

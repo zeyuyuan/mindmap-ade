@@ -51,6 +51,8 @@ public struct MapNode: Identifiable, Codable, Equatable, Sendable {
             if !name.isEmpty { return name }
             let line = value.task.split(whereSeparator: \.isNewline).first?.trimmingCharacters(in: .whitespaces)
             return line.flatMap { $0.isEmpty ? nil : String($0.prefix(100)) } ?? "New conversation"
+        case .gitChanges:
+            return "Git Changes"
         }
     }
 
@@ -64,6 +66,8 @@ public struct MapNode: Identifiable, Codable, Equatable, Sendable {
                 ?? "Worktree · Draft"
         case .agent(let value):
             value.isConfigured ? "Agent · \(value.cli.title)" : "Agent · Draft"
+        case .gitChanges:
+            "Git"
         }
     }
 

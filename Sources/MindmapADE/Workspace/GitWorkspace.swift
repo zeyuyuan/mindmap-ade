@@ -201,7 +201,7 @@ actor GitWorkspace {
         }
     }
 
-    private func availableDirectory(_ path: String) throws -> String {
+    func availableDirectory(_ path: String) throws -> String {
         var directory: ObjCBool = false
         guard path.hasPrefix("/"), FileManager.default.fileExists(atPath: path, isDirectory: &directory),
             directory.boolValue, FileManager.default.isReadableFile(atPath: path)
@@ -231,7 +231,7 @@ actor GitWorkspace {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
-    private func git(_ arguments: [String], in directory: String) throws -> String {
+    func git(_ arguments: [String], in directory: String, trimTrailingNewline: Bool = true) throws -> String {
         var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("GIT_") }
         environment["LC_ALL"] = "C"
         environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -245,7 +245,7 @@ actor GitWorkspace {
             throw WorkspaceIssue(
                 reason.isEmpty ? "Git exited with status \(result.status)." : String(reason.prefix(1200)))
         }
-        if text.last == "\n" { text.removeLast() }
+        if trimTrailingNewline, text.last == "\n" { text.removeLast() }
         return text
     }
 }

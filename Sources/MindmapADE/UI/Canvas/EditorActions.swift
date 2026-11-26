@@ -5,18 +5,44 @@ import SwiftUI
 
 @Observable
 final class EditorActions {
+    enum RightPane: Equatable {
+        case terminal(NodeAddress)
+        case gitChanges(NodeAddress)
+
+        var address: NodeAddress {
+            switch self {
+            case .terminal(let address), .gitChanges(let address): address
+            }
+        }
+
+        var kind: RightPaneKind {
+            switch self {
+            case .terminal: .terminal
+            case .gitChanges: .gitChanges
+            }
+        }
+    }
+
     static let defaultHint = "Shift-drag to select · Drag to pan · Double-click to edit"
 
     @ObservationIgnored weak var canvas: MindMapCanvasView?
     @ObservationIgnored weak var workspace: WorkspaceStore?
     var targetBoardID: UUID?
     let windowID = UUID()
-    private(set) var terminalAddress: NodeAddress?
-    private(set) var terminalWidthShare: CGFloat = 0.5
+    private(set) var rightPane: RightPane?
+    private(set) var paneWidthShare: CGFloat = 0.5
+    var terminalAddress: NodeAddress? {
+        if case .terminal(let address) = rightPane { address } else { nil }
+    }
+    var gitChangesAddress: NodeAddress? {
+        if case .gitChanges(let address) = rightPane { address } else { nil }
+    }
+    var terminalWidthShare: CGFloat { paneWidthShare }
     var requestedBoardID: UUID?
     var canAddProject = false
     var canAddWorktree = false
     var canLinkWorktree = false
+    var canAddGitChanges = false
     var canDeriveAgent = false
     var zoomLabel = "100%"
     var canEdit = false
@@ -52,39 +78,63 @@ final class EditorActions {
     func showTerminal(at address: NodeAddress, revealNode: Bool = true) {
         guard let workspace, workspace.canOpenAgent(at: address) else { return }
         if terminalAddress != address { detachTerminal() }
-        terminalAddress = address
+        rightPane = .terminal(address)
         workspace.terminals[address]?.owner = windowID
-        saveTerminalPane()
-        if revealNode { canvas?.revealTerminalNode(address) }
+        saveRightPane()
+        if revealNode { canvas?.revealRightPaneNode(address) }
+    }
+
+    func showGitChanges(at address: NodeAddress, revealNode: Bool = true) {
+        guard let workspace, workspace.canOpenGitChanges(at: address) else { return }
+        if terminalAddress != nil { detachTerminal() }
+        rightPane = .gitChanges(address)
+        saveRightPane()
+        if revealNode { canvas?.revealRightPaneNode(address) }
+    }
+
+    func hideRightPane() {
+        detachTerminal()
+        rightPane = nil
+        saveRightPane()
     }
 
     func hideTerminal() {
-        detachTerminal()
-        saveTerminalPane()
+        hideRightPane()
     }
 
     func detachTerminal() {
         if let address = terminalAddress, workspace?.terminals[address]?.owner == windowID {
             workspace?.terminals[address]?.owner = nil
         }
-        terminalAddress = nil
+        if case .terminal = rightPane { rightPane = nil }
+    }
+
+    func restoreRightPane() {
+        guard let state = workspace?.restoreRightPane(for: windowID) else { return }
+        paneWidthShare = state.widthShare
+        switch state.kind {
+        case .terminal: showTerminal(at: state.address, revealNode: false)
+        case .gitChanges: showGitChanges(at: state.address, revealNode: false)
+        }
     }
 
     func restoreTerminalPane() {
-        guard let state = workspace?.restoreAgentPane(for: windowID) else { return }
-        terminalWidthShare = state.widthShare
-        showTerminal(at: state.address, revealNode: false)
+        restoreRightPane()
+    }
+
+    func resizePane(to share: CGFloat) {
+        guard paneWidthShare != share else { return }
+        paneWidthShare = share
+        saveRightPane()
     }
 
     func resizeTerminal(to share: CGFloat) {
-        guard terminalWidthShare != share else { return }
-        terminalWidthShare = share
-        saveTerminalPane()
+        resizePane(to: share)
     }
 
-    private func saveTerminalPane() {
-        let state = terminalAddress.map { AgentPaneState(address: $0, widthShare: terminalWidthShare) }
-        workspace?.rememberAgentPane(state, from: windowID)
+    private func saveRightPane() {
+        let state = rightPane.map { RightPaneState(address: $0.address, kind: $0.kind, widthShare: paneWidthShare) }
+        workspace?.rememberRightPane(state, from: windowID)
     }
 
     func add(_ kind: NodeKind) { activeCanvas?.insertResource(kind) }
@@ -195,6 +245,8 @@ struct MindMapCommands: Commands {
                 Button("Worktree", systemImage: NodeKind.worktree.symbol) { actions?.add(.worktree) }
                     .disabled(actions?.canAddWorktree != true)
                 Button("Agent", systemImage: NodeKind.agent.symbol) { actions?.add(.agent) }
+                Button("Git Changes", systemImage: NodeKind.gitChanges.symbol) { actions?.add(.gitChanges) }
+                    .disabled(actions?.canAddGitChanges != true)
             }
             .disabled(actions?.canvas == nil || actions?.workspace?.isReadOnly != false)
             Button("Link Existing Worktree…", systemImage: "link") { actions?.linkWorktree() }

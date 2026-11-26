@@ -1209,7 +1209,7 @@ struct CanvasRegressionTests {
         try await canvas.ready()
 
         canvas.view.updatePresentation(
-            runtimeDetails: [:], activeAgentID: nil, agentRunStates: [active.id: .running, failed.id: .failed])
+            runtimeDetails: [:], activePaneNodeID: nil, agentRunStates: [active.id: .running, failed.id: .failed])
         let badge = try #require(
             canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAgentSummaryAccessibilityElement }.first)
         #expect(badge.accessibilityLabel() == "Agents in Planning")
@@ -1217,7 +1217,7 @@ struct CanvasRegressionTests {
         #expect(badge.accessibilityValue() as? String == "1 active · 1 failed")
 
         canvas.view.updatePresentation(
-            runtimeDetails: [:], activeAgentID: nil, agentRunStates: [active.id: .exited, failed.id: .failed])
+            runtimeDetails: [:], activePaneNodeID: nil, agentRunStates: [active.id: .exited, failed.id: .failed])
         #expect(badge.accessibilityValue() as? String == "1 failed")
         #expect(badge.accessibilityPerformPress())
         try await canvas.waitForSelectedTopic("Checks")
@@ -1255,5 +1255,112 @@ struct CanvasRegressionTests {
         #expect(after.translation.x < camera.translation.x)
         try await Task.sleep(for: .milliseconds(60))
         #expect(workspace.cameras[session.id] == after)
+    }
+
+    @Test func gitChangesSelectionAndExplicitOpeningAreSeparate() async throws {
+        var project = ProjectTopic()
+        project.location = ProjectLocation(directory: "/project", gitCommonDirectory: "/project/.git")
+        let root = MapNode(content: .project(project))
+        let location = WorktreeLocation(
+            directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "feature/git", commit: "abc",
+            isPrimary: false)
+        let worktree = MapNode(content: .worktree(WorktreeTopic(location: location)))
+        var topic = AgentTopic(task: "Run task")
+        topic.isConfigured = true
+        let agent = MapNode(content: .agent(topic))
+        let changes = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: "abc")))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(worktree, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(agent, parent: worktree.id)).edit)
+        board.apply(try #require(board.inserting(changes, parent: agent.id)).edit)
+
+        let disk = MemoryWorkspaceDisk(board: board)
+        let workspace = WorkspaceStore(disk: disk)
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let agentAddress = NodeAddress(boardID: session.id, nodeID: agent.id)
+        let changesAddress = NodeAddress(boardID: session.id, nodeID: changes.id)
+        let terminal = AgentTerminal()
+        workspace.terminals[agentAddress] = terminal
+
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        canvas.actions.workspace = workspace
+        try await canvas.ready()
+        canvas.view.fitContent()
+
+        func center(of title: String) throws -> CGPoint {
+            let element = try #require(
+                canvas.view.accessibilityChildren()?.compactMap { $0 as? TopicAccessibilityElement }
+                    .first { $0.accessibilityLabel() == title })
+            let frame = canvas.view.convert(canvas.window.convertFromScreen(element.accessibilityFrame()), from: nil)
+            return CGPoint(x: frame.midX, y: frame.midY)
+        }
+
+        // Open the Agent terminal first.
+        canvas.actions.showTerminal(at: agentAddress, revealNode: false)
+        #expect(canvas.actions.terminalAddress == agentAddress)
+        #expect(terminal.owner == canvas.actions.windowID)
+
+        // Single-click selects Git Changes without disturbing the open Agent terminal.
+        let changesPoint = try center(of: changes.title)
+        try canvas.click(changesPoint)
+        #expect(canvas.view.selected == [changes.id])
+        #expect(canvas.actions.terminalAddress == agentAddress)
+        #expect(canvas.actions.gitChangesAddress == nil)
+        #expect(terminal.owner == canvas.actions.windowID)
+        #expect(canvas.window.firstResponder === canvas.view)
+
+        // Double-click opens the Git right pane and parks the terminal without closing it.
+        canvas.view.mouseDown(with: try canvas.event(.leftMouseDown, at: changesPoint, clickCount: 2))
+        canvas.view.mouseUp(with: try canvas.event(.leftMouseUp, at: changesPoint, clickCount: 2))
+        #expect(canvas.view.selected == [changes.id])
+        #expect(canvas.actions.gitChangesAddress == changesAddress)
+        #expect(canvas.actions.terminalAddress == nil)
+        #expect(terminal.owner == nil)
+        #expect(canvas.window.firstResponder === canvas.view)
+
+        // F2 reopens the Git Changes right pane after hiding it.
+        canvas.actions.hideRightPane()
+        #expect(canvas.actions.gitChangesAddress == nil)
+        let f2 = try #require(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: canvas.window.windowNumber, context: nil, characters: "",
+                charactersIgnoringModifiers: "", isARepeat: false, keyCode: 120))
+        canvas.view.keyDown(with: f2)
+        #expect(canvas.actions.gitChangesAddress == changesAddress)
+
+        // Context menu on Git Changes offers Open Git Changes & Show in Finder, not Configure.
+        canvas.actions.hideRightPane()
+        let changesMenu = try #require(canvas.view.menu(for: try canvas.event(.rightMouseDown, at: changesPoint)))
+        let titles = changesMenu.items.map(\.title)
+        #expect(titles.contains("Open Git Changes"))
+        #expect(titles.contains("Show in Finder"))
+        #expect(!titles.contains(where: { $0.hasPrefix("Configure") }))
+        let openIndex = try #require(titles.firstIndex(of: "Open Git Changes"))
+        changesMenu.performActionForItem(at: openIndex)
+        #expect(canvas.actions.gitChangesAddress == changesAddress)
+
+        // Right pane state persists and restores cleanly.
+        try await workspace.flush()
+        let restored = WorkspaceStore(disk: disk)
+        await restored.loadIfNeeded()
+        let restoredActions = EditorActions()
+        restoredActions.workspace = restored
+        restoredActions.restoreRightPane()
+        #expect(restoredActions.gitChangesAddress == changesAddress)
+
+        // Deleting Git Changes makes Add Git Changes available again on the Agent.
+        canvas.view.deleteSelection()
+        #expect(session.board.nodes[changes.id] == nil)
+        let agentPoint = try center(of: agent.title)
+        let agentMenu = try #require(canvas.view.menu(for: try canvas.event(.rightMouseDown, at: agentPoint)))
+        #expect(agentMenu.items.map(\.title).contains("Add Git Changes"))
+        #expect(canvas.actions.canAddGitChanges)
+        canvas.actions.add(.gitChanges)
+        let recreated = try #require(session.board.nodes[agent.id]?.children.last)
+        #expect(session.board.nodes[recreated]?.content.kind == .gitChanges)
+        #expect(canvas.actions.gitChangesAddress == NodeAddress(boardID: session.id, nodeID: recreated))
     }
 }

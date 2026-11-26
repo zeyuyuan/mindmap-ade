@@ -11,6 +11,17 @@ extension WorkspaceStore {
         for address in operations where address.boardID == boardID {
             details[address.nodeID] = "Preparing…"
         }
+        if let session = board(boardID) {
+            for id in session.gitChangesNodeIDs where details[id] == nil {
+                if let target = gitChangesTarget(for: id, in: session.board) {
+                    if let summary = gitChangesDetails[target] {
+                        details[id] = summary
+                    }
+                } else {
+                    details[id] = "No worktree"
+                }
+            }
+        }
         return details
     }
 
@@ -326,27 +337,55 @@ extension WorkspaceStore {
         _ agent: AgentTopic, to location: WorktreeLocation, creationCommit: String?,
         address: NodeAddress, session: BoardSession
     ) throws {
-        let board = session.board
-        var edit = board.replacingContent(address.nodeID, with: .agent(agent)) ?? BoardEdit()
-        let scope = board.context(above: address.nodeID)
+        let original = session.board
+        var candidate = original
+        var touched: [UUID] = []
+        var seen = Set<UUID>()
+        func record(_ edit: BoardEdit) {
+            for replacement in edit.nodes where seen.insert(replacement.id).inserted {
+                touched.append(replacement.id)
+            }
+        }
+        if let contentEdit = candidate.replacingContent(address.nodeID, with: .agent(agent)) {
+            candidate.apply(contentEdit)
+            record(contentEdit)
+        }
+        let scope = candidate.context(above: address.nodeID)
         if scope.worktree == nil {
-            let siblings = board.parents[address.nodeID].flatMap { board.nodes[$0]?.children } ?? board.roots.map(\.id)
+            let siblings =
+                candidate.parents[address.nodeID].flatMap { candidate.nodes[$0]?.children }
+                ?? candidate.roots.map(\.id)
             let reusable = siblings.first { id in
-                guard case .worktree(let worktree) = board.nodes[id]?.content else { return false }
+                guard case .worktree(let worktree) = candidate.nodes[id]?.content else { return false }
                 return worktree.location?.directory == location.directory
                     && worktree.location?.gitCommonDirectory == location.gitCommonDirectory
             }
             let parentEdit =
-                reusable.flatMap { board.moving(address.nodeID, to: $0) }
-                ?? board.insertingParent(
+                reusable.flatMap { candidate.moving(address.nodeID, to: $0) }
+                ?? candidate.insertingParent(
                     MapNode(content: .worktree(WorktreeTopic(location: location, creationCommit: creationCommit))),
                     above: address.nodeID)
             guard let parentEdit else { throw WorkspaceIssue("The worktree could not be attached to this node.") }
-            edit.nodes.append(contentsOf: parentEdit.nodes)
-            edit.roots = parentEdit.roots
+            candidate.apply(parentEdit)
+            record(parentEdit)
         }
-        if !edit.nodes.isEmpty || edit.roots != nil {
-            try apply(edit, in: session, action: "Configure Conversation")
+        let hasGitChanges =
+            candidate.nodes[address.nodeID]?.children.contains { candidate.nodes[$0]?.content.kind == .gitChanges }
+            == true
+        if !hasGitChanges {
+            let base = location.commit.isEmpty ? nil : location.commit
+            let changesNode = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: base)))
+            if let insertion = candidate.inserting(changesNode, parent: address.nodeID) {
+                candidate.apply(insertion.edit)
+                record(insertion.edit)
+            }
+        }
+        let replacements = touched.compactMap { id -> NodeReplacement? in
+            original.nodes[id] == candidate.nodes[id] ? nil : NodeReplacement(id: id, node: candidate.nodes[id])
+        }
+        let roots = candidate.roots == original.roots ? nil : candidate.roots
+        if !replacements.isEmpty || roots != nil {
+            try apply(BoardEdit(nodes: replacements, roots: roots), in: session, action: "Configure Conversation")
         }
     }
 

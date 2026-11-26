@@ -27,6 +27,13 @@ enum CanvasStyle {
     static let resourceIconPointSize: CGFloat = 16
     static let activeAgentTintFraction: CGFloat = 0.18
     static let activeAgentSymbol = "terminal.fill"
+    static let activeGitChangesSymbol = "plusminus.circle.fill"
+    static let diffAdditionOpacity: Double = 0.14
+    static let diffDeletionOpacity: Double = 0.14
+    static let diffHunkOpacity: Double = 0.08
+    static let gitChangesListMinimumHeight: CGFloat = 88
+    static let gitChangesDiffMinimumHeight: CGFloat = 120
+    static let gitChangesListDefaultShare: CGFloat = 0.36
     static let agentEditHighlightDuration: Duration = .seconds(6)
     static let agentEditFadeDuration: TimeInterval = 2
     static let agentEditTintFraction: CGFloat = 0.14
@@ -118,7 +125,7 @@ enum CanvasStyle {
         named name: String, color: NSColor, size: CGFloat, pointSize: CGFloat, contentsScale: CGFloat
     ) -> CGImage? {
         let configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
-            .applying(.init(paletteColors: [color]))
+            .applying(.preferringMonochrome())
         guard
             let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
                 .withSymbolConfiguration(configuration)
@@ -139,6 +146,9 @@ enum CanvasStyle {
             in: CGRect(
                 x: (size - symbol.size.width) / 2, y: (size - symbol.size.height) / 2,
                 width: symbol.size.width, height: symbol.size.height))
+        context.setBlendMode(.sourceIn)
+        context.setFillColor(color.cgColor)
+        context.fill(CGRect(origin: .zero, size: CGSize(width: size, height: size)))
         return context.makeImage()
     }
 

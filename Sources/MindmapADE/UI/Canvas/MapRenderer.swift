@@ -322,7 +322,9 @@ final class MapRenderer {
             resourceIconScale = contentsScale
             resourceIconColor = color
             resourceIconImages.removeAll(keepingCapacity: true)
-            let symbols = NodeKind.allCases.filter { $0 != .text }.map(\.symbol) + [CanvasStyle.activeAgentSymbol]
+            let symbols =
+                NodeKind.allCases.filter { $0 != .text }.map(\.symbol)
+                + [CanvasStyle.activeAgentSymbol, CanvasStyle.activeGitChangesSymbol]
             for symbol in symbols {
                 resourceIconImages[symbol] = CanvasStyle.symbolImage(
                     named: symbol, color: NSColor(cgColor: color) ?? .labelColor, size: MapMetrics.resourceIconSize,
@@ -339,7 +341,7 @@ final class MapRenderer {
     func render(
         board: MindMapBoard, layout: MapLayout, camera: MapCamera, viewport: CGRect,
         selection: Set<UUID>, backingScale: CGFloat, drag: MapDragPreview? = nil,
-        runtimeDetails: [UUID: String] = [:], editingTitleIDs: Set<UUID> = [], activeAgentID: UUID? = nil,
+        runtimeDetails: [UUID: String] = [:], editingTitleIDs: Set<UUID> = [], activePaneNodeID: UUID? = nil,
         agentEditedTopics: [UUID: ContinuousClock.Instant] = [:], focusedTopics: Set<UUID>? = nil,
         agentSummaries: [UUID: AgentBranchSummary] = [:]
     ) {
@@ -413,20 +415,26 @@ final class MapRenderer {
             }
             let kind = node.content.kind
             let isEditingTitle = editingTitleIDs.contains(id)
-            let isActiveAgent = kind == .agent && id == activeAgentID
+            let isActivePaneNode = (kind == .agent || kind == .gitChanges) && id == activePaneNodeID
             if kind != .text, camera.scale >= CanvasStyle.textDetailScale, icons == nil {
                 icons = resourceIcons(contentsScale: contentsScale)
+            }
+            let iconSymbol: String
+            if isActivePaneNode {
+                iconSymbol = kind == .gitChanges ? CanvasStyle.activeGitChangesSymbol : CanvasStyle.activeAgentSymbol
+            } else {
+                iconSymbol = kind.symbol
             }
             topic.configure(
                 node: node, descendantCount: placement.descendantCount,
                 isCollapsed: placement.children.isEmpty && !node.children.isEmpty, root: placement.depth == 0,
                 selected: selection.contains(id),
                 scale: camera.scale, contentsScale: contentsScale, runtimeDetail: runtimeDetails[id],
-                resourceIcon: icons?[isActiveAgent ? CanvasStyle.activeAgentSymbol : kind.symbol],
+                resourceIcon: icons?[iconSymbol],
                 isEditingTitle: isEditingTitle, agentSummary: agentSummaries[id]
             )
             topic.configureBackground(
-                showsCard: !isEditingTitle || kind != .text, isActiveAgent: isActiveAgent,
+                showsCard: !isEditingTitle || kind != .text, isActiveAgent: isActivePaneNode,
                 editDeadline: agentEditedTopics[id], now: now)
         }
 

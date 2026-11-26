@@ -8,7 +8,7 @@ struct MindMapCanvas: NSViewRepresentable {
     let actions: EditorActions
     let revision: Int
     let runtimeDetails: [UUID: String]
-    let activeAgentID: UUID?
+    let activePaneNodeID: UUID?
     let agentEditedTopics: [UUID: ContinuousClock.Instant]
     let agentRunStates: [UUID: AgentRun.State]
 
@@ -19,7 +19,7 @@ struct MindMapCanvas: NSViewRepresentable {
     func updateNSView(_ view: MindMapCanvasView, context: Context) {
         view.update(session: session, revision: revision)
         view.updatePresentation(
-            runtimeDetails: runtimeDetails, activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics,
+            runtimeDetails: runtimeDetails, activePaneNodeID: activePaneNodeID, agentEditedTopics: agentEditedTopics,
             agentRunStates: agentRunStates)
     }
 
@@ -84,7 +84,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     private var formLease: UUID?
     private var configureAfterLayout: UUID?
     private var runtimeDetails: [UUID: String] = [:]
-    private var activeAgentID: UUID?
+    private var activePaneNodeID: UUID?
     private var agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     private var agentRunStates: [UUID: AgentRun.State] = [:]
     private var agentSummaries: [UUID: AgentBranchSummary] = [:]
@@ -272,7 +272,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             savedLayout = nil
             requestedLayout = nil
             pendingFit = false
-            activeAgentID = nil
+            activePaneNodeID = nil
             agentEditedTopics.removeAll()
             agentRunStates.removeAll()
             refreshAgentSummaries()
@@ -448,7 +448,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 selection: selected, backingScale: window?.backingScaleFactor ?? 2,
                 drag: pointerGesture?.branch?.preview,
                 runtimeDetails: runtimeDetails, editingTitleIDs: editingTitleIDs,
-                activeAgentID: activeAgentID, agentEditedTopics: agentEditedTopics,
+                activePaneNodeID: activePaneNodeID, agentEditedTopics: agentEditedTopics,
                 focusedTopics: branchFocus?.topics, agentSummaries: agentSummaries
             )
             renderer.showDropTarget(dropIndicator)
@@ -461,15 +461,16 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     func updatePresentation(
-        runtimeDetails: [UUID: String], activeAgentID: UUID?, agentEditedTopics: [UUID: ContinuousClock.Instant] = [:],
+        runtimeDetails: [UUID: String], activePaneNodeID: UUID?,
+        agentEditedTopics: [UUID: ContinuousClock.Instant] = [:],
         agentRunStates: [UUID: AgentRun.State] = [:]
     ) {
         guard
-            self.runtimeDetails != runtimeDetails || self.activeAgentID != activeAgentID
+            self.runtimeDetails != runtimeDetails || self.activePaneNodeID != activePaneNodeID
                 || self.agentEditedTopics != agentEditedTopics || self.agentRunStates != agentRunStates
         else { return }
         self.runtimeDetails = runtimeDetails
-        self.activeAgentID = activeAgentID
+        self.activePaneNodeID = activePaneNodeID
         self.agentEditedTopics = agentEditedTopics
         if self.agentRunStates != agentRunStates {
             self.agentRunStates = agentRunStates
@@ -495,7 +496,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private var selectedWorktreeParent: UUID? {
         guard !session.isReadOnly, selected.count == 1, let id = selected.first,
-            let kind = session.board.nodes[id]?.content.kind, kind != .agent
+            let kind = session.board.nodes[id]?.content.kind, kind != .agent, kind != .gitChanges
         else { return nil }
         let parent = session.board.context(startingAt: id).worktreeID ?? id
         return session.board.canInsertResource(.worktree, under: parent) ? parent : nil
@@ -505,10 +506,19 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     private var canLinkWorktree: Bool {
         guard !session.isReadOnly, selected.count == 1, let id = selected.first,
-            let kind = session.board.nodes[id]?.content.kind, kind != .agent
+            let kind = session.board.nodes[id]?.content.kind, kind != .agent, kind != .gitChanges
         else { return false }
         return session.board.context(startingAt: id).worktreeID == nil
             && session.board.canInsertResource(.worktree, under: id)
+    }
+
+    private var canAddGitChanges: Bool {
+        guard !session.isReadOnly, selected.count == 1, let id = selected.first,
+            let node = session.board.nodes[id], case .agent(let agent) = node.content,
+            agent.isConfigured,
+            !node.children.contains(where: { session.board.nodes[$0]?.content.kind == .gitChanges })
+        else { return false }
+        return session.board.canInsertResource(.gitChanges, under: id)
     }
 
     private func updateActions() {
@@ -522,6 +532,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         actions.canAddProject = canAddProject
         actions.canAddWorktree = canAddWorktree
         actions.canLinkWorktree = canLinkWorktree
+        actions.canAddGitChanges = canAddGitChanges
         let undoManager = editingTextView?.undoManager
         actions.undoTitle = undoManager?.undoMenuItemTitle ?? session.undoTitle
         actions.redoTitle = undoManager?.redoMenuItemTitle ?? session.redoTitle
@@ -654,7 +665,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     func editSelection() { if selected.count == 1, let id = selected.first { openNode(id) } }
 
-    func revealTerminalNode(_ address: NodeAddress) {
+    func revealRightPaneNode(_ address: NodeAddress) {
         guard address.boardID == session.id, session.board.nodes[address.nodeID] != nil else { return }
         selected = [address.nodeID]
         revealAfterTerminalResize = address.nodeID
@@ -663,12 +674,19 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         render()
     }
 
+    func revealTerminalNode(_ address: NodeAddress) {
+        revealRightPaneNode(address)
+    }
+
     private func openNode(_ id: UUID) {
         guard let node = session.board.nodes[id] else { return }
+        let address = NodeAddress(boardID: session.id, nodeID: id)
         if node.content.kind == .text {
             beginEditing(id)
-        } else if workspace?.canOpenAgent(at: NodeAddress(boardID: session.id, nodeID: id)) == true {
-            actions?.showTerminal(at: NodeAddress(boardID: session.id, nodeID: id))
+        } else if node.content.kind == .gitChanges {
+            actions?.showGitChanges(at: address)
+        } else if workspace?.canOpenAgent(at: address) == true {
+            actions?.showTerminal(at: address)
         } else {
             configureNode(id)
         }
@@ -680,6 +698,10 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             let node = session.board.nodes[id], node.content.kind != .text
         else { return }
         let address = NodeAddress(boardID: session.id, nodeID: id)
+        if node.content.kind == .gitChanges {
+            actions?.showGitChanges(at: address)
+            return
+        }
         if workspace.agentRuns[address]?.state.isActive == true {
             actions?.showTerminal(at: address)
             return
@@ -759,7 +781,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
 
     func insertResource(_ kind: NodeKind, at point: CGPoint? = nil, source: UUID? = nil, linkWorktree: Bool = false) {
         guard !session.isReadOnly, kind != .text, kind != .project || canAddProject,
-            kind != .worktree || (linkWorktree ? canLinkWorktree : canAddWorktree)
+            kind != .worktree || (linkWorktree ? canLinkWorktree : canAddWorktree),
+            kind != .gitChanges || canAddGitChanges
         else { return }
         finishEditing()
         closeNodeForm()
@@ -781,6 +804,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 parent = worktreeParent
             }
             content = .worktree(worktree)
+        } else if kind == .gitChanges {
+            let commit = parent.flatMap { session.board.context(above: $0).worktree?.commit }
+            content = .gitChanges(GitChangesTopic(baseCommit: commit?.isEmpty == true ? nil : commit))
         } else {
             content = .draft(kind)
         }
@@ -795,9 +821,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             return
         }
         selected = [result.id]
-        configureAfterLayout = result.id
         revealAfterLayout = result.id
+        if kind != .gitChanges { configureAfterLayout = result.id }
         changed()
+        if kind == .gitChanges {
+            actions?.showGitChanges(at: NodeAddress(boardID: session.id, nodeID: result.id))
+        }
     }
 
     func deriveAgent() {
@@ -1874,7 +1903,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         switch node.content {
         case .project(let project): path = project.location?.directory
         case .worktree(let tree): path = tree.location?.directory
-        case .agent: path = session.board.context(above: id).worktree?.directory
+        case .agent, .gitChanges: path = session.board.context(above: id).worktree?.directory
         case .text, .branch: path = nil
         }
         if let path { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
@@ -1943,6 +1972,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         if canAddProject { addResource(.project) }
         if canAddWorktree { addResource(.worktree) }
         if canLinkWorktree { add("Link Existing Worktree…", #selector(linkWorktreeAction(_:)), symbol: "link") }
+        if canAddGitChanges { addResource(.gitChanges) }
         if let node, node.content.kind == .text, !node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             add(
                 "New Agent from Text", #selector(deriveAgentAction(_:)), symbol: NodeKind.agent.symbol, key: "\r",
@@ -1964,6 +1994,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 add("Edit Text", #selector(editAction(_:)), symbol: "pencil", key: editKey)
             } else if node.worktreeCreationDraft != nil {
                 add("Edit Worktree Name", #selector(editAction(_:)), symbol: "pencil", key: editKey)
+            } else if kind == .gitChanges {
+                add("Open Git Changes", #selector(editAction(_:)), symbol: NodeKind.gitChanges.symbol, key: editKey)
+                if session.board.context(above: node.id).worktree?.directory != nil {
+                    add("Show in Finder", #selector(showLocationAction(_:)), symbol: "arrow.up.right.square")
+                }
             } else {
                 let address = NodeAddress(boardID: session.id, nodeID: node.id)
                 let opensTerminal = workspace?.canOpenAgent(at: address) == true
@@ -2037,17 +2072,28 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             guard let node = board.nodes[id] else { continue }
             let element = accessibilityNodes[id] ?? TopicAccessibilityElement(id: id, canvas: self)
             element.setAccessibilityLabel(node.title)
-            element.setAccessibilityRoleDescription(node.content.kind == .project ? "project topic" : "mind map topic")
+            let roleDescription: String
+            switch node.content.kind {
+            case .project: roleDescription = "project topic"
+            case .gitChanges: roleDescription = "git changes topic"
+            default: roleDescription = "mind map topic"
+            }
+            element.setAccessibilityRoleDescription(roleDescription)
             let isCollapsed = mapLayout.nodes[id]?.children.isEmpty == true && !node.children.isEmpty
             let children =
                 isCollapsed
                 ? "Collapsed, \(mapLayout.nodes[id]?.descendantCount ?? 0) hidden topics"
                 : "\(node.children.count) children"
             let detail = runtimeDetails[id] ?? node.detail
-            let terminalStatus = id == activeAgentID ? "Active terminal" : nil
+            let paneStatus: String? =
+                if id == activePaneNodeID {
+                    node.content.kind == .gitChanges ? "Active git changes" : "Active terminal"
+                } else {
+                    nil
+                }
             let agentEditStatus = agentEditedTopics[id] != nil ? "Recently changed by an Agent" : nil
             element.setAccessibilityValue(
-                [terminalStatus, agentEditStatus, detail, children].compactMap { $0 }.joined(separator: ", "))
+                [paneStatus, agentEditStatus, detail, children].compactMap { $0 }.joined(separator: ", "))
             element.setAccessibilitySelected(selected.contains(id))
             element.setAccessibilityEnabled(!session.isReadOnly)
             accessibilityNodes[id] = element

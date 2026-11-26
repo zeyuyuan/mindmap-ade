@@ -3,6 +3,7 @@ import Foundation
 public enum ResourcePlacementProblem: Equatable, Sendable {
     case projectBelowResource, worktreeSourceChange, missingGitProject, differentRepository
     case agentWorktreeChange, missingAgentWorktree
+    case gitChangesAgentChange, missingGitChangesAgent
 
     public var message: String {
         switch self {
@@ -12,6 +13,8 @@ public enum ResourcePlacementProblem: Equatable, Sendable {
         case .differentRepository: NodeContext.Problem.differentRepository.message
         case .agentWorktreeChange: "Keep the Agent under its current worktree."
         case .missingAgentWorktree: "Move the Agent under a configured worktree."
+        case .gitChangesAgentChange: "Keep Git Changes under its Agent."
+        case .missingGitChangesAgent: "Place Git Changes under an Agent."
         }
     }
 }
@@ -27,6 +30,8 @@ public struct BranchResources: Sendable {
     fileprivate var worktreeSourceID: UUID?
     fileprivate var agentWorktreeID: UUID?
     fileprivate var requiresAgentWorktree = false
+    fileprivate var gitChangesAgentID: UUID?
+    fileprivate var requiresGitChangesAgent = false
 
     fileprivate mutating func addWorktree(_ worktree: WorktreeTopic, needsProject: Bool) {
         hasWorktree = true
@@ -68,6 +73,9 @@ extension MindMapBoard {
             var resources = BranchResources()
             resources.addWorktree(worktree, needsProject: true)
             return resources.projectProblem(gitDirectory: path.gitDirectory) == nil
+        case .gitChanges:
+            guard let parent, let owner = nodes[parent], case .agent = owner.content else { return false }
+            return true
         case .text, .agent:
             return true
         }
@@ -79,13 +87,14 @@ extension MindMapBoard {
         case .project(let project):
             guard permitsResource(content, under: parents[child]) else { return false }
             let resources = branchResources(in: child)
-            return !resources.hasProject
+            return !resources.hasProject && !resources.requiresGitChangesAgent
                 && resources.projectProblem(gitDirectory: project.location?.gitCommonDirectory) == nil
         case .worktree:
             guard permitsResource(content, under: parents[child]) else { return false }
             let resources = branchResources(in: child)
             return !resources.hasProject && !resources.hasWorktree && resources.agentWorktreeID == nil
-        case .branch:
+                && !resources.requiresGitChangesAgent
+        case .branch, .gitChanges:
             return false
         case .text, .agent:
             return true
@@ -98,6 +107,7 @@ extension MindMapBoard {
             let resources = branchResources(in: id)
             if resources.hasProject || resources.hasWorktree || resources.agentWorktreeID != nil
                 || resources.requiresAgentWorktree || resources.usesAncestorSource
+                || resources.requiresGitChangesAgent
             {
                 result[id] = resources
             }
@@ -130,6 +140,13 @@ extension MindMapBoard {
             } else if resources.requiresAgentWorktree && (context.worktree == nil || context.problem != nil) {
                 return .missingAgentWorktree
             }
+            if let agentID = resources.gitChangesAgentID {
+                if parent != agentID { return .gitChangesAgentChange }
+            } else if resources.requiresGitChangesAgent
+                && parent.flatMap({ nodes[$0]?.content.kind }) != .agent
+            {
+                return .missingGitChangesAgent
+            }
         }
         return nil
     }
@@ -154,11 +171,12 @@ extension MindMapBoard {
     private func branchResources(in root: UUID) -> BranchResources {
         var result = BranchResources()
         var usesAncestorWorktree = false
-        var pending = [(id: root, hasProject: false, hasWorktree: false)]
+        var pending = [(id: root, hasProject: false, hasWorktree: false, hasAgent: false)]
         while let next = pending.popLast() {
             guard let node = nodes[next.id] else { continue }
             var hasProject = next.hasProject
             var hasWorktree = next.hasWorktree
+            var hasAgent = next.hasAgent
             switch node.content {
             case .project:
                 result.hasProject = true
@@ -175,19 +193,29 @@ extension MindMapBoard {
                     }
                 }
                 hasWorktree = true
-            case .agent(let agent) where !hasProject && !hasWorktree:
-                usesAncestorWorktree = true
-                result.requiresAgentWorktree = result.requiresAgentWorktree || agent.isConfigured
-                if let plan = agent.worktreeChoice.pendingPlan {
-                    result.usesAncestorSource = true
-                    result.hasPreparedWorktree = true
-                    result.requiresGitProject = true
-                    result.requiredRepositories.insert(plan.gitCommonDirectory)
+            case .agent(let agent):
+                if !hasProject && !hasWorktree {
+                    usesAncestorWorktree = true
+                    result.requiresAgentWorktree = result.requiresAgentWorktree || agent.isConfigured
+                    if let plan = agent.worktreeChoice.pendingPlan {
+                        result.usesAncestorSource = true
+                        result.hasPreparedWorktree = true
+                        result.requiresGitProject = true
+                        result.requiredRepositories.insert(plan.gitCommonDirectory)
+                    }
                 }
-            case .text, .agent, .branch:
+                hasAgent = true
+            case .gitChanges where !hasAgent:
+                result.requiresGitChangesAgent = true
+                if result.gitChangesAgentID == nil, let owner = parents[next.id],
+                    nodes[owner]?.content.kind == .agent
+                {
+                    result.gitChangesAgentID = owner
+                }
+            case .text, .branch, .gitChanges:
                 break
             }
-            for child in node.children { pending.append((child, hasProject, hasWorktree)) }
+            for child in node.children { pending.append((child, hasProject, hasWorktree, hasAgent)) }
         }
         if usesAncestorWorktree || result.usesAncestorSource {
             let scope = context(above: root)
@@ -207,7 +235,7 @@ extension MindMapBoard {
                 result.projectCount += 1
             case .worktree:
                 result.hasSource = true
-            case .text, .agent, .branch:
+            case .text, .agent, .branch, .gitChanges:
                 break
             }
             current = parents[id]

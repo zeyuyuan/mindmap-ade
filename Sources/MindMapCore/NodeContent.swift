@@ -1,7 +1,7 @@
 import Foundation
 
 public enum NodeKind: String, CaseIterable, Codable, Sendable {
-    case text, project, worktree, agent
+    case text, project, worktree, agent, gitChanges
 
     public var title: String {
         switch self {
@@ -9,6 +9,7 @@ public enum NodeKind: String, CaseIterable, Codable, Sendable {
         case .project: "Project"
         case .worktree: "Worktree"
         case .agent: "Agent"
+        case .gitChanges: "Git Changes"
         }
     }
 }
@@ -150,12 +151,21 @@ public struct AgentTopic: Codable, Equatable, Sendable {
     }
 }
 
+public struct GitChangesTopic: Codable, Equatable, Sendable {
+    public var baseCommit: String?
+
+    public init(baseCommit: String? = nil) {
+        self.baseCommit = baseCommit
+    }
+}
+
 public enum NodeContent: Codable, Equatable, Sendable {
     case text
     case project(ProjectTopic)
     case branch(LegacyBranchTopic)
     case worktree(WorktreeTopic)
     case agent(AgentTopic)
+    case gitChanges(GitChangesTopic)
 
     public var kind: NodeKind {
         switch self {
@@ -163,12 +173,13 @@ public enum NodeContent: Codable, Equatable, Sendable {
         case .project: .project
         case .worktree: .worktree
         case .agent: .agent
+        case .gitChanges: .gitChanges
         }
     }
 
     public var isDraft: Bool {
         switch self {
-        case .text, .branch: false
+        case .text, .branch, .gitChanges: false
         case .project(let project): project.location == nil
         case .worktree(let worktree): worktree.location == nil
         case .agent(let agent): !agent.isConfigured
@@ -181,6 +192,7 @@ public enum NodeContent: Codable, Equatable, Sendable {
         case .project: .project(ProjectTopic())
         case .worktree: .worktree(WorktreeTopic())
         case .agent: .agent(AgentTopic())
+        case .gitChanges: .gitChanges(GitChangesTopic())
         }
     }
 }
@@ -203,6 +215,7 @@ public struct NodeContext: Equatable, Sendable {
     public var project: ProjectLocation?
     public var worktreeID: UUID?
     public var worktree: WorktreeLocation?
+    public var agentID: UUID?
     public var problem: Problem?
 
     public init() {}
@@ -218,6 +231,8 @@ extension MindMapBoard {
         var ancestor = parent
         while let id = ancestor, let node = nodes[id] {
             switch node.content {
+            case .agent where result.agentID == nil && result.worktreeID == nil:
+                result.agentID = id
             case .worktree(let value) where result.worktreeID == nil:
                 result.worktreeID = id
                 result.worktree = value.location
@@ -234,7 +249,7 @@ extension MindMapBoard {
                     result.problem = .unfinishedProject
                 }
                 return result
-            case .text, .agent, .branch, .worktree:
+            case .text, .agent, .branch, .worktree, .gitChanges:
                 break
             }
             ancestor = parents[id]

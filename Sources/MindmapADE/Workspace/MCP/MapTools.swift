@@ -112,7 +112,7 @@ private enum MapTool: String, CaseIterable {
                 + "Drafts use text as the Project name, proposed Worktree branch, or Agent task."
             fields = [
                 "parentId": ["type": ["string", "null"]],
-                "kind": ["type": "string", "enum": NodeKind.allCases.map(\.rawValue)],
+                "kind": ["type": "string", "enum": NodeKind.allCases.filter { $0 != .gitChanges }.map(\.rawValue)],
                 "text": ["type": "string"],
                 "expectedRevision": ["type": "integer"],
             ]
@@ -482,7 +482,8 @@ extension WorkspaceStore {
             let text = try boundedText(arguments["text"], limit: 24_000)
             let kind: NodeKind
             if let value = arguments["kind"] {
-                guard let raw = value as? String, let requested = NodeKind(rawValue: raw) else {
+                guard let raw = value as? String, let requested = NodeKind(rawValue: raw), requested != .gitChanges
+                else {
                     throw WorkspaceIssue("Choose a topic kind from text, project, worktree, or agent.")
                 }
                 kind = requested
@@ -566,6 +567,8 @@ extension WorkspaceStore {
             return MapNode(content: .worktree(worktree))
         case .agent:
             return MapNode(content: .agent(AgentTopic(task: text, cli: cli)))
+        case .gitChanges:
+            return MapNode(content: .gitChanges(GitChangesTopic()))
         }
     }
 

@@ -385,7 +385,10 @@ struct AgentWorkspaceTests {
         let repeated = try await request(connection, token: token, method: "tools/call", params: create)
         #expect(try toolResult(first)["nodeId"] as? String == toolResult(repeated)["nodeId"] as? String)
         #expect(session.agentEditedTopics[childID] == firstDeadline)
-        #expect(session.board.nodes[agent.id]?.children.count == 1)
+        let agentChildren = try #require(session.board.nodes[agent.id]?.children)
+        #expect(agentChildren.count == 2)
+        #expect(session.board.nodes[agentChildren[0]]?.content.kind == .gitChanges)
+        #expect(agentChildren[1] == childID)
         func call(_ name: String, _ arguments: [String: Any] = [:]) async throws -> [String: Any] {
             try await request(
                 connection, token: token, method: "tools/call", params: ["name": name, "arguments": arguments])
@@ -599,7 +602,7 @@ struct AgentWorkspaceTests {
             #expect(session.agentEditedTopics[id] != nil)
         }
         #expect(session.board.context(above: agent.id).worktree?.directory == location.directory)
-        #expect(await disk.snapshot().boards[0].nodes.count == 8)
+        #expect(await disk.snapshot().boards[0].nodes.count == 9)
         try await workspace.interruptAllAgents()
         let ended = try await request(connection, token: token, method: "tools/list")
         #expect(ended["error"] != nil)
@@ -1001,6 +1004,95 @@ struct AgentWorkspaceTests {
         }
         #expect(stopped.agentRuns[address]?.id == stoppedRun.id)
         #expect(stopped.terminals[address] == nil)
+    }
+
+    @Test func gitChangesSnapshotReadsWorkingTreeDiffsAndCommitsSinceBase() async throws {
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let author = [
+            "-c", "user.name=Mindmap Tests", "-c", "user.email=qa@example.invalid", "-c", "commit.gpgsign=false",
+        ]
+        let baseFile = fixture.repository.appendingPathComponent("Sources/hello world.txt")
+        try FileManager.default.createDirectory(
+            at: baseFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "line 1\nline 2\nline 3\n".write(to: baseFile, atomically: true, encoding: .utf8)
+        let removedFile = fixture.repository.appendingPathComponent("old.txt")
+        try "remove me\n".write(to: removedFile, atomically: true, encoding: .utf8)
+        try fixture.git(["add", "."])
+        try fixture.git(author + ["commit", "-m", "Add initial files"])
+        let baseCommit = try fixture.git(["rev-parse", "HEAD"]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Commit a change after baseCommit.
+        let committedFile = fixture.repository.appendingPathComponent("Sources/feature.swift")
+        try "let answer = 42\nprint(answer)\n".write(to: committedFile, atomically: true, encoding: .utf8)
+        try fixture.git(["add", "Sources/feature.swift"])
+        try fixture.git(author + ["commit", "-m", "Add feature module"])
+
+        // Create staged, unstaged, deleted, untracked text, and untracked binary working-tree changes.
+        try "line 1\nline 2 updated\nline 3\nline 4\n".write(to: baseFile, atomically: true, encoding: .utf8)
+        try fixture.git(["add", "Sources/hello world.txt"])
+        try "line 1\nline 2 updated\nline 3\nline 4\nline 5 unstaged\n".write(
+            to: baseFile, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: removedFile)
+        let untracked = fixture.repository.appendingPathComponent("notes 中文.md")
+        try "# Notes\nSecond line\n".write(to: untracked, atomically: true, encoding: .utf8)
+        let binary = fixture.repository.appendingPathComponent("asset.bin")
+        try Data([0x00, 0x01, 0x02, 0xFF]).write(to: binary)
+
+        let git = GitWorkspace()
+        let snapshot = try await git.changesSnapshot(in: fixture.repository.path, baseCommit: baseCommit)
+        #expect(snapshot.branchLabel == "main")
+        #expect(snapshot.commits.count == 1)
+        #expect(snapshot.commits.first?.subject == "Add feature module")
+        #expect(snapshot.commits.first?.fileCount == 1)
+        #expect(snapshot.commits.first?.additions == 2)
+
+        let staged = try #require(
+            snapshot.files.first { $0.section == .staged && $0.path == "Sources/hello world.txt" })
+        #expect(staged.status == .modified)
+        #expect(staged.directoryPath == "Sources")
+        #expect(staged.additions == 2)
+        #expect(staged.deletions == 1)
+
+        let unstaged = try #require(
+            snapshot.files.first { $0.section == .unstaged && $0.path == "Sources/hello world.txt" })
+        #expect(unstaged.status == .modified)
+        #expect(unstaged.additions == 1)
+        #expect(unstaged.deletions == 0)
+
+        let deleted = try #require(snapshot.files.first { $0.section == .unstaged && $0.path == "old.txt" })
+        #expect(deleted.status == .deleted)
+        #expect(deleted.deletions == 1)
+
+        let untrackedText = try #require(
+            snapshot.files.first { $0.section == .untracked && $0.path == "notes 中文.md" })
+        #expect(untrackedText.additions == 2)
+        #expect(!untrackedText.isBinary)
+
+        let untrackedBinary = try #require(snapshot.files.first { $0.section == .untracked && $0.path == "asset.bin" })
+        #expect(untrackedBinary.isBinary)
+        #expect(snapshot.cardDetail.hasPrefix("4 files"))
+
+        let stagedDiff = try await git.workingTreeDiff(for: staged, in: fixture.repository.path)
+        #expect(stagedDiff.lines.contains { $0.kind == .addition && $0.text == "line 2 updated" })
+        #expect(stagedDiff.lines.contains { $0.kind == .deletion && $0.text == "line 2" })
+
+        let untrackedDiff = try await git.workingTreeDiff(for: untrackedText, in: fixture.repository.path)
+        #expect(untrackedDiff.lines.map(\.text) == ["# Notes", "Second line"])
+        #expect(untrackedDiff.lines.allSatisfy { $0.kind == .addition })
+
+        let binaryDiff = try await git.workingTreeDiff(for: untrackedBinary, in: fixture.repository.path)
+        #expect(binaryDiff.isBinary)
+
+        let commit = try #require(snapshot.commits.first)
+        let commitFiles = try await git.commitFiles(for: commit.hash, in: fixture.repository.path)
+        #expect(commitFiles.count == 1)
+        let commitFile = try #require(commitFiles.first)
+        #expect(commitFile.path == "Sources/feature.swift")
+        #expect(commitFile.status == .added)
+        let commitDiff = try await git.commitFileDiff(
+            commit: commit.hash, file: commitFile, in: fixture.repository.path)
+        #expect(commitDiff.lines.contains { $0.kind == .addition && $0.text == "let answer = 42" })
     }
 
     @Test func terminalOutputRemainsPendingUntilWritten() async throws {

@@ -21,7 +21,7 @@ import Testing
         }
         """
     let archive = try JSONDecoder().decode(WorkspaceArchive.self, from: Data(legacy.utf8)).validated()
-    #expect(archive.schemaVersion == 7)
+    #expect(archive.schemaVersion == 8)
     #expect(archive.boards.first?.nodes[root]?.content == .text)
     #expect(archive.boards.first?.nodes[root]?.text == "Original text")
     #expect(archive.boards.first?.roots.first?.position == CGPoint(x: 30, y: 60))
@@ -62,7 +62,7 @@ import Testing
 
     let migrated = try JSONDecoder().decode(WorkspaceArchive.self, from: JSONEncoder().encode(archive)).validated()
     let result = try #require(migrated.boards.first)
-    #expect(migrated.schemaVersion == 7)
+    #expect(migrated.schemaVersion == 8)
     #expect(migrated.selectedBoardID == board.id)
     #expect(migrated.cameras[board.id] == camera)
     #expect(result.roots == board.roots)
@@ -293,4 +293,68 @@ func oldProjectCheckoutLiftsBranchesAndKeepsInheritedAgentBindings(hasInheritedA
     #expect(board.moving(unbound, to: unfinished) == nil)
     board.apply(try #require(board.moving(unbound, to: original)))
     #expect(board.moving(unbound, to: root.id) == nil)
+}
+
+@Test func gitChangesNodesStayBoundToTheirAgentAndMoveWithTheirBranch() throws {
+    let common = "/project/.git"
+    var project = ProjectTopic()
+    project.location = ProjectLocation(directory: "/project", gitCommonDirectory: common)
+    let root = MapNode(content: .project(project))
+    var board = MindMapBoard(root: root)
+    func insert(_ node: MapNode, under parent: UUID?) throws -> UUID {
+        let insertion = try #require(board.inserting(node, parent: parent))
+        board.apply(insertion.edit)
+        return insertion.id
+    }
+    let location = WorktreeLocation(
+        directory: "/checkout", gitCommonDirectory: common, branch: "feature/git-node", commit: "abc1234",
+        isPrimary: false)
+    let worktree = try insert(MapNode(content: .worktree(WorktreeTopic(location: location))), under: root.id)
+    var agentTopic = AgentTopic(task: "Implement changes")
+    agentTopic.isConfigured = true
+    let agentA = try insert(MapNode(content: .agent(agentTopic)), under: worktree)
+    let agentB = try insert(MapNode(content: .agent(agentTopic)), under: worktree)
+    let note = try insert(MapNode(text: "Group"), under: worktree)
+
+    #expect(board.inserting(MapNode(content: .gitChanges(GitChangesTopic())), parent: nil) == nil)
+    #expect(board.inserting(MapNode(content: .gitChanges(GitChangesTopic())), parent: root.id) == nil)
+    #expect(board.inserting(MapNode(content: .gitChanges(GitChangesTopic())), parent: worktree) == nil)
+    #expect(board.inserting(MapNode(content: .gitChanges(GitChangesTopic())), parent: note) == nil)
+
+    let changes = try insert(MapNode(content: .gitChanges(GitChangesTopic(baseCommit: "abc1234"))), under: agentA)
+    let context = board.context(above: changes)
+    #expect(context.agentID == agentA)
+    #expect(context.worktreeID == worktree)
+    #expect(context.projectID == root.id)
+    #expect(context.problem == nil)
+
+    // Cannot detach or reparent Git Changes away from its owning Agent.
+    #expect(board.moving(changes, to: nil) == nil)
+    #expect(board.moving(changes, to: worktree) == nil)
+    #expect(board.moving(changes, to: agentB) == nil)
+    #expect(board.moving(changes, to: note) == nil)
+    #expect(board.insertingParent(MapNode(content: .worktree(WorktreeTopic())), above: changes) == nil)
+    #expect(board.insertingParent(MapNode(content: .project(ProjectTopic())), above: changes) == nil)
+
+    // Reordering under the same Agent and adding follow-up notes beneath Git Changes are allowed.
+    let agentNote = try insert(MapNode(text: "Plan"), under: agentA)
+    board.apply(try #require(board.moving(changes, to: agentA, at: 1)))
+    #expect(board.nodes[agentA]?.children == [agentNote, changes])
+    let review = try insert(MapNode(text: "Review notes"), under: changes)
+    #expect(board.parents[review] == changes)
+
+    // Moving the owning Agent within its worktree carries its Git Changes subtree along cleanly.
+    board.apply(try #require(board.moving(agentA, to: note)))
+    #expect(board.parents[agentA] == note)
+    #expect(board.parents[changes] == agentA)
+
+    let archive = WorkspaceArchive(
+        boards: [board],
+        rightPane: RightPaneState(
+            address: NodeAddress(boardID: board.id, nodeID: changes), kind: .gitChanges, widthShare: 0.45)
+    )
+    let decoded = try JSONDecoder().decode(WorkspaceArchive.self, from: JSONEncoder().encode(archive)).validated()
+    #expect(decoded.schemaVersion == 8)
+    #expect(decoded.rightPane == archive.rightPane)
+    #expect(decoded.boards.first?.nodes[changes]?.content == .gitChanges(GitChangesTopic(baseCommit: "abc1234")))
 }

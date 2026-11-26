@@ -66,7 +66,10 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 | `findSelectionOpacity` | 0.18 | System selection color behind the highlighted search result |
 | `selectionOpacity` | 0.08 | Accent fill for selection and drop overlays |
 | `resourceIconPointSize` | 16 pt | Symbol inside the resource icon tile |
-| `activeAgentTintFraction` | 0.18 | System accent blended into the active Agent card background |
+| `activeAgentTintFraction` | 0.18 | System accent blended into the active Agent or Git Changes card background |
+| `activeAgentSymbol` / `activeGitChangesSymbol` | `terminal.fill` / `plusminus.circle.fill` | Active-pane SF Symbols for Agent and Git Changes cards |
+| `diffAdditionOpacity` / `diffDeletionOpacity` / `diffHunkOpacity` | 0.14 / 0.14 / 0.08 | Semantic green, red, and accent row fills in the Git Changes diff viewer |
+| `gitChangesListMinimumHeight` / `gitChangesDiffMinimumHeight` / `gitChangesListDefaultShare` | 88 / 120 pt / 0.36 | Vertical split bounds and default list share inside the Git Changes pane |
 | `agentEditColor` / `agentEditTintFraction` | System green / 0.14 | Semantic color for recent Agent changes, blended over the current card background |
 | `agentEditHighlightDuration` / `agentEditFadeDuration` | 6 / 2 s | Full green tint followed by a linear fade to the current card background |
 | `formWidth` / `formMaximumBodyHeight` | 384 / 344 pt | Native node popover and its scrollable form body |
@@ -87,7 +90,7 @@ Defined in `Sources/MindmapADE/UI/Canvas/CanvasStyle.swift`.
 
 `MapCamera.minimumScale` is 0.000001 and `maximumScale` is 4, allowing Fit Content to include very large maps. Sub-percent magnification displays fractional percentages. Editing below 75% aims for 100%; editing is capped at 150% and reduced as needed to fit the topic's width. Fit Content enlarges no further than 150%. Camera changes preserve their anchor. Native sidebar controls use system sizing.
 
-Selection uses the system accent outline. The Agent whose terminal pane is open has a tinted card and the `terminal.fill` symbol. Its highlight follows the pane independently of canvas selection and process status. Do not add custom glass or shadows to map content. Disable implicit layer animations during pointer manipulation.
+Selection uses the system accent outline. The Agent or Git Changes node whose right pane is open has a tinted card and its filled symbol (`terminal.fill` or `plusminus.circle.fill`). Its highlight follows the pane independently of canvas selection and process status. Do not add custom glass or shadows to map content. Disable implicit layer animations during pointer manipulation.
 
 During a branch drag, use the system accent to outline a prospective parent or draw a solid insertion line for a sibling. The status bar describes the result of releasing at the current point.
 
@@ -101,11 +104,11 @@ Branch controls sit outside the card: minus collapses, a numeric badge expands. 
 
 Place hidden Agent status beside the outermost collapsed branch that contains each Agent. Show active, failed, and interrupted counts in text. One Agent is a direct jump, and several use a native menu.
 
-Resource cards use a leading SF Symbol on a tertiary system fill. Use the folder, branching arrows, and terminal symbols for projects, worktrees, and agents. A Git Project shows its current branch beneath its name. A bound folder without Git shows its name centered beside the icon. An unbound Project keeps its Draft label. Worktree cards show their branch and directory name. The enclosing Project or parent Worktree identifies a new checkout’s source. Hide the symbols with the text at overview zoom. Keep the popover anchored to the node at system control size. Close or Keep Draft keeps a new draft available to complete later. A new Worktree has a focused name field inside its card, with the generated branch name as the placeholder. Tab accepts the name. Return or leaving the field creates the checkout. Keep the terminal at its own text size inside the board window.
+Resource cards use a leading SF Symbol on a tertiary system fill. Use the folder, branching arrows, terminal, and plus-minus circle symbols for projects, worktrees, agents, and git changes. A Git Project shows its current branch beneath its name. A bound folder without Git shows its name centered beside the icon. An unbound Project keeps its Draft label. Worktree cards show their branch and directory name. Git Changes cards show the live working-tree and commit summary beneath their title. The enclosing Project or parent Worktree identifies a new checkout’s source. Hide the symbols with the text at overview zoom. Keep the popover anchored to the node at system control size. Close or Keep Draft keeps a new draft available to complete later. A new Worktree has a focused name field inside its card, with the generated branch name as the placeholder. Tab accepts the name. Return or leaving the field creates the checkout. Keep the terminal at its own text size inside the board window.
 
 Lay out the native text editor in world coordinates at the canvas font size and scale the editor view with the camera. Use the draft dimensions to lay out the tree, including neighboring topics and connectors, as text changes. Keep the editor clipped to the space the current tree layout has assigned, including while a new layout is pending. Preserve the viewport when committing an inline text edit. Reserve space for empty and trailing lines so the insertion point stays visible. Scroll overflowing text within the topic and reserve the same trailing inset in the editor and preview. Keep native caret, selection, and input-method geometry in the same text-container coordinate system.
 
-The Agent terminal opens to the right of the canvas at half the board width. Keep its controls in the pane header, with icon buttons and help labels so they fit at the minimum window size. The divider adjusts the two pane widths without changing the terminal font size.
+The right detail pane (Agent terminal or Git Changes) opens to the right of the canvas at half the board width. Keep its controls in the pane header, with icon buttons and help labels so they fit at the minimum window size. The divider adjusts the two pane widths without changing the terminal font size. Inside the Git Changes pane, a horizontal divider separates the changed files or commit list from the monospaced unified diff view.
 
 ## Spacing
 

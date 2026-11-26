@@ -300,19 +300,21 @@ private struct TerminalAttachment: NSViewRepresentable {
 
 struct TerminalDivider: NSViewRepresentable {
     let width: CGFloat
+    var label = "Terminal width"
     let resize: (CGFloat) -> Void
 
     func makeNSView(context: Context) -> Grip {
         let view = Grip()
         view.setAccessibilityElement(true)
         view.setAccessibilityRole(.slider)
-        view.setAccessibilityLabel("Terminal width")
+        view.setAccessibilityLabel(label)
         return view
     }
 
     func updateNSView(_ view: Grip, context: Context) {
         view.terminalWidth = width
         view.resize = resize
+        view.setAccessibilityLabel(label)
         view.setAccessibilityValue("\(Int(width)) points")
     }
 

@@ -131,14 +131,14 @@ struct RendererRegressionTests {
         let renderer = MapRenderer(layer: host)
         let viewport = CGRect(x: 0, y: 0, width: 300, height: 200)
 
-        func render(activeAgentID: UUID?, agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]) {
+        func render(activePaneNodeID: UUID?, agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]) {
             renderer.render(
                 board: board, layout: layout, camera: MapCamera(), viewport: viewport,
-                selection: [second.id], backingScale: 2, activeAgentID: activeAgentID,
+                selection: [second.id], backingScale: 2, activePaneNodeID: activePaneNodeID,
                 agentEditedTopics: agentEditedTopics)
         }
 
-        render(activeAgentID: nil)
+        render(activePaneNodeID: nil)
         let trees = try #require(host.sublayers?.first?.sublayers)
         let firstCard = try #require(trees.first?.sublayers?.first)
         let secondCard = try #require(trees.last?.sublayers?.first)
@@ -147,14 +147,14 @@ struct RendererRegressionTests {
         let background = try #require(firstCard.backgroundColor)
         let icon = try #require(firstIcon.contents as AnyObject?)
 
-        render(activeAgentID: first.id)
+        render(activePaneNodeID: first.id)
         #expect(firstCard.backgroundColor != background)
         #expect(firstIcon.contents as AnyObject? !== icon)
         #expect(firstCard.borderWidth == CanvasStyle.borderWidth)
         #expect(secondCard.backgroundColor == background)
         #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
 
-        render(activeAgentID: second.id)
+        render(activePaneNodeID: second.id)
         #expect(firstCard.backgroundColor == background)
         #expect(firstIcon.contents as AnyObject? === icon)
         #expect(secondCard.backgroundColor != background)
@@ -166,7 +166,7 @@ struct RendererRegressionTests {
         let selectionBorder = secondCard.borderColor
         let contentsCount = secondCard.sublayers?.count
         let deadline = ContinuousClock.now.advanced(by: .seconds(8))
-        render(activeAgentID: second.id, agentEditedTopics: [second.id: deadline])
+        render(activePaneNodeID: second.id, agentEditedTopics: [second.id: deadline])
         let key = try #require(secondCard.animationKeys()?.first)
         let fade = try #require(secondCard.animation(forKey: key) as? CABasicAnimation)
         #expect(secondCard.sublayers?.count == contentsCount)
@@ -179,20 +179,55 @@ struct RendererRegressionTests {
         #expect(secondCard.borderColor == selectionBorder)
         #expect(secondIcon.contents as AnyObject? === activeIcon)
 
-        render(activeAgentID: second.id, agentEditedTopics: [second.id: deadline])
+        render(activePaneNodeID: second.id, agentEditedTopics: [second.id: deadline])
         #expect(secondCard.animation(forKey: key)?.beginTime == fade.beginTime)
-        render(activeAgentID: second.id, agentEditedTopics: [second.id: deadline.advanced(by: .seconds(1))])
+        render(activePaneNodeID: second.id, agentEditedTopics: [second.id: deadline.advanced(by: .seconds(1))])
         #expect((secondCard.animation(forKey: key)?.beginTime ?? 0) > fade.beginTime + 0.8)
 
-        render(activeAgentID: first.id, agentEditedTopics: [second.id: .now.advanced(by: .seconds(1))])
+        render(activePaneNodeID: first.id, agentEditedTopics: [second.id: .now.advanced(by: .seconds(1))])
         let inProgress = try #require(secondCard.animation(forKey: key) as? CABasicAnimation)
         #expect(inProgress.beginTime < secondCard.convertTime(CACurrentMediaTime(), from: nil))
         #expect((inProgress.toValue as! CGColor) == background)
 
-        render(activeAgentID: nil)
+        render(activePaneNodeID: nil)
         #expect(secondCard.animation(forKey: key) == nil)
         #expect(secondCard.backgroundColor == background)
         #expect(secondIcon.contents as AnyObject? === icon)
         #expect(secondCard.borderWidth == CanvasStyle.selectedBorderWidth)
+    }
+
+    @Test func activeGitChangesCardHighlightsIndependentlyOfSelection() throws {
+        _ = NSApplication.shared
+        let agent = MapNode(content: .agent(AgentTopic(task: "Session")))
+        var board = MindMapBoard(root: agent)
+        let changes = MapNode(content: .gitChanges(GitChangesTopic()))
+        board.apply(try #require(board.inserting(changes, parent: agent.id)).edit)
+        let size = CGSize(width: MapMetrics.resourceMinimumWidth, height: MapMetrics.resourceHeight)
+        let layout = TreeLayout.make(board: board, sizes: [agent.id: size, changes.id: size])
+        let host = CALayer()
+        let renderer = MapRenderer(layer: host)
+        let viewport = CGRect(x: 0, y: 0, width: 640, height: 200)
+
+        renderer.render(
+            board: board, layout: layout, camera: MapCamera(), viewport: viewport,
+            selection: [agent.id], backingScale: 2, activePaneNodeID: nil)
+        let tree = try #require(host.sublayers?.first?.sublayers?.first)
+        let cards = try #require(tree.sublayers?.filter { $0.cornerRadius == CanvasStyle.nodeRadius })
+        let changesCard = try #require(cards.first { $0.frame == layout.nodes[changes.id]?.frame })
+        let changesIcon = try #require(changesCard.sublayers?.first { $0.contents != nil })
+        let idleBackground = try #require(changesCard.backgroundColor)
+        let idleIcon = try #require(changesIcon.contents as AnyObject?)
+
+        renderer.render(
+            board: board, layout: layout, camera: MapCamera(), viewport: viewport,
+            selection: [agent.id], backingScale: 2, activePaneNodeID: changes.id)
+        #expect(changesCard.backgroundColor != idleBackground)
+        #expect(changesIcon.contents as AnyObject? !== idleIcon)
+
+        renderer.render(
+            board: board, layout: layout, camera: MapCamera(), viewport: viewport,
+            selection: [agent.id], backingScale: 2, activePaneNodeID: nil)
+        #expect(changesCard.backgroundColor == idleBackground)
+        #expect(changesIcon.contents as AnyObject? === idleIcon)
     }
 }

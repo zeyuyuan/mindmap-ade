@@ -34,7 +34,7 @@ struct RootView: View {
             actions.workspace = workspace
             selectedBoardID = workspace.board(workspace.lastSelectedBoardID)?.id ?? workspace.boards.first?.id
             actions.targetBoardID = selectedBoardID
-            actions.restoreTerminalPane()
+            actions.restoreRightPane()
             didRestoreWorkspace = true
         }
         .onChange(of: actions.requestedBoardID) { _, id in
@@ -50,7 +50,7 @@ struct RootView: View {
         }
         .onDisappear {
             actions.detachTerminal()
-            workspace.releaseAgentPane(from: actions.windowID)
+            workspace.releaseRightPane(from: actions.windowID)
         }
         .onChange(of: workspace.boards.map(\.id)) { _, ids in
             guard didRestoreWorkspace else { return }
@@ -149,29 +149,46 @@ private struct BoardCanvasContent: View {
         let activationCount: Int
     }
 
+    private struct GitChangesRefresh: Equatable {
+        let boardID: UUID
+        let targets: [GitChangesTarget]
+        let runStates: [UUID: AgentRun.State]
+        let activationCount: Int
+    }
+
     var body: some View {
         GeometryReader { geometry in
-            let terminalAddress = visibleTerminalAddress
+            let rightPane = visibleRightPane
             HStack(spacing: 0) {
                 MindMapCanvas(
                     session: session, workspace: workspace, actions: actions, revision: session.revision,
-                    runtimeDetails: runtimeDetails, activeAgentID: terminalAddress?.nodeID,
+                    runtimeDetails: runtimeDetails, activePaneNodeID: rightPane?.address.nodeID,
                     agentEditedTopics: session.agentEditedTopics,
                     agentRunStates: workspace.agentRunStates(in: session.id)
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if let address = terminalAddress {
+                if let pane = rightPane {
                     let available = max(0, geometry.size.width - CanvasStyle.terminalResizeHandleWidth)
-                    let width = boundedTerminalWidth(available * actions.terminalWidthShare, available: available)
-                    TerminalDivider(width: width) { proposed in
+                    let width = boundedPaneWidth(available * actions.paneWidthShare, available: available)
+                    TerminalDivider(
+                        width: width,
+                        label: pane.kind == .gitChanges ? "Git changes width" : "Terminal width"
+                    ) { proposed in
                         if available > 0 {
-                            actions.resizeTerminal(to: boundedTerminalWidth(proposed, available: available) / available)
+                            actions.resizePane(to: boundedPaneWidth(proposed, available: available) / available)
                         }
                     }
                     .frame(width: CanvasStyle.terminalResizeHandleWidth)
-                    AgentTerminalPane(address: address, session: session, workspace: workspace, actions: actions)
-                        .frame(width: width)
-                        .id(address)
+                    switch pane {
+                    case .terminal(let address):
+                        AgentTerminalPane(address: address, session: session, workspace: workspace, actions: actions)
+                            .frame(width: width)
+                            .id(address)
+                    case .gitChanges(let address):
+                        GitChangesPane(address: address, session: session, workspace: workspace, actions: actions)
+                            .frame(width: width)
+                            .id(address)
+                    }
                 }
             }
         }
@@ -188,6 +205,14 @@ private struct BoardCanvasContent: View {
             )
         ) {
             await refreshProjectCheckoutLabels()
+        }
+        .task(
+            id: GitChangesRefresh(
+                boardID: session.id, targets: gitChangesTargets,
+                runStates: workspace.agentRunStates(in: session.id), activationCount: activationCount
+            )
+        ) {
+            await refreshGitChangesSummaries()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             activationCount += 1
@@ -235,11 +260,29 @@ private struct BoardCanvasContent: View {
         return undoTargetsAgentEdit ? "\(status) · ⌘Z to undo" : status
     }
 
-    private var visibleTerminalAddress: NodeAddress? {
-        guard let address = actions.terminalAddress, address.boardID == session.id,
-            workspace.canOpenAgent(at: address)
-        else { return nil }
-        return address
+    private var visibleRightPane: EditorActions.RightPane? {
+        guard let pane = actions.rightPane, pane.address.boardID == session.id else { return nil }
+        switch pane {
+        case .terminal(let address):
+            return workspace.canOpenAgent(at: address) ? pane : nil
+        case .gitChanges(let address):
+            return workspace.canOpenGitChanges(at: address) ? pane : nil
+        }
+    }
+
+    private var gitChangesTargets: [GitChangesTarget] {
+        _ = session.revision
+        var targets: [GitChangesTarget] = []
+        var seen = Set<GitChangesTarget>()
+        for id in session.gitChangesNodeIDs {
+            if let target = workspace.gitChangesTarget(for: id, in: session.board), seen.insert(target).inserted {
+                targets.append(target)
+            }
+        }
+        return targets.sorted {
+            $0.directory == $1.directory
+                ? ($0.baseCommit ?? "") < ($1.baseCommit ?? "") : $0.directory < $1.directory
+        }
     }
 
     private var runtimeDetails: [UUID: String] {
@@ -259,7 +302,27 @@ private struct BoardCanvasContent: View {
         if !Task.isCancelled { projectCheckoutLabels = labels }
     }
 
-    private func boundedTerminalWidth(_ proposed: CGFloat, available: CGFloat) -> CGFloat {
+    private func refreshGitChangesSummaries() async {
+        let targets = gitChangesTargets
+        guard !targets.isEmpty else { return }
+        func pollOnce() async {
+            for target in targets {
+                guard !Task.isCancelled else { return }
+                if let snapshot = try? await workspace.git.changesSnapshot(
+                    in: target.directory, baseCommit: target.baseCommit)
+                {
+                    workspace.recordGitChangesSnapshot(snapshot, for: target)
+                }
+            }
+        }
+        await pollOnce()
+        while !Task.isCancelled, workspace.activeRunCount(in: session.id) > 0 {
+            do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            await pollOnce()
+        }
+    }
+
+    private func boundedPaneWidth(_ proposed: CGFloat, available: CGFloat) -> CGFloat {
         let half = available / 2
         let minimum = min(CanvasStyle.terminalMinimumWidth, half)
         let maximum = available - min(CanvasStyle.canvasMinimumWidth, half)

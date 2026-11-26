@@ -74,6 +74,8 @@ extension MapNode {
                 return node
             }
             return isOrigin ? [progress, task, name] : [task, name, progress]
+        case .gitChanges:
+            return []
         }
     }
 }

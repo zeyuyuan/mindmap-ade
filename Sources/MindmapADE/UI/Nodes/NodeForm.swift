@@ -140,7 +140,7 @@ final class NodeFormModel {
             case .agent(let agent):
                 try await workspace.launchAgent(agent, at: address)
                 showTerminal()
-            case .text, .branch:
+            case .text, .branch, .gitChanges:
                 return
             }
             close()
@@ -190,6 +190,7 @@ extension NodeKind {
         case .project: "folder"
         case .worktree: "arrow.triangle.branch"
         case .agent: "terminal"
+        case .gitChanges: "plusminus.circle"
         }
     }
 }
@@ -281,7 +282,7 @@ struct NodeForm: View {
                     }
                 case .agent:
                     agentFields
-                case .text, .branch:
+                case .text, .branch, .gitChanges:
                     EmptyView()
                 }
             }
@@ -321,6 +322,7 @@ struct NodeForm: View {
     private var showsSave: Bool {
         switch model.content {
         case .worktree: !model.showsWorktreeDetails
+        case .gitChanges: false
         default: true
         }
     }
@@ -330,7 +332,7 @@ struct NodeForm: View {
         case .project: "Save Project"
         case .worktree: "Link Worktree"
         case .agent: "Start"
-        case .text, .branch: "Save"
+        case .text, .branch, .gitChanges: "Save"
         }
     }
 
@@ -343,7 +345,7 @@ struct NodeForm: View {
             model.context.problem == nil && model.context.project?.gitCommonDirectory != nil
                 && (model.context.worktree != nil || model.selectionIsComplete(model.worktreeChoice))
                 && cliAvailability[model.agent.cli] == true
-        case .text, .branch: false
+        case .text, .branch, .gitChanges: false
         }
     }
 

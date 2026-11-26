@@ -20,6 +20,23 @@ public struct AgentPaneState: Codable, Equatable, Sendable {
     }
 }
 
+public enum RightPaneKind: String, Codable, Equatable, Sendable {
+    case terminal
+    case gitChanges
+}
+
+public struct RightPaneState: Codable, Equatable, Sendable {
+    public let address: NodeAddress
+    public let kind: RightPaneKind
+    public let widthShare: Double
+
+    public init(address: NodeAddress, kind: RightPaneKind, widthShare: Double) {
+        self.address = address
+        self.kind = kind
+        self.widthShare = widthShare
+    }
+}
+
 // Retain the nested launcher so runs from older archives can still be decoded.
 public struct AgentLauncher: Codable, Equatable, Sendable {
     public let executable: String

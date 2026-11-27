@@ -98,7 +98,7 @@ The board find bar and its result list use the system bar material. A result has
 
 Agent edits tint each directly changed topic for the hold and fade durations. The fade changes only the background color, including with Reduce Motion enabled. VoiceOver exposes the status on the topic. The status bar describes the latest Agent edit, including deletions, and shows the standard Undo shortcut when it would undo that edit.
 
-The status bar distinguishes loading, saving, saved, failed, and read-only states. Place workspace errors below the split view so they do not cover the canvas status or sidebar controls. Undo a board deletion from the Edit menu without adding a footer.
+The status bar distinguishes loading, saving, saved, failed, and read-only states. Place workspace errors below the split view so they do not cover the canvas status or sidebar controls. Undo a board deletion from the Edit menu. The sidebar’s Recently Deleted section lets people restore an individual board after relaunch.
 
 Branch controls sit outside the card: minus collapses, a numeric badge expands. A collapsed branch shows its total descendants, including descendants below other folded nodes, and excludes the topic itself. The badge widens for multiple digits without changing card width. Counts are derived once per layout snapshot and reused during camera movement. Hide controls below `textDetailScale`, matching the text detail level. Use the same geometry for drawing, pointer hit testing, and accessibility frames.
 

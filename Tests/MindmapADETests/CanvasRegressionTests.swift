@@ -213,6 +213,57 @@ struct CanvasRegressionTests {
         #expect(session.board == board)
     }
 
+    @Test func deletedBoardsCanBeRestoredInEitherOrderAfterReopening() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first: UUID
+        let second: UUID
+        let third: UUID
+        let original: MindMapBoard
+        let run: AgentRun
+        do {
+            let workspace = WorkspaceStore(directory: directory)
+            await workspace.loadIfNeeded()
+            let session = try #require(workspace.boards.first)
+            first = session.id
+            let agent = MapNode(content: .agent(AgentTopic(task: "Test recovery")))
+            let rootID = session.board.roots[0].id
+            let insertion = try #require(session.board.inserting(agent, parent: rootID))
+            #expect(session.apply(insertion.edit, named: "Add Agent"))
+            original = session.board
+            let address = NodeAddress(boardID: first, nodeID: agent.id)
+            let checkout = WorktreeLocation(
+                directory: "/test", gitCommonDirectory: "/test/.git",
+                branch: "test", commit: "a", isPrimary: false)
+            var stopped = AgentRun(address: address, worktree: checkout, cli: .codex, executable: "codex")
+            stopped.state = .stopped
+            run = stopped
+            workspace.agentRuns[address] = run
+            try await workspace.agentFiles.saveSnapshot(Data("Output".utf8), for: run.id)
+            workspace.rememberSelection([agent.id], for: first)
+            second = try #require(workspace.createBoard())
+            third = try #require(workspace.createBoard())
+            workspace.deleteBoard(first)
+            workspace.deleteBoard(second)
+            #expect(workspace.boards.map(\.id) == [third])
+            try await workspace.flush()
+        }
+        let reopened = WorkspaceStore(directory: directory)
+        await reopened.loadIfNeeded()
+        #expect(!reopened.isReadOnly)
+        #expect(reopened.deletedBoards.map(\.id) == [first, second])
+        #expect(reopened.lastBoardDeletionTime == nil)
+        #expect(reopened.restoreBoard(first) == first)
+        #expect(reopened.restoreBoard(second) == second)
+        #expect(reopened.boards.map(\.id) == [first, second, third])
+        #expect(reopened.board(first)?.board == original)
+        #expect(reopened.agentRuns[run.address]?.id == run.id)
+        #expect(reopened.selections[first] == [run.address.nodeID])
+        #expect(await reopened.agentFiles.snapshot(for: run.id) == "Output")
+        #expect(reopened.deletedBoards.isEmpty)
+        try await reopened.flush()
+    }
+
     @Test(arguments: [0.75, 1.04, 1.5])
     func textEditorMatchesTheCanvasFontAndPositionAtDifferentZooms(zoom: Double) async throws {
         let root = MapNode(text: "Hello World")

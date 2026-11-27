@@ -25,7 +25,7 @@ make run
 - Option-Command-Up/Down reorders a branch without dragging; the same commands are in the Node menu.
 - Delete removes selected branches. Command-Z and Shift-Command-Z undo and redo. Command-C copies complete branches, including folded descendants. Command-V pastes them under the selected topic or as separate roots on the canvas. Other apps receive an indented text outline. Copied Agents start as drafts, and bound worktrees link to the existing checkout.
 - Use **Node → Group Under New Topic** (Option-Command-G) to name a group of selected branches. Option-Command-Left promotes topics one level, and Option-Command-Right makes them children of the preceding sibling.
-- Command-N creates a board. Rename, reorder, and delete boards in the sidebar. Use Edit → Undo Delete Board (Command-Z) to restore a recently deleted board.
+- Command-N creates a board. Rename, reorder, and delete boards in the sidebar. Use Edit → Undo Delete Board (Command-Z) to restore a recently deleted board. Reopen **Recently Deleted** in the sidebar to restore individual boards, including after relaunch.
 
 ## Running an Agent
 

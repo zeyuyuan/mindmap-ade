@@ -8,6 +8,7 @@ struct RootView: View {
     @State private var didRestoreWorkspace = false
     @State private var actions = EditorActions()
     @State private var renamingID: UUID?
+    @State private var showsDeletedBoards = false
     @State private var boardName = ""
 
     var body: some View {
@@ -86,6 +87,21 @@ struct RootView: View {
                     .onMove { workspace.moveBoards(from: $0, to: $1) }
                     .onDelete { indices in
                         for id in indices.map({ workspace.boards[$0].id }) { workspace.deleteBoard(id) }
+                    }
+                }
+                if !workspace.deletedBoards.isEmpty {
+                    Section("Recently Deleted", isExpanded: $showsDeletedBoards) {
+                        ForEach(workspace.deletedBoards.reversed()) { entry in
+                            Button {
+                                if let id = workspace.restoreBoard(entry.id) { selectedBoardID = id }
+                            } label: {
+                                Label(entry.session.name, systemImage: "arrow.uturn.backward")
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Restore \(entry.session.name)")
+                            .help("Restore \(entry.session.name)")
+                            .disabled(workspace.isReadOnly)
+                        }
                     }
                 }
             }

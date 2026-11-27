@@ -311,10 +311,11 @@ final class WorkspaceStore {
         let commit: () -> Void
     }
 
-    private struct BoardDeletion {
+    struct BoardDeletion: Identifiable {
+        var id: UUID { session.id }
         let session: BoardSession
         let index: Int
-        let time = ContinuousClock.now
+        let time: ContinuousClock.Instant?
     }
 
     private(set) var boards: [BoardSession] = []
@@ -331,8 +332,8 @@ final class WorkspaceStore {
         }
     }
     private(set) var errorMessage: String?
-    private var deletedBoard: BoardDeletion?
-    var lastBoardDeletionTime: ContinuousClock.Instant? { deletedBoard?.time }
+    private(set) var deletedBoards: [BoardDeletion] = []
+    var lastBoardDeletionTime: ContinuousClock.Instant? { deletedBoards.last?.time }
     @ObservationIgnored var cameras: [UUID: MapCamera] = [:]
     @ObservationIgnored private(set) var selections: [UUID: Set<UUID>] = [:]
     @ObservationIgnored var lastSelectedBoardID: UUID?
@@ -406,6 +407,11 @@ final class WorkspaceStore {
             selections = value.selections ?? [:]
             lastSelectedBoardID = value.selectedBoardID
             boards = value.boards.map(makeSession)
+            deletedBoards = (value.deletedBoards ?? []).map {
+                let session = makeSession($0.board)
+                session.isReadOnly = true
+                return BoardDeletion(session: session, index: $0.index, time: nil)
+            }
             rightPane =
                 value.rightPane
                 ?? value.agentPane.map {
@@ -445,14 +451,26 @@ final class WorkspaceStore {
         guard !hasActiveWork(in: id) else { return }
         commitEdits(in: id)
         let session = boards.remove(at: index)
-        deletedBoard = BoardDeletion(session: session, index: index)
+        // Indices include the deleted boards so they can be restored in any order.
+        var slot = index
+        for occupied in deletedBoards.map(\.index).sorted() where occupied <= slot { slot += 1 }
+        session.isReadOnly = true
+        deletedBoards.append(BoardDeletion(session: session, index: slot, time: .now))
         scheduleSave()
     }
 
     func undoDeleteBoard() -> UUID? {
-        guard let deletion = deletedBoard else { return nil }
-        boards.insert(deletion.session, at: min(deletion.index, boards.count))
-        deletedBoard = nil
+        guard let last = deletedBoards.last, last.time != nil else { return nil }
+        return restoreBoard(last.id)
+    }
+
+    @discardableResult
+    func restoreBoard(_ id: UUID) -> UUID? {
+        guard !isReadOnly, let entry = deletedBoards.firstIndex(where: { $0.id == id }) else { return nil }
+        let deletion = deletedBoards.remove(at: entry)
+        let before = deletedBoards.filter { $0.index < deletion.index }.count
+        deletion.session.isReadOnly = false
+        boards.insert(deletion.session, at: min(max(0, deletion.index - before), boards.count))
         scheduleSave()
         return deletion.session.id
     }
@@ -703,8 +721,9 @@ final class WorkspaceStore {
             board.apply(BoardEdit(nodes: replacements))
             return board
         }
+        let retained = Dictionary(uniqueKeysWithValues: (boards + deletedBoards.map(\.session)).map { ($0.id, $0) })
         let runs = agentRuns.values.filter { run in
-            board(run.address.boardID)?.board.nodes[run.address.nodeID]?.content.kind == .agent
+            retained[run.address.boardID]?.board.nodes[run.address.nodeID]?.content.kind == .agent
         }
         let savedPane = rightPane.flatMap { canOpenRightPane($0) ? $0 : nil }
         let legacyAgentPane = savedPane.flatMap {
@@ -712,8 +731,9 @@ final class WorkspaceStore {
         }
         return WorkspaceArchive(
             boards: snapshots, cameras: cameras, selectedBoardID: lastSelectedBoardID, agentRuns: Array(runs),
-            selections: selections.filter { board($0.key) != nil },
-            agentPane: legacyAgentPane, rightPane: savedPane)
+            selections: selections.filter { retained[$0.key] != nil },
+            agentPane: legacyAgentPane, rightPane: savedPane,
+            deletedBoards: deletedBoards.map { DeletedBoardRecord(board: $0.session.board, index: $0.index) })
     }
 
     func scheduleSave() {

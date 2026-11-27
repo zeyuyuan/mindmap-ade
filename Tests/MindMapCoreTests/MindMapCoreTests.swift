@@ -153,6 +153,11 @@ import Testing
     let decoded = try JSONDecoder().decode(WorkspaceArchive.self, from: data).validated()
     #expect(decoded.boards == [board])
     #expect(decoded.cameras[board.id]?.scale == 1.5)
+    var newer = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    newer["schemaVersion"] = WorkspaceArchive.currentVersion
+    newer["futurePane"] = ["kind": "unrecognized"]
+    let extended = try JSONSerialization.data(withJSONObject: newer)
+    #expect(throws: BoardValidationError.self) { try JSONDecoder().decode(WorkspaceArchive.self, from: extended) }
     var invalid = board
     invalid.apply(BoardEdit(nodes: [NodeReplacement(id: board.roots[0].id, node: nil)]))
     #expect(throws: BoardValidationError.self) { try invalid.validated() }
@@ -161,7 +166,7 @@ import Testing
     cycle.apply(BoardEdit(nodes: [NodeReplacement(id: id, node: MapNode(id: id, children: [id]))]))
     #expect(throws: BoardValidationError.self) { try cycle.validated() }
     var future = archive
-    future.schemaVersion += 1
+    future.schemaVersion = WorkspaceArchive.currentVersion + 1
     #expect(throws: BoardValidationError.self) { try future.validated() }
 }
 

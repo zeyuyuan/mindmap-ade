@@ -1,10 +1,36 @@
 import Foundation
 
+public struct DeletedBoardRecord: Codable, Sendable {
+    public let board: MindMapBoard
+    public let index: Int
+
+    public init(board: MindMapBoard, index: Int) {
+        self.board = board
+        self.index = index
+    }
+}
+
 public struct WorkspaceArchive: Codable, Sendable {
-    private static let currentVersion = 9
+    private static let worktreeArchiveVersion = 9
+    public static let currentVersion = 10
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, boards, deletedBoards, cameras, selectedBoardID, agentRuns, selections, agentPane, rightPane
+    }
+
+    private struct UnrecognizedKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init?(intValue: Int) { return nil }
+        init?(stringValue: String) {
+            guard CodingKeys(rawValue: stringValue) == nil else { return nil }
+            self.stringValue = stringValue
+        }
+    }
 
     public var schemaVersion: Int
     public var boards: [MindMapBoard]
+    public var deletedBoards: [DeletedBoardRecord]?
     public var cameras: [UUID: MapCamera]
     public var selectedBoardID: UUID?
     public var agentRuns: [AgentRun]?
@@ -15,10 +41,11 @@ public struct WorkspaceArchive: Codable, Sendable {
     public init(
         boards: [MindMapBoard], cameras: [UUID: MapCamera] = [:], selectedBoardID: UUID? = nil,
         agentRuns: [AgentRun] = [], selections: [UUID: Set<UUID>] = [:], agentPane: AgentPaneState? = nil,
-        rightPane: RightPaneState? = nil
+        rightPane: RightPaneState? = nil, deletedBoards: [DeletedBoardRecord] = []
     ) {
-        schemaVersion = Self.currentVersion
+        schemaVersion = deletedBoards.isEmpty ? Self.worktreeArchiveVersion : Self.currentVersion
         self.boards = boards
+        self.deletedBoards = deletedBoards.isEmpty ? nil : deletedBoards
         self.cameras = cameras
         self.selectedBoardID = selectedBoardID
         self.agentRuns = agentRuns
@@ -27,11 +54,36 @@ public struct WorkspaceArchive: Codable, Sendable {
         self.rightPane = rightPane
     }
 
-    public func validated() throws -> Self {
-        guard (1...Self.currentVersion).contains(schemaVersion), Set(boards.map(\.id)).count == boards.count else {
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        // A newer workspace may carry pane or resource state this build cannot round-trip.
+        if schemaVersion >= Self.worktreeArchiveVersion,
+            !(try decoder.container(keyedBy: UnrecognizedKey.self).allKeys.isEmpty)
+        {
             throw BoardValidationError.invalidStructure
         }
-        for board in boards { _ = try board.validated() }
+        boards = try values.decode([MindMapBoard].self, forKey: .boards)
+        deletedBoards = try values.decodeIfPresent([DeletedBoardRecord].self, forKey: .deletedBoards)
+        cameras = try values.decode([UUID: MapCamera].self, forKey: .cameras)
+        selectedBoardID = try values.decodeIfPresent(UUID.self, forKey: .selectedBoardID)
+        agentRuns = try values.decodeIfPresent([AgentRun].self, forKey: .agentRuns)
+        selections = try values.decodeIfPresent([UUID: Set<UUID>].self, forKey: .selections)
+        agentPane = try values.decodeIfPresent(AgentPaneState.self, forKey: .agentPane)
+        rightPane = try values.decodeIfPresent(RightPaneState.self, forKey: .rightPane)
+    }
+
+    public func validated() throws -> Self {
+        let deleted = deletedBoards ?? []
+        let allBoards = boards + deleted.map(\.board)
+        guard (1...Self.currentVersion).contains(schemaVersion),
+            Set(allBoards.map(\.id)).count == allBoards.count,
+            Set(deleted.map(\.index)).count == deleted.count,
+            deleted.allSatisfy({ allBoards.indices.contains($0.index) })
+        else {
+            throw BoardValidationError.invalidStructure
+        }
+        for board in allBoards { _ = try board.validated() }
         guard
             cameras.values.allSatisfy({
                 $0.scale.isFinite && (MapCamera.minimumScale...MapCamera.maximumScale).contains($0.scale)
@@ -62,7 +114,7 @@ public struct WorkspaceArchive: Codable, Sendable {
                     kind: pane.kind, widthShare: pane.widthShare)
             }
         }
-        migrated.schemaVersion = Self.currentVersion
+        migrated.schemaVersion = deleted.isEmpty ? Self.worktreeArchiveVersion : Self.currentVersion
         return migrated
     }
 }

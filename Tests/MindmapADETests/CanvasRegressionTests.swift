@@ -122,6 +122,97 @@ private final class CanvasFixture {
 @Suite(.serialized)
 @MainActor
 struct CanvasRegressionTests {
+    @Test func addingAnotherSiblingToTheFirstRootKeepsBothExistingTreesInPlace() async throws {
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk())
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let first = session.board.roots[0].id
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        canvas.view.insertNode(asChild: false)
+        let previous = session.board.roots
+        canvas.view.jumpToTopic(first)
+        canvas.view.insertNode(asChild: false)
+        let roots = session.board.roots
+        #expect(roots.count == 3)
+        #expect(roots[0] == previous[0] && roots[2] == previous[1])
+        let layout = TreeLayout.make(board: session.board, sizes: [:])
+        let newBounds = try #require(layout.nodes[roots[1].id]?.subtreeBounds)
+        for root in previous {
+            #expect(!newBounds.intersects(try #require(layout.nodes[root.id]?.subtreeBounds)))
+        }
+    }
+
+    @Test func canvasClipboardCopiesFoldedBranchesAcrossBoardsAndUndoesTheWholePaste() async throws {
+        var source = MindMapBoard(root: MapNode(text: "Release"))
+        let root = source.roots[0].id
+        let a = try #require(source.inserting(text: "Verify", parent: root))
+        source.apply(a.edit)
+        let b = try #require(source.inserting(text: "Ship", parent: root))
+        source.apply(b.edit)
+        source.apply(try #require(source.togglingCollapse(root)))
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: source))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        canvas.view.copyBranches(to: pasteboard)
+        #expect(pasteboard.string(forType: .string) == "Release\n\tVerify\n\tShip")
+        let destination = try #require(workspace.board(workspace.createBoard()))
+        let original = destination.board
+        canvas.view.update(session: destination, revision: destination.revision)
+        canvas.view.pasteBranches(from: pasteboard)
+        let copy = try #require(canvas.view.selected.first.flatMap { destination.board.nodes[$0] })
+        #expect(copy.id != root && copy.isCollapsed)
+        #expect(copy.children.compactMap { destination.board.nodes[$0]?.text } == ["Verify", "Ship"])
+        #expect(Set(source.nodes.keys).isDisjoint(with: destination.board.nodes.keys))
+        #expect(destination.board.parents[copy.id] == original.roots.first?.id)
+        canvas.view.undoCommand()
+        #expect(destination.board == original)
+        canvas.view.redoCommand()
+        #expect(destination.board.nodes[copy.id] == copy)
+        #expect(session.board == source)
+    }
+
+    @Test func groupingInTheContextMenuKeepsTheMultiSelectionAndSupportsChangingLevels() async throws {
+        var board = MindMapBoard(root: MapNode(text: "Plan"))
+        let root = board.roots[0].id
+        let a = try #require(board.inserting(text: "One", parent: root))
+        board.apply(a.edit)
+        let b = try #require(board.inserting(text: "Two", parent: root))
+        board.apply(b.edit)
+        let workspace = WorkspaceStore(disk: MemoryWorkspaceDisk(board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        workspace.cameras[session.id] = MapCamera(translation: CGPoint(x: 100, y: 120))
+        let canvas = CanvasFixture(workspace: workspace, session: session)
+        defer { canvas.close() }
+        try await canvas.ready()
+        let upper = CGPoint(x: 298, y: 112)
+        let lower = CGPoint(x: 298, y: 164)
+        try canvas.click(upper)
+        try canvas.click(lower, modifiers: .command)
+        let menu = try #require(canvas.view.menu(for: canvas.event(.rightMouseDown, at: upper)))
+        #expect(canvas.view.selected == [a.id, b.id])
+        #expect(menu.item(withTitle: "Group Under New Topic") != nil)
+        canvas.view.groupSelection()
+        let title = try #require(canvas.view.selected.first)
+        #expect(session.board.nodes[title]?.children == [a.id, b.id])
+        #expect(session.board.nodes[root]?.children == [title])
+        let editor = try #require(canvas.editor)
+        _ = canvas.view.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+        canvas.view.undoCommand()
+        #expect(session.board == board)
+        canvas.view.jumpToTopic(b.id)
+        canvas.view.changeLevel(promoting: false)
+        #expect(session.board.parents[b.id] == a.id)
+        canvas.view.changeLevel(promoting: true)
+        #expect(session.board == board)
+    }
+
     @Test(arguments: [0.75, 1.04, 1.5])
     func textEditorMatchesTheCanvasFontAndPositionAtDifferentZooms(zoom: Double) async throws {
         let root = MapNode(text: "Hello World")

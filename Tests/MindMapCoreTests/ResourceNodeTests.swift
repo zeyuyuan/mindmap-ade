@@ -455,3 +455,47 @@ func oldProjectCheckoutLiftsBranchesAndKeepsInheritedAgentBindings(hasInheritedA
     }
     _ = try migrated.validated()
 }
+
+@Test func copiedAgentsRemainIndependentDraftsAndWorktreesNeedACompatibleDestination() throws {
+    let source = MapNode(text: "Write tests")
+    var project = ProjectTopic()
+    project.location = ProjectLocation(directory: "/project", gitCommonDirectory: "/project/.git")
+    let root = MapNode(content: .project(project))
+    var board = MindMapBoard(root: root)
+    let tree = WorktreeLocation(
+        directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "test",
+        commit: "abc", isPrimary: false)
+    let worktree = MapNode(content: .worktree(WorktreeTopic(location: tree, creationCommit: "abc")))
+    board.apply(try #require(board.inserting(worktree, parent: root.id)).edit)
+    board.apply(try #require(board.inserting(source, parent: worktree.id)).edit)
+    var agent = AgentTopic(task: "Verify", sourceTextID: source.id, cli: .codex)
+    agent.isConfigured = true
+    board.apply(try #require(board.inserting(MapNode(content: .agent(agent)), parent: source.id)).edit)
+    let changes = MapNode(content: .gitChanges(GitChangesTopic()))
+    board.apply(try #require(board.inserting(changes, parent: worktree.id)).edit)
+    var destination = MindMapBoard()
+    let forest = try #require(board.copiedBranches([root.id, source.id]))
+    let result = try destination.pastingBranches(forest, under: destination.roots[0].id)
+    destination.apply(result.edit)
+    let copiedProject = try #require(destination.nodes[result.ids[0]])
+    let copiedWorktree = try #require(copiedProject.children.first.flatMap { destination.nodes[$0] })
+    let copiedSource = try #require(copiedWorktree.children.first.flatMap { destination.nodes[$0] })
+    let copiedAgent = try #require(copiedSource.children.first.flatMap { destination.nodes[$0] })
+    guard case .agent(let draft) = copiedAgent.content, case .worktree(let reference) = copiedWorktree.content else {
+        Issue.record("Pasting changed the resource types.")
+        return
+    }
+    #expect(!draft.isConfigured && draft.cli == .codex && draft.task == "Verify")
+    #expect(draft.sourceTextID == copiedSource.id && copiedSource.id != source.id)
+    #expect(reference.location == tree && reference.choice.mode == .existing)
+    let copiedChanges = try #require(copiedWorktree.children.last.flatMap { destination.nodes[$0] })
+    #expect(copiedChanges.content == .gitChanges(GitChangesTopic(baseCommit: "abc")))
+    let onlyChanges = try #require(board.copiedBranches([changes.id]))
+    #expect(throws: BranchPasteError.missingCopiedWorktree) {
+        try destination.pastingBranches(onlyChanges, under: copiedWorktree.id)
+    }
+    let justWorktree = try #require(board.copiedBranches([worktree.id]))
+    #expect(throws: BranchPasteError.self) {
+        try destination.pastingBranches(justWorktree, under: destination.roots[0].id)
+    }
+}

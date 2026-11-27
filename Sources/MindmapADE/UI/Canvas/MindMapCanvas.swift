@@ -48,6 +48,7 @@ private final class TopicEditorBackdrop: NSView {
 final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, NSUserInterfaceValidations,
     NSPopoverDelegate
 {
+    private static let branchPasteboardType = NSPasteboard.PasteboardType("com.zeyuyuan.mindmap-ade.branches.v1")
     private static let worktreeNameHint = "Tab uses default · Click away to create"
     private static let singleSelectionHint = "Select one topic for this action."
 
@@ -551,6 +552,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         actions.canRedo = undoManager?.canRedo ?? session.canRedo
         let node = selected.count == 1 ? selected.first.flatMap { session.board.nodes[$0] } : nil
         actions.canDelete = !selected.isEmpty && !session.isReadOnly
+        let siblings = session.isReadOnly ? nil : selectedSiblings
+        actions.canPromote = siblings?.parent != nil
+        actions.canDemote = siblings?.previous != nil
         actions.canCollapse =
             node?.children.isEmpty == false
             && (!session.isReadOnly || selected.contains(where: expandedAncestors.contains))
@@ -597,6 +601,35 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         if edit { openNode(id) }
     }
 
+    private func measuredLayout(_ board: MindMapBoard, expanded: Set<UUID> = []) -> MapLayout {
+        var measurements = TopicMeasurements()
+        return measurements.layout(
+            board: board, regularFont: CanvasStyle.font(root: false).fontName,
+            rootFont: CanvasStyle.font(root: true).fontName, expandedAncestors: expanded, checkCancellation: {})
+    }
+
+    private var placementLayout: MapLayout {
+        if renderedLayout == layoutRequest { return mapLayout }
+        // An immediate second command can arrive before the background layout finishes.
+        return measuredLayout(session.board, expanded: expandedAncestors)
+    }
+
+    private func nextRootPosition(alignedAt x: CGFloat? = nil) -> CGPoint {
+        let center = camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY))
+        return CGPoint(x: x ?? center.x, y: max(center.y, placementLayout.bounds.maxY + MapMetrics.rootGap))
+    }
+
+    private func stackedRootPositions(_ ids: [UUID], in layout: MapLayout) -> [UUID: CGPoint] {
+        var next = nextRootPosition()
+        var positions: [UUID: CGPoint] = [:]
+        for id in ids {
+            guard let node = layout.nodes[id] else { continue }
+            positions[id] = CGPoint(x: next.x, y: next.y + node.frame.minY - node.subtreeBounds.minY)
+            next.y += node.subtreeBounds.height + MapMetrics.rootGap
+        }
+        return positions
+    }
+
     func insertNode(asChild: Bool) {
         finishEditing()
         guard !session.isReadOnly else { return }
@@ -610,10 +643,12 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         }
         let parent = asChild ? current : session.board.parents[current]
         let old = mapLayout.nodes[current]
-        let position = CGPoint(
-            x: old?.frame.minX ?? camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY)).x,
-            y: (old?.subtreeBounds.maxY ?? 0) + MapMetrics.rootGap
-        )
+        let position: CGPoint
+        if parent == nil {
+            position = nextRootPosition(alignedAt: session.board.roots.first(where: { $0.id == current })?.position.x)
+        } else {
+            position = CGPoint(x: old?.frame.minX ?? 0, y: (old?.subtreeBounds.maxY ?? 0) + MapMetrics.rootGap)
+        }
         guard let result = session.board.inserting(parent: parent, after: asChild ? nil : current, position: position)
         else { return }
         guard session.apply(result.edit, named: asChild ? "Add Child" : "Add Sibling") else {
@@ -633,8 +668,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     func insertRoot(at point: CGPoint? = nil) {
         finishEditing()
         guard !session.isReadOnly else { return }
-        let center = camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY))
-        let position = point ?? CGPoint(x: center.x, y: max(center.y, mapLayout.bounds.maxY + MapMetrics.rootGap))
+        let position = point ?? nextRootPosition()
         guard let result = session.board.inserting(parent: nil, position: position) else { return }
         guard session.apply(result.edit, named: "Add Root") else {
             changed()
@@ -849,8 +883,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         } else {
             content = .draft(kind)
         }
-        let center = camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY))
-        let position = point ?? CGPoint(x: center.x, y: max(center.y, mapLayout.bounds.maxY + MapMetrics.rootGap))
+        let position = parent == nil ? (point ?? nextRootPosition()) : .zero
         guard
             let result = session.board.inserting(
                 MapNode(content: content), parent: parent, position: position)
@@ -961,6 +994,69 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             return true
         }
         return super.performKeyEquivalent(with: event)
+    }
+
+    func groupSelection() {
+        finishEditing()
+        guard !session.isReadOnly, !selected.isEmpty else { return }
+        let frame = mapLayout.orderedIDs.first(where: selected.contains).flatMap { mapLayout.nodes[$0]?.frame }
+        guard let group = session.board.groupingBranches(selected) else {
+            actions?.hint = "Keep projects, worktrees and Agents with their current working directories."
+            return
+        }
+        guard session.apply(group.edit, named: "Group Under New Topic") else {
+            changed()
+            return
+        }
+        selected = [group.id]
+        revealAfterLayout = group.id
+        changed()
+        beginEditing(
+            group.id,
+            provisionalFrame: frame
+                ?? CGRect(
+                    origin: .zero,
+                    size: CGSize(width: MapMetrics.minimumNodeWidth, height: MapMetrics.minimumNodeHeight)))
+    }
+
+    private var selectedSiblings: (ids: [UUID], parent: UUID?, previous: UUID?)? {
+        let board = session.board
+        let ids = board.topLevelSelection(selected)
+        guard let first = ids.first else { return nil }
+        let parent = board.parents[first]
+        guard ids.allSatisfy({ board.parents[$0] == parent }) else { return nil }
+        let siblings = parent.flatMap { board.nodes[$0]?.children } ?? board.roots.map(\.id)
+        guard let index = siblings.firstIndex(of: first) else { return nil }
+        return (ids, parent, index > 0 ? siblings[index - 1] : nil)
+    }
+
+    func changeLevel(promoting: Bool) {
+        finishEditing()
+        let board = session.board
+        guard !session.isReadOnly, let siblings = selectedSiblings else { return }
+        let ids = siblings.ids
+        let edit: BoardEdit?
+        if promoting {
+            guard let parent = siblings.parent else { return }
+            let grandparent = board.parents[parent]
+            let siblings = grandparent.flatMap { board.nodes[$0]?.children } ?? board.roots.map(\.id)
+            guard let index = siblings.firstIndex(of: parent) else { return }
+            edit = board.movingBranches(
+                Set(ids), to: grandparent, at: index + 1,
+                positions: grandparent == nil ? stackedRootPositions(ids, in: placementLayout) : [:])
+        } else {
+            guard let previous = siblings.previous else { return }
+            edit = board.movingBranches(Set(ids), to: previous)
+        }
+        guard let edit else {
+            actions?.hint = "Keep projects, worktrees and Agents with their current working directories."
+            return
+        }
+        if session.apply(edit, named: promoting ? "Promote Topics" : "Demote Topics") {
+            selected = Set(ids)
+            revealAfterLayout = ids.first
+        }
+        changed()
     }
 
     func moveSelection(by offset: Int) {
@@ -1952,32 +2048,60 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         changed()
     }
 
-    @objc func copy(_ sender: Any?) {
-        let text = mapLayout.orderedIDs.filter { selected.contains($0) }.compactMap { session.board.nodes[$0]?.title }
-            .joined(separator: "\n")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+    @objc func copy(_ sender: Any?) { copyBranches(to: .general) }
+
+    func copyBranches(to pasteboard: NSPasteboard) {
+        guard let forest = session.board.copiedBranches(selected),
+            let data = try? JSONEncoder().encode(forest)
+        else { return }
+        let item = NSPasteboardItem()
+        item.setData(data, forType: Self.branchPasteboardType)
+        item.setString(forest.textOutline, forType: .string)
+        pasteboard.clearContents()
+        pasteboard.writeObjects([item])
     }
 
-    @objc func paste(_ sender: Any?) {
-        guard !session.isReadOnly, let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
-            return
-        }
+    @objc func paste(_ sender: Any?) { pasteBranches(from: .general) }
+
+    func pasteBranches(from pasteboard: NSPasteboard) {
+        guard !session.isReadOnly else { return }
         finishEditing()
         guard selected.count <= 1 else {
             actions?.hint = Self.singleSelectionHint
             return
         }
         let parent = selected.first
-        guard
-            let result = session.board.inserting(
-                text: text, parent: parent, position: camera.worldPoint(CGPoint(x: bounds.midX, y: bounds.midY)))
-        else { return }
-        guard session.apply(result.edit, named: "Paste Topic") else {
-            changed()
-            return
+        let edit: BoardEdit
+        let ids: [UUID]
+        if let data = pasteboard.data(forType: Self.branchPasteboardType) {
+            do {
+                let forest = try JSONDecoder().decode(MindMapBoard.self, from: data).validated()
+                let positions =
+                    parent == nil ? stackedRootPositions(forest.roots.map(\.id), in: measuredLayout(forest)) : [:]
+                (edit, ids) = try session.board.pastingBranches(forest, under: parent, rootPositions: positions)
+            } catch BranchPasteError.missingCopiedWorktree {
+                actions?.hint = "Copy the Worktree to include its Git Changes card."
+                return
+            } catch BranchPasteError.incompatibleLocation {
+                actions?.hint = "Choose a destination that supports the copied projects and worktrees."
+                return
+            } catch {
+                actions?.hint = "The copied branches could not be read."
+                return
+            }
+        } else {
+            guard let text = pasteboard.string(forType: .string), !text.isEmpty,
+                let result = session.board.inserting(
+                    text: text, parent: parent,
+                    position: parent == nil ? nextRootPosition() : .zero)
+            else { return }
+            edit = result.edit
+            ids = [result.id]
         }
-        selected = [result.id]
+        if session.apply(edit, named: "Paste Topics") {
+            selected = Set(ids)
+            revealAfterLayout = ids.first
+        }
         changed()
     }
 
@@ -2019,6 +2143,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     @objc private func addSiblingAction(_ sender: Any?) { insertNode(asChild: false) }
     @objc private func addRootAction(_ sender: Any?) { insertRoot(at: contextPoint) }
     @objc private func editAction(_ sender: Any?) { editSelection() }
+    @objc private func groupAction(_ sender: Any?) { groupSelection() }
     @objc private func deleteAction(_ sender: Any?) { deleteSelection() }
     @objc private func fitContentAction(_ sender: Any?) { fitContent() }
     @objc private func focusBranchAction(_ sender: Any?) {
@@ -2042,7 +2167,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         contextPoint = camera.worldPoint(localPoint(event))
         let node = mapLayout.hitTest(contextPoint).flatMap { session.board.nodes[$0] }
         if let node {
-            select(node.id)
+            if !selected.contains(node.id) { select(node.id) }
+            window?.makeFirstResponder(self)
         } else {
             selected.removeAll()
             render()
@@ -2069,6 +2195,14 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             add("Add \(kind.title)", #selector(addResourceAction(_:)), symbol: kind.symbol, resource: kind)
         }
 
+        if node != nil {
+            add("Group Under New Topic", #selector(groupAction(_:)), symbol: "rectangle.3.group")
+            if selected.count > 1 {
+                add("Copy Branches", #selector(copy(_:)), symbol: "doc.on.doc", key: "c", modifiers: .command)
+                add("Delete", #selector(deleteAction(_:)), symbol: "trash")
+                return menu
+            }
+        }
         if node == nil {
             add(
                 "Add Root", #selector(addRootAction(_:)), symbol: "plus.square", key: "r",
@@ -2163,9 +2297,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 add("Make Root", #selector(detachAction(_:)), symbol: "arrow.up.to.line")
             }
             menu.addItem(.separator())
-            if kind == .text {
-                add("Copy Text", #selector(copy(_:)), symbol: "doc.on.doc", key: "c", modifiers: .command)
-            }
+            add("Copy Branch", #selector(copy(_:)), symbol: "doc.on.doc", key: "c", modifiers: .command)
             add(
                 "Delete", #selector(deleteAction(_:)), symbol: "trash",
                 key: String(UnicodeScalar(NSBackspaceCharacter)!))

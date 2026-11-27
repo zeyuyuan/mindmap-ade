@@ -23,7 +23,8 @@ make run
 - Drag a topic onto another topic to reparent its branch. Drop near a topic's upper or lower edge to reorder, or on blank space to make a root. Drag a selected topic to move the selection together; one undo restores the group. Drops onto a moved branch's descendants leave the map unchanged.
 - Click a topic to select it. Command-click adds or removes individual topics, and Shift-drag from blank canvas adds the topics inside the selection rectangle. Click the external minus control to fold a branch, and click the hidden descendant count to expand it. Arrow keys navigate, expand, and collapse.
 - Option-Command-Up/Down reorders a branch without dragging; the same commands are in the Node menu.
-- Delete removes selected branches. Command-Z and Shift-Command-Z undo and redo. Copy and paste transfer plain text.
+- Delete removes selected branches. Command-Z and Shift-Command-Z undo and redo. Command-C copies complete branches, including folded descendants. Command-V pastes them under the selected topic or as separate roots on the canvas. Other apps receive an indented text outline. Copied Agents start as drafts, and bound worktrees link to the existing checkout.
+- Use **Node → Group Under New Topic** (Option-Command-G) to name a group of selected branches. Option-Command-Left promotes topics one level, and Option-Command-Right makes them children of the preceding sibling.
 - Command-N creates a board. Rename, reorder, and delete boards in the sidebar. Use Edit → Undo Delete Board (Command-Z) to restore a recently deleted board.
 
 ## Running an Agent

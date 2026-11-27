@@ -49,6 +49,8 @@ final class EditorActions {
     var zoomLabel = "100%"
     var canEdit = false
     var canDelete = false
+    var canPromote = false
+    var canDemote = false
     var undoTitle = "Undo"
     var redoTitle = "Redo"
     var canUndo = false
@@ -194,6 +196,8 @@ final class EditorActions {
             activeCanvas?.redoCommand()
         }
     }
+    func groupSelection() { activeCanvas?.groupSelection() }
+    func changeLevel(promoting: Bool) { activeCanvas?.changeLevel(promoting: promoting) }
     func moveUp() { activeCanvas?.moveSelection(by: -1) }
     func moveDown() { activeCanvas?.moveSelection(by: 1) }
 }
@@ -273,6 +277,15 @@ struct MindMapCommands: Commands {
                 .keyboardShortcut(".", modifiers: [.command, .option])
                 .disabled(actions?.canCollapse != true)
             Divider()
+            Button("Group Under New Topic") { actions?.groupSelection() }
+                .keyboardShortcut("g", modifiers: [.command, .option])
+                .disabled(actions?.canDelete != true)
+            Button("Promote") { actions?.changeLevel(promoting: true) }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                .disabled(actions?.canPromote != true)
+            Button("Demote") { actions?.changeLevel(promoting: false) }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                .disabled(actions?.canDemote != true)
             Button("Move Up") { actions?.moveUp() }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
                 .disabled(actions?.canEdit != true)

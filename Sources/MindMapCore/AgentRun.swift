@@ -82,13 +82,14 @@ public struct AgentRun: Identifiable, Codable, Equatable, Sendable {
     public var conversationRecoveryError: String?
     public let checkout: String?
     public let worktreeIdentity: String?
+    public let baseCommit: String?
     public var previousSnapshotID: UUID?
 
     public var cli: AgentCLIKind { selectedCLI ?? .commandCode }
 
     public init(
         address: NodeAddress, worktree: WorktreeLocation, cli: AgentCLIKind, executable: String,
-        conversationID: UUID? = nil, worktreeIdentity: String? = nil
+        conversationID: UUID? = nil, worktreeIdentity: String? = nil, baseCommit: String? = nil
     ) {
         id = UUID()
         self.address = address
@@ -101,6 +102,7 @@ public struct AgentRun: Identifiable, Codable, Equatable, Sendable {
         checkout = Self.checkoutReference(worktree)
         self.conversationID = conversationID
         self.worktreeIdentity = worktreeIdentity
+        self.baseCommit = baseCommit ?? (worktree.commit.isEmpty ? nil : worktree.commit)
     }
 
     public static func checkoutReference(_ worktree: WorktreeLocation) -> String {

@@ -66,11 +66,12 @@ private enum MapTool: String, CaseIterable {
     case move = "move_node"
     case delete = "delete_node"
     case register = "register_worktree"
+    case registerChanges = "register_git_changes"
 
     var changesMap: Bool {
         switch self {
         case .context, .search, .node, .list, .selection: false
-        case .create, .update, .move, .delete, .register: true
+        case .create, .update, .move, .delete, .register, .registerChanges: true
         }
     }
 
@@ -145,6 +146,11 @@ private enum MapTool: String, CaseIterable {
             description =
                 "Show a real worktree registered with this project. A new conversation draft can be placed under it while this process keeps its original directory."
             fields = ["directory": ["type": "string"], "task": ["type": "string"]]
+            required = ["directory"]
+        case .registerChanges:
+            description =
+                "Attach a Git Changes card under this Agent's worktree for another Git repository or worktree modified during this conversation. Pass the full path to the repository, worktree, or any folder inside it."
+            fields = ["directory": ["type": "string"]]
             required = ["directory"]
         }
         if changesMap {
@@ -548,6 +554,8 @@ extension WorkspaceStore {
             return ["nodeId": node.id.uuidString]
         case .register:
             return try await register(arguments: arguments, grant: grant, session: session)
+        case .registerChanges:
+            return try await registerGitChanges(arguments: arguments, grant: grant, session: session)
         case .context, .search, .node, .list, .selection:
             throw WorkspaceIssue("Use a map read tool to inspect a topic.")
         }
@@ -698,6 +706,118 @@ extension WorkspaceStore {
             try applyMapEdit(edit, change: .registeredWorktree, highlighting: addedTopics, in: session)
         }
         return result
+    }
+
+    private func registerGitChanges(
+        arguments: [String: Any], grant: MCPGrant, session: BoardSession
+    ) async throws -> [String: Any] {
+        let origin = grant.run.address.nodeID
+        let directory = try boundedText(arguments["directory"], limit: 4_096).trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        guard directory.hasPrefix("/") else {
+            throw WorkspaceIssue("Provide the full path to a folder inside a Git repository.")
+        }
+        let initialScope = session.board.context(above: origin)
+        guard let worktreeID = initialScope.worktreeID,
+            let initialWorktreeNode = session.board.nodes[worktreeID],
+            case .worktree(let initialTree) = initialWorktreeNode.content,
+            let ownLocation = initialTree.location
+        else {
+            throw WorkspaceIssue("This Agent does not have a configured worktree.")
+        }
+        let location = try await git.project(at: directory)
+        guard let common = location.gitCommonDirectory else {
+            throw WorkspaceIssue("Provide a path inside a Git repository.")
+        }
+        let isOwnWorktree = ownLocation.directory == location.directory
+        let existingChild = initialWorktreeNode.children.first(where: { childID in
+            guard case .gitChanges(let topic) = session.board.nodes[childID]?.content else { return false }
+            return (topic.directory ?? ownLocation.directory) == location.directory
+        })
+        let existingBase: String? =
+            if let existingChild, case .gitChanges(let topic) = session.board.nodes[existingChild]?.content {
+                topic.baseCommit
+            } else {
+                initialTree.trackedExternalGitChanges.first(where: { $0.directory == location.directory })?.baseCommit
+            }
+        let baseCommit =
+            existingBase ?? (isOwnWorktree ? defaultGitChangesBaseCommit(for: worktreeID, in: session) : nil)
+        let snapshot = try await git.changesSnapshot(in: location.directory, baseCommit: baseCommit)
+        guard isActive(grant), board(session.id) === session,
+            session.board.nodes[origin]?.content.kind == .agent,
+            var worktreeNode = session.board.nodes[worktreeID],
+            case .worktree(var worktreeTopic) = worktreeNode.content,
+            worktreeTopic.location?.directory == ownLocation.directory
+        else { throw WorkspaceIssue("The map session has ended.") }
+
+        let headCommit = isOwnWorktree ? baseCommit : (baseCommit ?? snapshot.headCommit)
+        recordGitChangesSnapshot(snapshot, for: GitChangesTarget(directory: location.directory, baseCommit: headCommit))
+        guard snapshot.hasChanges else {
+            return ["directory": location.directory, "hasChanges": false, "alreadyTracked": false]
+        }
+        let topic = GitChangesTopic(
+            directory: isOwnWorktree ? nil : location.directory,
+            gitCommonDirectory: isOwnWorktree ? nil : common,
+            baseCommit: headCommit)
+        guard worktreeTopic.showsGitChanges else {
+            if !isOwnWorktree {
+                let before = worktreeTopic
+                worktreeTopic.rememberExternalGitChanges(topic)
+                if worktreeTopic != before {
+                    worktreeNode.content = .worktree(worktreeTopic)
+                    _ = session.apply(
+                        BoardEdit(nodes: [NodeReplacement(id: worktreeID, node: worktreeNode)]),
+                        named: "Register External Git Changes", recordHistory: false)
+                }
+            }
+            return [
+                "directory": location.directory, "hasChanges": true,
+                "alreadyTracked": false, "hidden": true,
+            ]
+        }
+
+        if let existing = worktreeNode.children.first(where: { childID in
+            guard case .gitChanges(let existingTopic) = session.board.nodes[childID]?.content else { return false }
+            return (existingTopic.directory ?? ownLocation.directory) == location.directory
+        }) {
+            if !isOwnWorktree {
+                let before = worktreeTopic
+                worktreeTopic.rememberExternalGitChanges(topic)
+                if worktreeTopic != before {
+                    worktreeNode.content = .worktree(worktreeTopic)
+                    _ = session.apply(
+                        BoardEdit(nodes: [NodeReplacement(id: worktreeID, node: worktreeNode)]),
+                        named: "Register External Git Changes", recordHistory: false)
+                }
+            }
+            return [
+                "nodeId": existing.uuidString, "directory": location.directory,
+                "alreadyTracked": true, "hasChanges": true,
+            ]
+        }
+
+        let index = gitChangesInsertIndex(under: worktreeID, isOwnWorktree: isOwnWorktree, in: session.board)
+        guard
+            var insertion = session.board.inserting(
+                MapNode(content: .gitChanges(topic)), parent: worktreeID, at: index)
+        else {
+            throw WorkspaceIssue("Git Changes could not be added under this worktree.")
+        }
+        if !isOwnWorktree {
+            insertion.edit.nodes = insertion.edit.nodes.map { replacement in
+                guard replacement.id == worktreeID, var updated = replacement.node,
+                    case .worktree(var updatedTree) = updated.content
+                else { return replacement }
+                updatedTree.rememberExternalGitChanges(topic)
+                updated.content = .worktree(updatedTree)
+                return NodeReplacement(id: worktreeID, node: updated)
+            }
+        }
+        try applyMapEdit(insertion.edit, change: .registeredGitChanges, highlighting: [insertion.id], in: session)
+        return [
+            "nodeId": insertion.id.uuidString, "directory": location.directory,
+            "alreadyTracked": false, "hasChanges": true,
+        ]
     }
 
     private func mapNode(_ value: Any?, in board: MindMapBoard) throws -> MapNode {

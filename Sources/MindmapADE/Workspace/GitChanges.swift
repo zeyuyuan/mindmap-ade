@@ -133,6 +133,10 @@ nonisolated struct GitChangesSnapshot: Equatable, Sendable {
         Set(files.map(\.path)).count
     }
 
+    var hasChanges: Bool {
+        !files.isEmpty || !commits.isEmpty
+    }
+
     var cardDetail: String {
         let count = uniqueFileCount
         if count > 0 {
@@ -757,4 +761,22 @@ nonisolated final class GitDirectoryWatcher: @unchecked Sendable {
 nonisolated struct GitChangesTarget: Hashable, Sendable {
     let directory: String
     let baseCommit: String?
+}
+
+nonisolated struct GitChangesCardSummary: Equatable, Sendable {
+    let branchLabel: String
+    let cardDetail: String
+
+    var externalCardDetail: String {
+        "\(branchLabel) · \(cardDetail)"
+    }
+}
+
+nonisolated struct UntrackedDirtyRepository: Identifiable, Equatable, Sendable {
+    let directory: String
+    let name: String
+    let branchLabel: String
+    let cardDetail: String
+
+    var id: String { directory }
 }

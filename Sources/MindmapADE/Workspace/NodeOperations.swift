@@ -13,9 +13,10 @@ extension WorkspaceStore {
         }
         if let session = board(boardID) {
             for id in session.gitChangesNodeIDs where details[id] == nil {
+                guard case .gitChanges(let topic) = session.board.nodes[id]?.content else { continue }
                 if let target = gitChangesTarget(for: id, in: session.board) {
-                    if let summary = gitChangesDetails[target] {
-                        details[id] = summary
+                    if let summary = gitChangesSummaries[target] {
+                        details[id] = topic.directory == nil ? summary.cardDetail : summary.externalCardDetail
                     }
                 } else {
                     details[id] = "No worktree"
@@ -228,6 +229,269 @@ extension WorkspaceStore {
         try await startAgentShell(for: run, owner: owner)
     }
 
+    /// Toggles whether `worktreeID` shows Git Changes child nodes.
+    /// Turning it off preserves tracked external repositories on the Worktree while removing childless cards.
+    @discardableResult
+    func setWorktreeShowsGitChanges(_ shows: Bool, for worktreeID: UUID, in session: BoardSession) -> Bool {
+        guard !isReadOnly, !isQuitting, board(session.id) === session,
+            var worktreeNode = session.board.nodes[worktreeID],
+            case .worktree(var topic) = worktreeNode.content,
+            topic.location != nil,
+            topic.showsGitChanges != shows
+        else { return false }
+
+        if !shows {
+            for childID in worktreeNode.children {
+                if case .gitChanges(let gitTopic) = session.board.nodes[childID]?.content {
+                    topic.rememberExternalGitChanges(gitTopic)
+                }
+            }
+        }
+        topic.showsGitChanges = shows
+        worktreeNode.content = .worktree(topic)
+
+        var replacements: [NodeReplacement] = []
+        if !shows {
+            let removable = Set(
+                worktreeNode.children.filter { childID in
+                    guard let child = session.board.nodes[childID] else { return false }
+                    return child.content.kind == .gitChanges && child.children.isEmpty
+                })
+            if !removable.isEmpty {
+                worktreeNode.children.removeAll { removable.contains($0) }
+                if worktreeNode.children.isEmpty { worktreeNode.isCollapsed = false }
+                for id in removable {
+                    replacements.append(NodeReplacement(id: id, node: nil))
+                }
+            }
+        }
+        replacements.append(NodeReplacement(id: worktreeID, node: worktreeNode))
+        return session.apply(
+            BoardEdit(nodes: replacements),
+            named: shows ? "Show Git Changes" : "Hide Git Changes")
+    }
+
+    /// Resolves a Git repository or worktree at `path` and attaches (or reuses) a Git Changes card under `worktreeID`.
+    /// Rejects directories with no Git changes so clean repositories do not add empty cards.
+    func attachGitChanges(
+        directory path: String, under worktreeID: UUID, in session: BoardSession
+    ) async throws -> (id: UUID, created: Bool, directory: String) {
+        guard !isReadOnly, !isQuitting, board(session.id) === session,
+            let initialNode = session.board.nodes[worktreeID],
+            case .worktree(let initialTopic) = initialNode.content,
+            let ownLocation = initialTopic.location
+        else { throw WorkspaceIssue("This Worktree is no longer available for editing.") }
+        let location = try await git.project(at: path)
+        guard let common = location.gitCommonDirectory else {
+            throw WorkspaceIssue("Choose a folder inside a Git repository.")
+        }
+        let isOwnWorktree = ownLocation.directory == location.directory
+        let existingChild = initialNode.children.first(where: { childID in
+            guard case .gitChanges(let topic) = session.board.nodes[childID]?.content else { return false }
+            return (topic.directory ?? ownLocation.directory) == location.directory
+        })
+        let existingBase: String? =
+            if let existingChild, case .gitChanges(let topic) = session.board.nodes[existingChild]?.content {
+                topic.baseCommit
+            } else {
+                initialTopic.trackedExternalGitChanges.first(where: { $0.directory == location.directory })?.baseCommit
+            }
+        let baseCommit =
+            existingBase ?? (isOwnWorktree ? defaultGitChangesBaseCommit(for: worktreeID, in: session) : nil)
+        let snapshot = try await git.changesSnapshot(in: location.directory, baseCommit: baseCommit)
+        guard board(session.id) === session, var worktreeNode = session.board.nodes[worktreeID],
+            case .worktree(var worktreeTopic) = worktreeNode.content,
+            worktreeTopic.location?.directory == ownLocation.directory
+        else { throw WorkspaceIssue("This Worktree is no longer available.") }
+        let headCommit = isOwnWorktree ? baseCommit : (baseCommit ?? snapshot.headCommit)
+        let target = GitChangesTarget(directory: location.directory, baseCommit: headCommit)
+        recordGitChangesSnapshot(snapshot, for: target)
+        guard snapshot.hasChanges else {
+            let name = URL(fileURLWithPath: location.directory).lastPathComponent
+            throw WorkspaceIssue("No Git changes in \(name.isEmpty ? location.directory : name).")
+        }
+
+        let topic = GitChangesTopic(
+            directory: isOwnWorktree ? nil : location.directory,
+            gitCommonDirectory: isOwnWorktree ? nil : common,
+            baseCommit: headCommit)
+        if let existing = worktreeNode.children.first(where: { childID in
+            guard case .gitChanges(let existingTopic) = session.board.nodes[childID]?.content else { return false }
+            return (existingTopic.directory ?? ownLocation.directory) == location.directory
+        }) {
+            let beforeTopic = worktreeTopic
+            if !worktreeTopic.showsGitChanges { worktreeTopic.showsGitChanges = true }
+            if !isOwnWorktree { worktreeTopic.rememberExternalGitChanges(topic) }
+            if worktreeTopic != beforeTopic {
+                worktreeNode.content = .worktree(worktreeTopic)
+                try apply(
+                    BoardEdit(nodes: [NodeReplacement(id: worktreeID, node: worktreeNode)]), in: session,
+                    action: "Show Git Changes")
+            }
+            return (id: existing, created: false, directory: location.directory)
+        }
+        let index = gitChangesInsertIndex(under: worktreeID, isOwnWorktree: isOwnWorktree, in: session.board)
+        guard
+            var insertion = session.board.inserting(
+                MapNode(content: .gitChanges(topic)), parent: worktreeID, at: index)
+        else {
+            throw WorkspaceIssue("Git Changes could not be added under this Worktree.")
+        }
+        if !worktreeTopic.showsGitChanges || !isOwnWorktree {
+            insertion.edit.nodes = insertion.edit.nodes.map { replacement in
+                guard replacement.id == worktreeID, var updated = replacement.node,
+                    case .worktree(var updatedTree) = updated.content
+                else { return replacement }
+                updatedTree.showsGitChanges = true
+                if !isOwnWorktree { updatedTree.rememberExternalGitChanges(topic) }
+                updated.content = .worktree(updatedTree)
+                return NodeReplacement(id: worktreeID, node: updated)
+            }
+        }
+        try apply(insertion.edit, in: session, action: "Add Git Changes")
+        return (id: insertion.id, created: true, directory: location.directory)
+    }
+
+    /// Synchronizes Git Changes cards on `session` with real Git state:
+    /// shows each enabled Worktree's own and tracked external cards only when changes exist,
+    /// and removes clean or disabled leaf cards automatically while preserving tracked external metadata.
+    func syncGitChanges(in session: BoardSession) async {
+        guard board(session.id) === session else { return }
+        var targets = Set<GitChangesTarget>()
+        for nodeID in session.gitChangesNodeIDs {
+            if let target = gitChangesTarget(for: nodeID, in: session.board) {
+                targets.insert(target)
+            }
+        }
+        for (worktreeID, state) in session.worktreeGitStates where state.showsGitChanges {
+            guard case .worktree(let tree) = session.board.nodes[worktreeID]?.content,
+                let location = tree.location,
+                session.board.context(above: worktreeID).problem == nil
+            else { continue }
+            if !hasDefaultGitChanges(under: worktreeID, in: session.board) {
+                let baseCommit = defaultGitChangesBaseCommit(for: worktreeID, in: session)
+                targets.insert(GitChangesTarget(directory: location.directory, baseCommit: baseCommit))
+            }
+            for external in tree.trackedExternalGitChanges {
+                guard let directory = external.directory, !directory.isEmpty,
+                    !hasGitChanges(for: directory, under: worktreeID, in: session.board)
+                else { continue }
+                let base = external.baseCommit.flatMap { $0.isEmpty ? nil : $0 }
+                targets.insert(GitChangesTarget(directory: directory, baseCommit: base))
+            }
+        }
+        guard !targets.isEmpty else { return }
+
+        var snapshots: [GitChangesTarget: GitChangesSnapshot] = [:]
+        for target in targets {
+            guard !Task.isCancelled else { return }
+            if let snapshot = try? await git.changesSnapshot(in: target.directory, baseCommit: target.baseCommit) {
+                snapshots[target] = snapshot
+            }
+        }
+        guard !Task.isCancelled, board(session.id) === session else { return }
+        for (target, snapshot) in snapshots {
+            recordGitChangesSnapshot(snapshot, for: target)
+        }
+        guard !isReadOnly, !isQuitting else { return }
+
+        // Remove clean or disabled Git Changes nodes that have no child notes,
+        // harvesting any external GitChangesTopic onto the parent Worktree first.
+        var toRemove = Set<UUID>()
+        var rememberedExternals: [UUID: [GitChangesTopic]] = [:]
+        for nodeID in session.gitChangesNodeIDs {
+            guard let node = session.board.nodes[nodeID], node.children.isEmpty else { continue }
+            let isDisabled: Bool =
+                if let parentID = session.board.parents[nodeID],
+                    case .worktree(let tree) = session.board.nodes[parentID]?.content
+                {
+                    !tree.showsGitChanges
+                } else {
+                    false
+                }
+            let isClean: Bool =
+                if let target = gitChangesTarget(for: nodeID, in: session.board),
+                    let snapshot = snapshots[target]
+                {
+                    !snapshot.hasChanges
+                } else {
+                    false
+                }
+            guard isDisabled || isClean else { continue }
+            if case .gitChanges(let gitTopic) = node.content, gitTopic.directory != nil,
+                let parentID = session.board.parents[nodeID]
+            {
+                rememberedExternals[parentID, default: []].append(gitTopic)
+            }
+            toRemove.insert(nodeID)
+        }
+        if !toRemove.isEmpty, var edit = session.board.deleting(toRemove) {
+            if !rememberedExternals.isEmpty {
+                edit.nodes = edit.nodes.map { replacement in
+                    guard let externals = rememberedExternals[replacement.id],
+                        var updated = replacement.node,
+                        case .worktree(var updatedTree) = updated.content
+                    else { return replacement }
+                    for topic in externals { updatedTree.rememberExternalGitChanges(topic) }
+                    updated.content = .worktree(updatedTree)
+                    return NodeReplacement(id: replacement.id, node: updated)
+                }
+            }
+            _ = session.apply(edit, named: "Sync Git Changes", recordHistory: false)
+        }
+
+        // Attach default and tracked external Git Changes cards at the front of each enabled Worktree with changes.
+        for (worktreeID, state) in session.worktreeGitStates where state.showsGitChanges {
+            guard case .worktree(let tree) = session.board.nodes[worktreeID]?.content,
+                tree.showsGitChanges, let location = tree.location,
+                session.board.context(above: worktreeID).problem == nil
+            else { continue }
+            if !hasDefaultGitChanges(under: worktreeID, in: session.board) {
+                let baseCommit = defaultGitChangesBaseCommit(for: worktreeID, in: session)
+                let target = GitChangesTarget(directory: location.directory, baseCommit: baseCommit)
+                if snapshots[target]?.hasChanges == true {
+                    let node = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: baseCommit)))
+                    if let insertion = session.board.inserting(node, parent: worktreeID, at: 0) {
+                        _ = session.apply(insertion.edit, named: "Sync Git Changes", recordHistory: false)
+                    }
+                }
+            }
+            for external in tree.trackedExternalGitChanges {
+                guard let directory = external.directory, !directory.isEmpty,
+                    !hasGitChanges(for: directory, under: worktreeID, in: session.board)
+                else { continue }
+                let base = external.baseCommit.flatMap { $0.isEmpty ? nil : $0 }
+                let target = GitChangesTarget(directory: directory, baseCommit: base)
+                guard snapshots[target]?.hasChanges == true else { continue }
+                let index = gitChangesInsertIndex(under: worktreeID, isOwnWorktree: false, in: session.board)
+                let node = MapNode(content: .gitChanges(external))
+                if let insertion = session.board.inserting(node, parent: worktreeID, at: index) {
+                    _ = session.apply(insertion.edit, named: "Sync Git Changes", recordHistory: false)
+                }
+            }
+        }
+    }
+
+    func reconcileGitChangesNode(at address: NodeAddress, snapshot: GitChangesSnapshot) {
+        guard !isReadOnly, !isQuitting, !snapshot.hasChanges,
+            let session = board(address.boardID),
+            let node = session.board.nodes[address.nodeID],
+            case .gitChanges(let gitTopic) = node.content, node.children.isEmpty,
+            var edit = session.board.deleting([address.nodeID])
+        else { return }
+        if gitTopic.directory != nil, let parentID = session.board.parents[address.nodeID] {
+            edit.nodes = edit.nodes.map { replacement in
+                guard replacement.id == parentID, var updated = replacement.node,
+                    case .worktree(var updatedTree) = updated.content
+                else { return replacement }
+                updatedTree.rememberExternalGitChanges(gitTopic)
+                updated.content = .worktree(updatedTree)
+                return NodeReplacement(id: parentID, node: updated)
+            }
+        }
+        _ = session.apply(edit, named: "Sync Git Changes", recordHistory: false)
+    }
+
     private func beginOperation(_ address: NodeAddress) throws -> BoardSession {
         guard !isReadOnly, !isQuitting, let session = board(address.boardID),
             session.board.nodes[address.nodeID] != nil
@@ -368,17 +632,6 @@ extension WorkspaceStore {
             guard let parentEdit else { throw WorkspaceIssue("The worktree could not be attached to this node.") }
             candidate.apply(parentEdit)
             record(parentEdit)
-        }
-        let hasGitChanges =
-            candidate.nodes[address.nodeID]?.children.contains { candidate.nodes[$0]?.content.kind == .gitChanges }
-            == true
-        if !hasGitChanges {
-            let base = location.commit.isEmpty ? nil : location.commit
-            let changesNode = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: base)))
-            if let insertion = candidate.inserting(changesNode, parent: address.nodeID) {
-                candidate.apply(insertion.edit)
-                record(insertion.edit)
-            }
         }
         let replacements = touched.compactMap { id -> NodeReplacement? in
             original.nodes[id] == candidate.nodes[id] ? nil : NodeReplacement(id: id, node: candidate.nodes[id])

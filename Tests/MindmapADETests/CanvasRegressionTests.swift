@@ -1258,23 +1258,29 @@ struct CanvasRegressionTests {
     }
 
     @Test func gitChangesSelectionAndExplicitOpeningAreSeparate() async throws {
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let checkout = fixture.home.appendingPathComponent("Feature Checkout")
+        try fixture.git(["worktree", "add", "-b", "feature/git", checkout.path, "HEAD"])
+        try "edit\n".write(to: checkout.appendingPathComponent("change.txt"), atomically: true, encoding: .utf8)
+
+        let workspaceGit = GitWorkspace()
         var project = ProjectTopic()
-        project.location = ProjectLocation(directory: "/project", gitCommonDirectory: "/project/.git")
+        let projectLocation = try await workspaceGit.project(at: fixture.repository.path)
+        project.location = projectLocation
         let root = MapNode(content: .project(project))
-        let location = WorktreeLocation(
-            directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "feature/git", commit: "abc",
-            isPrimary: false)
+        let location = try await workspaceGit.existing(checkout.path, in: projectLocation)
         let worktree = MapNode(content: .worktree(WorktreeTopic(location: location)))
         var topic = AgentTopic(task: "Run task")
         topic.isConfigured = true
         let agent = MapNode(content: .agent(topic))
-        let changes = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: "abc")))
+        let changes = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: location.commit)))
         var board = MindMapBoard(root: root)
         board.apply(try #require(board.inserting(worktree, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(changes, parent: worktree.id, at: 0)).edit)
         board.apply(try #require(board.inserting(agent, parent: worktree.id)).edit)
-        board.apply(try #require(board.inserting(changes, parent: agent.id)).edit)
 
-        let disk = MemoryWorkspaceDisk(board: board)
+        let disk = MemoryWorkspaceDisk(board: board, directory: fixture.data)
         let workspace = WorkspaceStore(disk: disk)
         await workspace.loadIfNeeded()
         let session = try #require(workspace.boards.first)
@@ -1351,16 +1357,63 @@ struct CanvasRegressionTests {
         restoredActions.restoreRightPane()
         #expect(restoredActions.gitChangesAddress == changesAddress)
 
-        // Deleting Git Changes makes Add Git Changes available again on the Agent.
+        // Deleting the Worktree's default Git Changes node disables Show Git Changes atomically (undoable).
         canvas.view.deleteSelection()
         #expect(session.board.nodes[changes.id] == nil)
+        if case .worktree(let afterDelete) = session.board.nodes[worktree.id]?.content {
+            #expect(!afterDelete.showsGitChanges)
+        } else {
+            Issue.record("Expected configured worktree after deleting Git Changes")
+        }
+
+        // Worktree context menu exposes Show Git Changes toggle (currently off) and hides Track Another Repository.
+        let worktreePoint = try center(of: worktree.title)
+        let worktreeMenuOff = try #require(canvas.view.menu(for: try canvas.event(.rightMouseDown, at: worktreePoint)))
+        let toggleItemOff = try #require(worktreeMenuOff.items.first { $0.title == "Show Git Changes" })
+        #expect(toggleItemOff.state == .off)
+        #expect(!worktreeMenuOff.items.map(\.title).contains("Track Another Repository"))
+        #expect(canvas.actions.canToggleWorktreeGitChanges)
+        #expect(!canvas.actions.worktreeShowsGitChanges)
+        #expect(!canvas.actions.canAddExternalGitChanges)
+
+        // Agent context menu no longer carries Git Changes controls.
         let agentPoint = try center(of: agent.title)
         let agentMenu = try #require(canvas.view.menu(for: try canvas.event(.rightMouseDown, at: agentPoint)))
-        #expect(agentMenu.items.map(\.title).contains("Add Git Changes"))
-        #expect(canvas.actions.canAddGitChanges)
-        canvas.actions.add(.gitChanges)
-        let recreated = try #require(session.board.nodes[agent.id]?.children.last)
+        #expect(!agentMenu.items.map(\.title).contains("Show Git Changes"))
+        #expect(!agentMenu.items.map(\.title).contains("Track Another Repository"))
+
+        // Toggling Show Git Changes back on from the Worktree context menu restores the single Git Changes card
+        // at index 0 and exposes Track Another Repository.
+        let toggleIndex = try #require(worktreeMenuOff.items.firstIndex(of: toggleItemOff))
+        _ = canvas.view.menu(for: try canvas.event(.rightMouseDown, at: worktreePoint))
+        worktreeMenuOff.performActionForItem(at: toggleIndex)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while session.board.nodes[worktree.id]?.children.first == agent.id, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let recreated = try #require(session.board.nodes[worktree.id]?.children.first)
         #expect(session.board.nodes[recreated]?.content.kind == .gitChanges)
-        #expect(canvas.actions.gitChangesAddress == NodeAddress(boardID: session.id, nodeID: recreated))
+        #expect(session.board.nodes[worktree.id]?.children == [recreated, agent.id])
+
+        let worktreeMenuOn = try #require(canvas.view.menu(for: try canvas.event(.rightMouseDown, at: worktreePoint)))
+        let toggleItemOn = try #require(worktreeMenuOn.items.first { $0.title == "Show Git Changes" })
+        #expect(toggleItemOn.state == .on)
+        let trackMenu = try #require(worktreeMenuOn.items.first { $0.title == "Track Another Repository" }?.submenu)
+        #expect(trackMenu.items.map(\.title).contains(root.title))
+        #expect(trackMenu.items.map(\.title).contains("Choose Folder…"))
+        #expect(canvas.actions.canToggleWorktreeGitChanges)
+        #expect(canvas.actions.worktreeShowsGitChanges)
+        #expect(canvas.actions.canAddExternalGitChanges)
+
+        // Toggling Show Git Changes off again immediately removes the childless Git Changes node,
+        // and Undo restores both the preference and the card.
+        canvas.actions.toggleWorktreeGitChanges()
+        #expect(session.board.nodes[recreated] == nil)
+        #expect(session.board.nodes[worktree.id]?.children == [agent.id])
+        #expect(!canvas.actions.worktreeShowsGitChanges)
+        canvas.actions.undo()
+        #expect(session.board.nodes[recreated]?.content.kind == .gitChanges)
+        #expect(session.board.nodes[worktree.id]?.children == [recreated, agent.id])
+        #expect(canvas.actions.worktreeShowsGitChanges)
     }
 }

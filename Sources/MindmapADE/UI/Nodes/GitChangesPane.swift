@@ -28,6 +28,32 @@ struct GitChangesPane: View {
     @State private var diffError: String?
     @State private var listHeightShare: CGFloat = CanvasStyle.gitChangesListDefaultShare
     @State private var refreshNonce = 0
+    @State private var otherDirtyRepos: [UntrackedDirtyRepository] = []
+    @State private var trackingError: String?
+
+    private var nodeTitle: String {
+        _ = session.revision
+        return session.board.nodes[address.nodeID]?.title ?? "Git Changes"
+    }
+
+    private var explicitDirectory: String? {
+        _ = session.revision
+        guard case .gitChanges(let topic) = session.board.nodes[address.nodeID]?.content,
+            let directory = topic.directory, !directory.isEmpty
+        else { return nil }
+        return directory
+    }
+
+    private var owningWorktreeID: UUID? {
+        _ = session.revision
+        if let parent = session.board.parents[address.nodeID],
+            case .worktree(let tree) = session.board.nodes[parent]?.content,
+            tree.location != nil
+        {
+            return parent
+        }
+        return session.board.context(above: address.nodeID).worktreeID
+    }
 
     private var nodeContext: NodeContext {
         _ = session.revision
@@ -77,18 +103,53 @@ struct GitChangesPane: View {
         let refreshNonce: Int
     }
 
+    private struct OtherDirtyRefresh: Equatable {
+        let worktreeID: UUID?
+        let gitChangesNodeIDs: Set<UUID>
+        let gitProjectLocations: [UUID: ProjectLocation]
+        let worktreeGitStates: [UUID: BoardSession.WorktreeGitState]
+        let refreshNonce: Int
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             GitChangesHeader(
+                title: nodeTitle,
                 snapshot: snapshot,
                 directory: target?.directory,
                 scope: $scope,
                 isLoading: isLoading,
+                canTrackAnother: !session.isReadOnly && owningWorktreeID != nil,
+                onTrackAnother: {
+                    if let worktreeID = owningWorktreeID {
+                        actions.canvas?.chooseExternalGitChanges(under: worktreeID)
+                    }
+                },
                 onRefresh: { Task { await refresh(userInitiated: true) } },
                 onRevealDirectory: revealWorktreeInFinder,
                 onHide: { actions.hideRightPane() }
             )
             Divider()
+            if !otherDirtyRepos.isEmpty, let worktreeID = owningWorktreeID, !session.isReadOnly {
+                otherModifiedBar(worktreeID: worktreeID)
+                Divider()
+            }
+            if let trackingError {
+                HStack(spacing: CanvasStyle.formSpacing) {
+                    Label(trackingError, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                    Button("Dismiss", systemImage: "xmark") { self.trackingError = nil }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                }
+                .controlSize(.small)
+                .padding(.horizontal, CanvasStyle.statusHorizontalPadding)
+                .padding(.vertical, CanvasStyle.formCompactSpacing)
+                .background(.bar)
+                Divider()
+            }
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -96,6 +157,17 @@ struct GitChangesPane: View {
         .task(id: target) {
             await refresh(userInitiated: true)
             await watchChanges(for: target)
+        }
+        .task(
+            id: OtherDirtyRefresh(
+                worktreeID: owningWorktreeID,
+                gitChangesNodeIDs: session.gitChangesNodeIDs,
+                gitProjectLocations: session.gitProjectLocations,
+                worktreeGitStates: session.worktreeGitStates,
+                refreshNonce: refreshNonce
+            )
+        ) {
+            await refreshOtherDirtyRepositories()
         }
         .task(id: selectedCommit?.hash) {
             await loadSelectedCommitFiles()
@@ -177,7 +249,7 @@ struct GitChangesPane: View {
                 Text(
                     snapshot.commits.isEmpty
                         ? "Edits in this worktree will appear here automatically."
-                        : "No uncommitted edits. \(snapshot.commits.count) \(snapshot.commits.count == 1 ? "commit" : "commits") recorded since the Agent started."
+                        : "No uncommitted edits. \(snapshot.commits.count) \(snapshot.commits.count == 1 ? "commit" : "commits") recorded on this worktree."
                 )
             } actions: {
                 if !snapshot.commits.isEmpty {
@@ -214,7 +286,7 @@ struct GitChangesPane: View {
             ContentUnavailableView {
                 Label("No Commits Yet", systemImage: "clock")
             } description: {
-                Text("Commits created on this branch after the Agent started will appear here.")
+                Text("Commits created after this worktree's baseline will appear here.")
             } actions: {
                 if !snapshot.files.isEmpty {
                     Button("View Uncommitted Changes") { scope = .workingTree }
@@ -285,15 +357,106 @@ struct GitChangesPane: View {
     }
 
     private var blockedMessage: String? {
+        if explicitDirectory != nil { return nil }
         let scope = nodeContext
         if let problem = scope.problem { return problem.message }
         guard let project = scope.project, project.gitCommonDirectory != nil else {
             return "Choose a Git project above this branch."
         }
         guard scope.worktree != nil else {
-            return "Link or create a worktree above this Agent to inspect Git changes."
+            return "Link or create a worktree above this node to inspect Git changes."
         }
         return nil
+    }
+
+    @ViewBuilder
+    private func otherModifiedBar(worktreeID: UUID) -> some View {
+        VStack(alignment: .leading, spacing: CanvasStyle.formCompactSpacing) {
+            ForEach(otherDirtyRepos) { repo in
+                HStack(spacing: CanvasStyle.formSpacing) {
+                    Label(
+                        "\(repo.name) modified · \(repo.cardDetail)",
+                        systemImage: NodeKind.gitChanges.symbol
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help("\(repo.directory) (\(repo.branchLabel))")
+                    Spacer(minLength: 0)
+                    Button("Track") {
+                        Task { await trackExternalRepository(repo.directory, under: worktreeID) }
+                    }
+                    .controlSize(.mini)
+                }
+            }
+        }
+        .padding(.horizontal, CanvasStyle.statusHorizontalPadding)
+        .padding(.vertical, CanvasStyle.formCompactSpacing)
+        .background(.bar)
+    }
+
+    private func trackExternalRepository(_ directory: String, under worktreeID: UUID) async {
+        do {
+            let result = try await workspace.attachGitChanges(directory: directory, under: worktreeID, in: session)
+            trackingError = nil
+            otherDirtyRepos.removeAll { $0.directory == result.directory }
+            actions.showGitChanges(at: NodeAddress(boardID: session.id, nodeID: result.id))
+        } catch {
+            trackingError = error.localizedDescription
+        }
+    }
+
+    private func refreshOtherDirtyRepositories() async {
+        guard let worktreeID = owningWorktreeID else {
+            otherDirtyRepos = []
+            return
+        }
+        let worktreeTopic: WorktreeTopic? =
+            if case .worktree(let tree) = session.board.nodes[worktreeID]?.content {
+                tree
+            } else {
+                nil
+            }
+        let ownWorktreeDir = worktreeTopic?.location?.directory
+        let rememberedExternalDirs = Set(worktreeTopic?.trackedExternalGitChanges.compactMap(\.directory) ?? [])
+        var seen = workspace.trackedGitChangesDirectories(under: worktreeID, in: session.board)
+        seen.formUnion(rememberedExternalDirs)
+        if let ownWorktreeDir { seen.insert(ownWorktreeDir) }
+        var candidates = workspace.untrackedKnownGitDirectories(for: worktreeID, in: session.board)
+            .map(\.directory)
+            .filter { !seen.contains($0) }
+        for directory in candidates { seen.insert(directory) }
+        // Also inspect sibling worktrees of the enclosing repository.
+        if let project = nodeContext.project, project.gitCommonDirectory != nil,
+            let worktrees = try? await workspace.git.worktrees(for: project)
+        {
+            for tree in worktrees where seen.insert(tree.directory).inserted {
+                candidates.append(tree.directory)
+            }
+        }
+        // Exclude directories actively owned by a running Agent in another worktree.
+        let busyOtherAgentDirs = Set(
+            workspace.agentRuns.values.compactMap { run -> String? in
+                guard run.state.isActive, run.directory != ownWorktreeDir else { return nil }
+                return run.directory
+            })
+        candidates.removeAll { busyOtherAgentDirs.contains($0) }
+        var dirty: [UntrackedDirtyRepository] = []
+        for directory in candidates.prefix(12) {
+            guard !Task.isCancelled else { return }
+            guard let snap = try? await workspace.git.changesSnapshot(in: directory, baseCommit: nil),
+                snap.uniqueFileCount > 0
+            else { continue }
+            let name = URL(fileURLWithPath: snap.directory).lastPathComponent
+            dirty.append(
+                UntrackedDirtyRepository(
+                    directory: snap.directory, name: name.isEmpty ? snap.directory : name,
+                    branchLabel: snap.branchLabel, cardDetail: snap.cardDetail))
+        }
+        if !Task.isCancelled {
+            otherDirtyRepos = dirty
+        }
     }
 
     private func revealWorktreeInFinder() {
@@ -317,6 +480,10 @@ struct GitChangesPane: View {
             snapshot = loaded
             loadError = nil
             workspace.recordGitChangesSnapshot(loaded, for: currentTarget)
+            if !loaded.hasChanges {
+                workspace.reconcileGitChangesNode(at: address, snapshot: loaded)
+                return
+            }
             if let current = selectedFileID, !loaded.files.contains(where: { $0.id == current }) {
                 selectedFileID = loaded.files.first?.id
             } else if selectedFileID == nil {
@@ -429,10 +596,13 @@ struct GitChangesPane: View {
 }
 
 private struct GitChangesHeader: View {
+    let title: String
     let snapshot: GitChangesSnapshot?
     let directory: String?
     @Binding var scope: GitChangesPane.Scope
     let isLoading: Bool
+    let canTrackAnother: Bool
+    let onTrackAnother: () -> Void
     let onRefresh: () -> Void
     let onRevealDirectory: () -> Void
     let onHide: () -> Void
@@ -440,15 +610,20 @@ private struct GitChangesHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: CanvasStyle.formCompactSpacing) {
             HStack(spacing: CanvasStyle.formSpacing) {
-                Label("Git Changes", systemImage: NodeKind.gitChanges.symbol)
+                Label(title, systemImage: NodeKind.gitChanges.symbol)
                     .font(.headline)
                     .lineLimit(1)
-                    .help(directory ?? "Git Changes")
+                    .help(directory ?? title)
                 Spacer(minLength: 0)
                 if isLoading {
                     ProgressView()
                         .controlSize(.mini)
                         .accessibilityLabel("Refreshing Git changes")
+                }
+                if canTrackAnother {
+                    Button("Track Another Repository", systemImage: "plus", action: onTrackAnother)
+                        .labelStyle(.iconOnly)
+                        .help("Track another Git repository or worktree under this Worktree")
                 }
                 Button("Refresh", systemImage: "arrow.clockwise", action: onRefresh)
                     .labelStyle(.iconOnly)
@@ -868,7 +1043,7 @@ private struct GitDiffViewer: View {
                     ScrollView([.horizontal, .vertical]) {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             ForEach(diff.lines) { line in
-                                GitDiffLineRow(line: line)
+                                GitDiffLineRow(line: line, minimumWidth: geometry.size.width)
                             }
                             if diff.isTruncated {
                                 Text("Diff truncated after \(GitDiffDocument.maxRenderedLines.formatted()) lines.")
@@ -897,6 +1072,7 @@ private struct GitDiffViewer: View {
 
 private struct GitDiffLineRow: View {
     let line: GitDiffDocument.Line
+    let minimumWidth: CGFloat
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 0) {
@@ -928,7 +1104,7 @@ private struct GitDiffLineRow: View {
         }
         .font(.system(size: 11, design: .monospaced))
         .monospacedDigit()
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(minWidth: minimumWidth, maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 1)
         .background(backgroundColor)
     }

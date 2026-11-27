@@ -97,7 +97,8 @@ extension MapNode {
         case .project(let project): project.details
         case .agent(let agent): agent.task
         case .worktree(let tree): tree.location?.directory ?? title
-        case .branch, .gitChanges: title
+        case .gitChanges(let changes): changes.directory ?? title
+        case .branch: title
         }
     }
 }

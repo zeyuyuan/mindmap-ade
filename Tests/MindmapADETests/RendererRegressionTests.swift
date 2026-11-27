@@ -198,19 +198,22 @@ struct RendererRegressionTests {
 
     @Test func activeGitChangesCardHighlightsIndependentlyOfSelection() throws {
         _ = NSApplication.shared
-        let agent = MapNode(content: .agent(AgentTopic(task: "Session")))
-        var board = MindMapBoard(root: agent)
+        let location = WorktreeLocation(
+            directory: "/checkout", gitCommonDirectory: "/project/.git", branch: "feature/git", commit: "abc",
+            isPrimary: false)
+        let worktree = MapNode(content: .worktree(WorktreeTopic(location: location)))
+        var board = MindMapBoard(root: worktree)
         let changes = MapNode(content: .gitChanges(GitChangesTopic()))
-        board.apply(try #require(board.inserting(changes, parent: agent.id)).edit)
+        board.apply(try #require(board.inserting(changes, parent: worktree.id)).edit)
         let size = CGSize(width: MapMetrics.resourceMinimumWidth, height: MapMetrics.resourceHeight)
-        let layout = TreeLayout.make(board: board, sizes: [agent.id: size, changes.id: size])
+        let layout = TreeLayout.make(board: board, sizes: [worktree.id: size, changes.id: size])
         let host = CALayer()
         let renderer = MapRenderer(layer: host)
         let viewport = CGRect(x: 0, y: 0, width: 640, height: 200)
 
         renderer.render(
             board: board, layout: layout, camera: MapCamera(), viewport: viewport,
-            selection: [agent.id], backingScale: 2, activePaneNodeID: nil)
+            selection: [worktree.id], backingScale: 2, activePaneNodeID: nil)
         let tree = try #require(host.sublayers?.first?.sublayers?.first)
         let cards = try #require(tree.sublayers?.filter { $0.cornerRadius == CanvasStyle.nodeRadius })
         let changesCard = try #require(cards.first { $0.frame == layout.nodes[changes.id]?.frame })
@@ -220,13 +223,13 @@ struct RendererRegressionTests {
 
         renderer.render(
             board: board, layout: layout, camera: MapCamera(), viewport: viewport,
-            selection: [agent.id], backingScale: 2, activePaneNodeID: changes.id)
+            selection: [worktree.id], backingScale: 2, activePaneNodeID: changes.id)
         #expect(changesCard.backgroundColor != idleBackground)
         #expect(changesIcon.contents as AnyObject? !== idleIcon)
 
         renderer.render(
             board: board, layout: layout, camera: MapCamera(), viewport: viewport,
-            selection: [agent.id], backingScale: 2, activePaneNodeID: nil)
+            selection: [worktree.id], backingScale: 2, activePaneNodeID: nil)
         #expect(changesCard.backgroundColor == idleBackground)
         #expect(changesIcon.contents as AnyObject? === idleIcon)
     }

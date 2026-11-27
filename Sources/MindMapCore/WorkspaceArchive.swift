@@ -1,7 +1,7 @@
 import Foundation
 
 public struct WorkspaceArchive: Codable, Sendable {
-    private static let currentVersion = 8
+    private static let currentVersion = 9
 
     public var schemaVersion: Int
     public var boards: [MindMapBoard]
@@ -40,10 +40,26 @@ public struct WorkspaceArchive: Codable, Sendable {
         else { throw BoardValidationError.invalidStructure }
         var migrated = self
         if schemaVersion < 6 {
-            migrated.boards = boards.map { original in
+            migrated.boards = migrated.boards.map { original in
                 var board = schemaVersion < 4 ? original.removingLegacyBranchNodes() : original
                 board.flattenProjectCheckouts()
                 return board
+            }
+        }
+        if schemaVersion < 9 {
+            var remappedIDs: [UUID: [UUID: UUID]] = [:]
+            migrated.boards = migrated.boards.map { original in
+                var board = original
+                let remapped = board.migrateGitChangesToWorktrees()
+                if !remapped.isEmpty { remappedIDs[board.id] = remapped }
+                return board
+            }
+            if let pane = migrated.rightPane, pane.kind == .gitChanges,
+                let replacement = remappedIDs[pane.address.boardID]?[pane.address.nodeID]
+            {
+                migrated.rightPane = RightPaneState(
+                    address: NodeAddress(boardID: pane.address.boardID, nodeID: replacement),
+                    kind: pane.kind, widthShare: pane.widthShare)
             }
         }
         migrated.schemaVersion = Self.currentVersion
@@ -52,6 +68,74 @@ public struct WorkspaceArchive: Codable, Sendable {
 }
 
 extension MindMapBoard {
+    /// Moves legacy Git Changes nodes placed under Agents up to their enclosing configured Worktree,
+    /// deduplicating by canonical directory and preserving any child notes.
+    fileprivate mutating func migrateGitChangesToWorktrees() -> [UUID: UUID] {
+        // Visit nodes in deterministic document order so the first card per directory wins.
+        var ordered: [UUID] = []
+        var stack = roots.reversed().map(\.id)
+        while let id = stack.popLast() {
+            guard let node = nodes[id] else { continue }
+            ordered.append(id)
+            stack.append(contentsOf: node.children.reversed())
+        }
+        var remapped: [UUID: UUID] = [:]
+        for id in ordered {
+            guard let node = nodes[id], case .gitChanges(let topic) = node.content else { continue }
+            if let parentID = parents[id], case .worktree(let tree) = nodes[parentID]?.content, tree.location != nil {
+                continue
+            }
+            let scope = context(above: id)
+            guard let worktreeID = scope.worktreeID, var worktreeNode = nodes[worktreeID],
+                case .worktree(var worktreeTopic) = worktreeNode.content,
+                let worktreeLocation = worktreeTopic.location
+            else { continue }
+
+            let directory = topic.directory ?? worktreeLocation.directory
+            let existingID = worktreeNode.children.first { childID in
+                guard case .gitChanges(let existing) = nodes[childID]?.content else { return false }
+                return (existing.directory ?? worktreeLocation.directory) == directory
+            }
+
+            var replacements: [NodeReplacement] = []
+            if let oldParentID = parents[id], var oldParent = nodes[oldParentID] {
+                oldParent.children.removeAll { $0 == id }
+                if oldParent.children.isEmpty { oldParent.isCollapsed = false }
+                replacements.append(NodeReplacement(id: oldParentID, node: oldParent))
+            }
+
+            if let existingID, var existingNode = nodes[existingID] {
+                if !node.children.isEmpty {
+                    existingNode.children.append(contentsOf: node.children)
+                    existingNode.isCollapsed = false
+                    replacements.append(NodeReplacement(id: existingID, node: existingNode))
+                }
+                replacements.append(NodeReplacement(id: id, node: nil))
+                remapped[id] = existingID
+            } else {
+                let isOwnWorktree = topic.directory == nil || topic.directory == worktreeLocation.directory
+                let insertIndex =
+                    isOwnWorktree
+                    ? 0
+                    : worktreeNode.children.prefix(while: { nodes[$0]?.content.kind == .gitChanges }).count
+                var movedNode = node
+                if topic.directory == worktreeLocation.directory {
+                    movedNode.content = .gitChanges(GitChangesTopic(baseCommit: topic.baseCommit))
+                } else if !isOwnWorktree {
+                    worktreeTopic.rememberExternalGitChanges(topic)
+                    worktreeNode.content = .worktree(worktreeTopic)
+                }
+                worktreeNode.children.insert(id, at: insertIndex)
+                worktreeNode.isCollapsed = false
+                replacements.append(NodeReplacement(id: worktreeID, node: worktreeNode))
+                if movedNode != node {
+                    replacements.append(NodeReplacement(id: id, node: movedNode))
+                }
+            }
+            apply(BoardEdit(nodes: replacements))
+        }
+        return remapped
+    }
     fileprivate mutating func flattenProjectCheckouts() {
         let legacy = nodes.values.compactMap { node -> UUID? in
             guard case .worktree(let worktree) = node.content, worktree.isProjectDirectory == true else { return nil }

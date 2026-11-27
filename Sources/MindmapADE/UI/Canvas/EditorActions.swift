@@ -42,7 +42,9 @@ final class EditorActions {
     var canAddProject = false
     var canAddWorktree = false
     var canLinkWorktree = false
-    var canAddGitChanges = false
+    var canToggleWorktreeGitChanges = false
+    var worktreeShowsGitChanges = false
+    var canAddExternalGitChanges = false
     var canDeriveAgent = false
     var zoomLabel = "100%"
     var canEdit = false
@@ -138,6 +140,8 @@ final class EditorActions {
     }
 
     func add(_ kind: NodeKind) { activeCanvas?.insertResource(kind) }
+    func toggleWorktreeGitChanges() { activeCanvas?.toggleWorktreeGitChanges() }
+    func addExternalGitChanges() { activeCanvas?.chooseExternalGitChanges() }
     func linkWorktree() { activeCanvas?.insertResource(.worktree, linkWorktree: true) }
     func deriveAgent() { activeCanvas?.deriveAgent() }
 
@@ -245,12 +249,22 @@ struct MindMapCommands: Commands {
                 Button("Worktree", systemImage: NodeKind.worktree.symbol) { actions?.add(.worktree) }
                     .disabled(actions?.canAddWorktree != true)
                 Button("Agent", systemImage: NodeKind.agent.symbol) { actions?.add(.agent) }
-                Button("Git Changes", systemImage: NodeKind.gitChanges.symbol) { actions?.add(.gitChanges) }
-                    .disabled(actions?.canAddGitChanges != true)
+                Button("Track Another Repository…", systemImage: NodeKind.gitChanges.symbol) {
+                    actions?.addExternalGitChanges()
+                }
+                .disabled(actions?.canAddExternalGitChanges != true)
             }
             .disabled(actions?.canvas == nil || actions?.workspace?.isReadOnly != false)
             Button("Link Existing Worktree…", systemImage: "link") { actions?.linkWorktree() }
                 .disabled(actions?.canLinkWorktree != true)
+            Toggle(
+                "Show Git Changes",
+                isOn: Binding(
+                    get: { actions?.worktreeShowsGitChanges == true },
+                    set: { _ in actions?.toggleWorktreeGitChanges() }
+                )
+            )
+            .disabled(actions?.canToggleWorktreeGitChanges != true)
             Button("New Agent from Text") { actions?.deriveAgent() }
                 .disabled(actions?.canDeriveAgent != true)
             Divider()

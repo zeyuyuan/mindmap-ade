@@ -151,7 +151,8 @@ private struct BoardCanvasContent: View {
 
     private struct GitChangesRefresh: Equatable {
         let boardID: UUID
-        let targets: [GitChangesTarget]
+        let worktreeGitStates: [UUID: BoardSession.WorktreeGitState]
+        let gitChangesNodeIDs: Set<UUID>
         let runStates: [UUID: AgentRun.State]
         let activationCount: Int
     }
@@ -208,7 +209,8 @@ private struct BoardCanvasContent: View {
         }
         .task(
             id: GitChangesRefresh(
-                boardID: session.id, targets: gitChangesTargets,
+                boardID: session.id, worktreeGitStates: session.worktreeGitStates,
+                gitChangesNodeIDs: session.gitChangesNodeIDs,
                 runStates: workspace.agentRunStates(in: session.id), activationCount: activationCount
             )
         ) {
@@ -270,21 +272,6 @@ private struct BoardCanvasContent: View {
         }
     }
 
-    private var gitChangesTargets: [GitChangesTarget] {
-        _ = session.revision
-        var targets: [GitChangesTarget] = []
-        var seen = Set<GitChangesTarget>()
-        for id in session.gitChangesNodeIDs {
-            if let target = workspace.gitChangesTarget(for: id, in: session.board), seen.insert(target).inserted {
-                targets.append(target)
-            }
-        }
-        return targets.sorted {
-            $0.directory == $1.directory
-                ? ($0.baseCommit ?? "") < ($1.baseCommit ?? "") : $0.directory < $1.directory
-        }
-    }
-
     private var runtimeDetails: [UUID: String] {
         var details = workspace.runtimeDetails(in: session.id)
         for (id, location) in session.gitProjectLocations where details[id] == nil {
@@ -303,22 +290,11 @@ private struct BoardCanvasContent: View {
     }
 
     private func refreshGitChangesSummaries() async {
-        let targets = gitChangesTargets
-        guard !targets.isEmpty else { return }
-        func pollOnce() async {
-            for target in targets {
-                guard !Task.isCancelled else { return }
-                if let snapshot = try? await workspace.git.changesSnapshot(
-                    in: target.directory, baseCommit: target.baseCommit)
-                {
-                    workspace.recordGitChangesSnapshot(snapshot, for: target)
-                }
-            }
-        }
-        await pollOnce()
+        guard !session.worktreeGitStates.isEmpty || !session.gitChangesNodeIDs.isEmpty else { return }
+        await workspace.syncGitChanges(in: session)
         while !Task.isCancelled, workspace.activeRunCount(in: session.id) > 0 {
-            do { try await Task.sleep(for: .seconds(4)) } catch { return }
-            await pollOnce()
+            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            await workspace.syncGitChanges(in: session)
         }
     }
 

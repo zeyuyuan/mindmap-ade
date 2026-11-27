@@ -74,7 +74,8 @@ extension WorkspaceStore {
         let worktree = checkout.location
         var run = AgentRun(
             address: address, worktree: worktree, cli: agent.cli, executable: executable.path,
-            conversationID: previous?.conversationID, worktreeIdentity: checkout.identity)
+            conversationID: previous?.conversationID, worktreeIdentity: checkout.identity,
+            baseCommit: previous?.baseCommit)
         let previousTerminal = terminals[address]
         let terminalOwner = owner ?? previousTerminal?.owner
         if let previousTerminal, previousTerminal.isShell {
@@ -303,7 +304,9 @@ extension WorkspaceStore {
             "Mindmap ADE MCP tools can read and edit this board. Start with get_selection for selected topics, "
                 + "search_nodes for a phrase, or get_context for this Agent's location. Use get_node for a topic's text "
                 + "and list_nodes for its direct children. Pass nextCursor as cursor to continue a page. "
-                + "Read only the topics needed for the task.")
+                + "Read only the topics needed for the task. If you modify files in another Git repository or worktree "
+                + "outside the working directory, call register_git_changes with that directory path so its changes "
+                + "appear on the map.")
         return parts.joined(separator: "\n") + "\n\nTask:\n"
     }
 }

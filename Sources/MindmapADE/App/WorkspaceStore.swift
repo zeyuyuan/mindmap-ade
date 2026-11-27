@@ -12,6 +12,7 @@ enum AgentMapChange: String {
     case moved = "Agent Moved Topic"
     case removed = "Agent Removed Topic"
     case registeredWorktree = "Agent Registered Worktree"
+    case registeredGitChanges = "Agent Registered Git Changes"
 
     var status: String {
         switch self {
@@ -20,6 +21,7 @@ enum AgentMapChange: String {
         case .moved: "Agent moved a topic"
         case .removed: "Agent removed a topic"
         case .registeredWorktree: "Agent updated a worktree topic"
+        case .registeredGitChanges: "Agent registered Git changes"
         }
     }
 }
@@ -63,6 +65,11 @@ final class BoardSession: Identifiable {
         }
     }
 
+    struct WorktreeGitState: Equatable {
+        let showsGitChanges: Bool
+        let trackedExternalDirectories: [String]
+    }
+
     let id: UUID
     private(set) var name: String
     private(set) var revision = 0
@@ -70,6 +77,7 @@ final class BoardSession: Identifiable {
     private(set) var nodeCount: Int
     private(set) var gitProjectLocations: [UUID: ProjectLocation] = [:]
     private(set) var gitChangesNodeIDs: Set<UUID> = []
+    private(set) var worktreeGitStates: [UUID: WorktreeGitState] = [:]
     private(set) var agentEditNotice: AgentEditNotice?
     private(set) var agentEditedTopics: [UUID: ContinuousClock.Instant] = [:]
     @ObservationIgnored private(set) var board: MindMapBoard
@@ -108,6 +116,9 @@ final class BoardSession: Identifiable {
             }
             if node.content.kind == .gitChanges {
                 gitChangesNodeIDs.insert(node.id)
+            }
+            if let state = Self.worktreeGitState(node) {
+                worktreeGitStates[node.id] = state
             }
         }
     }
@@ -197,6 +208,10 @@ final class BoardSession: Identifiable {
             } else {
                 gitChangesNodeIDs.remove(replacement.id)
             }
+            let state = Self.worktreeGitState(replacement.node)
+            if worktreeGitStates[replacement.id] != state {
+                worktreeGitStates[replacement.id] = state
+            }
             if replacement.node == nil { clearAgentHighlight(for: replacement.id) }
         }
         name = board.name
@@ -231,6 +246,13 @@ final class BoardSession: Identifiable {
             location.gitCommonDirectory != nil
         else { return nil }
         return location
+    }
+
+    private static func worktreeGitState(_ node: MapNode?) -> WorktreeGitState? {
+        guard case .worktree(let worktree) = node?.content, worktree.location != nil else { return nil }
+        return WorktreeGitState(
+            showsGitChanges: worktree.showsGitChanges,
+            trackedExternalDirectories: worktree.trackedExternalGitChanges.compactMap(\.directory))
     }
 }
 
@@ -323,7 +345,7 @@ final class WorkspaceStore {
     var agentRuns: [NodeAddress: AgentRun] = [:]
     var recoveryIssues: [NodeAddress: AgentRecoveryIssue] = [:]
     var terminals: [NodeAddress: AgentTerminal] = [:]
-    var gitChangesDetails: [GitChangesTarget: String] = [:]
+    var gitChangesSummaries: [GitChangesTarget: GitChangesCardSummary] = [:]
     var connectedMapRuns: Set<UUID> = []
     var operations: Set<NodeAddress> = []
     @ObservationIgnored var isQuitting = false
@@ -493,13 +515,34 @@ final class WorkspaceStore {
     }
 
     func recordGitChangesSnapshot(_ snapshot: GitChangesSnapshot, for target: GitChangesTarget) {
-        if gitChangesDetails[target] != snapshot.cardDetail {
-            gitChangesDetails[target] = snapshot.cardDetail
+        let summary = GitChangesCardSummary(branchLabel: snapshot.branchLabel, cardDetail: snapshot.cardDetail)
+        if gitChangesSummaries[target] != summary {
+            gitChangesSummaries[target] = summary
         }
+    }
+
+    func defaultGitChangesBaseCommit(for worktreeID: UUID, in session: BoardSession) -> String? {
+        guard case .worktree(let tree) = session.board.nodes[worktreeID]?.content else { return nil }
+        if let creationCommit = tree.creationCommit, !creationCommit.isEmpty {
+            return creationCommit
+        }
+        let matchingRuns = agentRuns.values.filter { run in
+            guard run.address.boardID == session.id, let base = run.baseCommit, !base.isEmpty else { return false }
+            return session.board.context(above: run.address.nodeID).worktreeID == worktreeID
+        }
+        let active = matchingRuns.filter { $0.state.isActive }
+        if let earliestActive = active.min(by: { $0.startedAt < $1.startedAt }) {
+            return earliestActive.baseCommit
+        }
+        return matchingRuns.max(by: { $0.startedAt < $1.startedAt })?.baseCommit
     }
 
     func gitChangesTarget(for nodeID: UUID, in board: MindMapBoard) -> GitChangesTarget? {
         guard case .gitChanges(let topic) = board.nodes[nodeID]?.content else { return nil }
+        if let directory = topic.directory, !directory.isEmpty {
+            let base = topic.baseCommit.flatMap { $0.isEmpty ? nil : $0 }
+            return GitChangesTarget(directory: directory, baseCommit: base)
+        }
         let scope = board.context(above: nodeID)
         guard scope.problem == nil, let worktree = scope.worktree else { return nil }
         let base =
@@ -509,6 +552,82 @@ final class WorkspaceStore {
                 return tree.creationCommit
             }
         return GitChangesTarget(directory: worktree.directory, baseCommit: base)
+    }
+
+    func trackedGitChangesDirectories(under worktreeID: UUID, in board: MindMapBoard) -> Set<String> {
+        guard let node = board.nodes[worktreeID], case .worktree(let tree) = node.content else { return [] }
+        let ownDirectory = tree.location?.directory
+        var directories = Set<String>()
+        for childID in node.children {
+            guard case .gitChanges(let topic) = board.nodes[childID]?.content else { continue }
+            if let directory = topic.directory ?? ownDirectory, !directory.isEmpty {
+                directories.insert(directory)
+            }
+        }
+        return directories
+    }
+
+    func hasDefaultGitChanges(under worktreeID: UUID, in board: MindMapBoard) -> Bool {
+        guard let node = board.nodes[worktreeID], case .worktree(let tree) = node.content else { return false }
+        let ownDirectory = tree.location?.directory
+        return node.children.contains { childID in
+            guard case .gitChanges(let topic) = board.nodes[childID]?.content else { return false }
+            return topic.directory == nil || (ownDirectory != nil && topic.directory == ownDirectory)
+        }
+    }
+
+    func hasAnyGitChanges(under worktreeID: UUID, in board: MindMapBoard) -> Bool {
+        guard let node = board.nodes[worktreeID], node.content.kind == .worktree else { return false }
+        return node.children.contains { board.nodes[$0]?.content.kind == .gitChanges }
+    }
+
+    func hasGitChanges(for directory: String, under worktreeID: UUID, in board: MindMapBoard) -> Bool {
+        guard let node = board.nodes[worktreeID], case .worktree(let tree) = node.content else { return false }
+        let ownDirectory = tree.location?.directory
+        return node.children.contains { childID in
+            guard case .gitChanges(let topic) = board.nodes[childID]?.content else { return false }
+            return (topic.directory ?? ownDirectory) == directory
+        }
+    }
+
+    func gitChangesInsertIndex(under worktreeID: UUID, isOwnWorktree: Bool, in board: MindMapBoard) -> Int {
+        if isOwnWorktree { return 0 }
+        return board.nodes[worktreeID]?.children.prefix(while: { board.nodes[$0]?.content.kind == .gitChanges }).count
+            ?? 0
+    }
+
+    /// Other configured Git projects and worktrees on this board not already tracked under the Worktree.
+    func untrackedKnownGitDirectories(
+        for worktreeID: UUID, in board: MindMapBoard
+    ) -> [(label: String, directory: String)] {
+        var seen = trackedGitChangesDirectories(under: worktreeID, in: board)
+        if case .worktree(let tree) = board.nodes[worktreeID]?.content, let own = tree.location?.directory {
+            seen.insert(own)
+        }
+        var result: [(label: String, directory: String)] = []
+        for node in board.nodes.values {
+            let entry: (String, String)?
+            switch node.content {
+            case .project(let project):
+                if let location = project.location, location.gitCommonDirectory != nil {
+                    entry = (node.title, location.directory)
+                } else {
+                    entry = nil
+                }
+            case .worktree(let worktree):
+                if let location = worktree.location {
+                    entry = ("\(location.name) (\(location.revisionLabel))", location.directory)
+                } else {
+                    entry = nil
+                }
+            case .text, .branch, .agent, .gitChanges:
+                entry = nil
+            }
+            if let (label, directory) = entry, seen.insert(directory).inserted {
+                result.append((label: label, directory: directory))
+            }
+        }
+        return result.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
     }
 
     func select(_ id: UUID?) {

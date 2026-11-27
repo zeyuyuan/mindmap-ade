@@ -111,10 +111,50 @@ public struct WorktreeTopic: Codable, Equatable, Sendable {
     public var creationCommit: String?
     // Decoded only for migration of archives that synthesized a project checkout node.
     var isProjectDirectory: Bool?
+    // Omitted when enabled so existing archives default to showing Git Changes.
+    private var hidesGitChanges: Bool?
+    // Persisted external repositories tracked under this Worktree so hiding/showing or clean cycles preserve them.
+    private var externalGitChanges: [GitChangesTopic]?
 
-    public init(location: WorktreeLocation? = nil, creationCommit: String? = nil) {
+    public var showsGitChanges: Bool {
+        get { hidesGitChanges != true }
+        set { hidesGitChanges = newValue ? nil : true }
+    }
+
+    public var trackedExternalGitChanges: [GitChangesTopic] {
+        get { externalGitChanges ?? [] }
+        set { externalGitChanges = newValue.isEmpty ? nil : newValue }
+    }
+
+    public mutating func rememberExternalGitChanges(_ topic: GitChangesTopic) {
+        guard let directory = topic.directory, !directory.isEmpty, directory != location?.directory else { return }
+        var list = trackedExternalGitChanges
+        if let index = list.firstIndex(where: { $0.directory == directory }) {
+            if list[index].baseCommit == nil, topic.baseCommit != nil {
+                list[index] = topic
+                trackedExternalGitChanges = list
+            }
+        } else {
+            list.append(topic)
+            trackedExternalGitChanges = list
+        }
+    }
+
+    public mutating func forgetExternalGitChanges(directory: String) {
+        var list = trackedExternalGitChanges
+        let count = list.count
+        list.removeAll { $0.directory == directory }
+        if list.count != count {
+            trackedExternalGitChanges = list
+        }
+    }
+
+    public init(
+        location: WorktreeLocation? = nil, creationCommit: String? = nil, showsGitChanges: Bool = true
+    ) {
         self.location = location
         self.creationCommit = creationCommit
+        self.showsGitChanges = showsGitChanges
     }
 }
 
@@ -152,9 +192,14 @@ public struct AgentTopic: Codable, Equatable, Sendable {
 }
 
 public struct GitChangesTopic: Codable, Equatable, Sendable {
+    /// Canonical root directory when tracking a repository or worktree outside the enclosing worktree.
+    public var directory: String?
+    public var gitCommonDirectory: String?
     public var baseCommit: String?
 
-    public init(baseCommit: String? = nil) {
+    public init(directory: String? = nil, gitCommonDirectory: String? = nil, baseCommit: String? = nil) {
+        self.directory = directory
+        self.gitCommonDirectory = gitCommonDirectory
         self.baseCommit = baseCommit
     }
 }

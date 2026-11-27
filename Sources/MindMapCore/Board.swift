@@ -51,7 +51,11 @@ public struct MapNode: Identifiable, Codable, Equatable, Sendable {
             if !name.isEmpty { return name }
             let line = value.task.split(whereSeparator: \.isNewline).first?.trimmingCharacters(in: .whitespaces)
             return line.flatMap { $0.isEmpty ? nil : String($0.prefix(100)) } ?? "New conversation"
-        case .gitChanges:
+        case .gitChanges(let value):
+            if let directory = value.directory, !directory.isEmpty {
+                let name = URL(fileURLWithPath: directory).lastPathComponent
+                if !name.isEmpty { return name }
+            }
             return "Git Changes"
         }
     }
@@ -66,8 +70,8 @@ public struct MapNode: Identifiable, Codable, Equatable, Sendable {
                 ?? "Worktree · Draft"
         case .agent(let value):
             value.isConfigured ? "Agent · \(value.cli.title)" : "Agent · Draft"
-        case .gitChanges:
-            "Git"
+        case .gitChanges(let value):
+            value.directory == nil ? "Git" : "Git Changes"
         }
     }
 
@@ -198,7 +202,8 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func inserting(
-        _ node: MapNode, parent: UUID?, after sibling: UUID? = nil, position: CGPoint = .zero
+        _ node: MapNode, parent: UUID?, after sibling: UUID? = nil, at explicitIndex: Int? = nil,
+        position: CGPoint = .zero
     ) -> (edit: BoardEdit, id: UUID)? {
         guard nodes[node.id] == nil, node.children.isEmpty, permitsResource(node.content, under: parent) else {
             return nil
@@ -206,14 +211,20 @@ public struct MindMapBoard: Identifiable, Codable, Equatable, Sendable {
         var changes = [NodeReplacement(id: node.id, node: node)]
         if let parent {
             guard var owner = nodes[parent] else { return nil }
-            let index = sibling.flatMap { owner.children.firstIndex(of: $0).map { $0 + 1 } } ?? owner.children.count
+            let index =
+                explicitIndex.map { min(max(0, $0), owner.children.count) }
+                ?? sibling.flatMap { owner.children.firstIndex(of: $0).map { $0 + 1 } }
+                ?? owner.children.count
             owner.children.insert(node.id, at: index)
             owner.isCollapsed = false
             changes.append(NodeReplacement(id: parent, node: owner))
             return (BoardEdit(nodes: changes), node.id)
         }
         var nextRoots = roots
-        let index = sibling.flatMap { id in nextRoots.firstIndex { $0.id == id }.map { $0 + 1 } } ?? nextRoots.count
+        let index =
+            explicitIndex.map { min(max(0, $0), nextRoots.count) }
+            ?? sibling.flatMap { id in nextRoots.firstIndex { $0.id == id }.map { $0 + 1 } }
+            ?? nextRoots.count
         nextRoots.insert(RootPlacement(id: node.id, position: position), at: index)
         return (BoardEdit(nodes: changes, roots: nextRoots), node.id)
     }

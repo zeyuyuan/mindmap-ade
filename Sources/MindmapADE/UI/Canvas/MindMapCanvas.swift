@@ -512,13 +512,21 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
             && session.board.canInsertResource(.worktree, under: id)
     }
 
-    private var canAddGitChanges: Bool {
+    private var selectedConfiguredWorktree: (id: UUID, topic: WorktreeTopic)? {
         guard !session.isReadOnly, selected.count == 1, let id = selected.first,
-            let node = session.board.nodes[id], case .agent(let agent) = node.content,
-            agent.isConfigured,
-            !node.children.contains(where: { session.board.nodes[$0]?.content.kind == .gitChanges })
-        else { return false }
-        return session.board.canInsertResource(.gitChanges, under: id)
+            case .worktree(let topic) = session.board.nodes[id]?.content,
+            topic.location != nil
+        else { return nil }
+        return (id, topic)
+    }
+
+    private var canToggleWorktreeGitChanges: Bool { selectedConfiguredWorktree != nil }
+
+    private var worktreeShowsGitChanges: Bool { selectedConfiguredWorktree?.topic.showsGitChanges == true }
+
+    private var canAddExternalGitChanges: Bool {
+        guard let selected = selectedConfiguredWorktree, selected.topic.showsGitChanges else { return false }
+        return session.board.canInsertResource(.gitChanges, under: selected.id)
     }
 
     private func updateActions() {
@@ -532,7 +540,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         actions.canAddProject = canAddProject
         actions.canAddWorktree = canAddWorktree
         actions.canLinkWorktree = canLinkWorktree
-        actions.canAddGitChanges = canAddGitChanges
+        actions.canToggleWorktreeGitChanges = canToggleWorktreeGitChanges
+        actions.worktreeShowsGitChanges = worktreeShowsGitChanges
+        actions.canAddExternalGitChanges = canAddExternalGitChanges
         let undoManager = editingTextView?.undoManager
         actions.undoTitle = undoManager?.undoMenuItemTitle ?? session.undoTitle
         actions.redoTitle = undoManager?.redoMenuItemTitle ?? session.redoTitle
@@ -645,9 +655,42 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         guard !session.isReadOnly, !selected.isEmpty else { return }
         let first = mapLayout.orderedIDs.first(where: selected.contains)
         let parent = first.flatMap { session.board.parents[$0] }
-        if session.apply(session.board.deleting(selected), named: "Delete Topics") {
-            let next = parent.flatMap { session.board.nodes[$0]?.id } ?? session.board.roots[0].id
-            selected = [next]
+        if var edit = session.board.deleting(selected) {
+            let deletedIDs = Set(edit.nodes.compactMap { $0.node == nil ? $0.id : nil })
+            var worktreesToHide = Set<UUID>()
+            var externalDirsToForget: [UUID: Set<String>] = [:]
+            for id in deletedIDs {
+                guard case .gitChanges(let topic) = session.board.nodes[id]?.content,
+                    let parentID = session.board.parents[id],
+                    !deletedIDs.contains(parentID),
+                    case .worktree(let tree) = session.board.nodes[parentID]?.content,
+                    let ownDirectory = tree.location?.directory
+                else { continue }
+                if let externalDir = topic.directory, !externalDir.isEmpty, externalDir != ownDirectory {
+                    externalDirsToForget[parentID, default: []].insert(externalDir)
+                } else if tree.showsGitChanges {
+                    worktreesToHide.insert(parentID)
+                }
+            }
+            if !worktreesToHide.isEmpty || !externalDirsToForget.isEmpty {
+                edit.nodes = edit.nodes.map { replacement in
+                    let hides = worktreesToHide.contains(replacement.id)
+                    let forgotten = externalDirsToForget[replacement.id]
+                    guard hides || forgotten != nil, var updated = replacement.node,
+                        case .worktree(var updatedTree) = updated.content
+                    else { return replacement }
+                    if hides { updatedTree.showsGitChanges = false }
+                    if let forgotten {
+                        for dir in forgotten { updatedTree.forgetExternalGitChanges(directory: dir) }
+                    }
+                    updated.content = .worktree(updatedTree)
+                    return NodeReplacement(id: replacement.id, node: updated)
+                }
+            }
+            if session.apply(edit, named: "Delete Topics") {
+                let next = parent.flatMap { session.board.nodes[$0]?.id } ?? session.board.roots[0].id
+                selected = [next]
+            }
         }
         changed()
     }
@@ -780,9 +823,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
 
     func insertResource(_ kind: NodeKind, at point: CGPoint? = nil, source: UUID? = nil, linkWorktree: Bool = false) {
-        guard !session.isReadOnly, kind != .text, kind != .project || canAddProject,
-            kind != .worktree || (linkWorktree ? canLinkWorktree : canAddWorktree),
-            kind != .gitChanges || canAddGitChanges
+        guard !session.isReadOnly, kind != .text, kind != .gitChanges, kind != .project || canAddProject,
+            kind != .worktree || (linkWorktree ? canLinkWorktree : canAddWorktree)
         else { return }
         finishEditing()
         closeNodeForm()
@@ -804,9 +846,6 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 parent = worktreeParent
             }
             content = .worktree(worktree)
-        } else if kind == .gitChanges {
-            let commit = parent.flatMap { session.board.context(above: $0).worktree?.commit }
-            content = .gitChanges(GitChangesTopic(baseCommit: commit?.isEmpty == true ? nil : commit))
         } else {
             content = .draft(kind)
         }
@@ -822,10 +861,69 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         }
         selected = [result.id]
         revealAfterLayout = result.id
-        if kind != .gitChanges { configureAfterLayout = result.id }
+        configureAfterLayout = result.id
         changed()
-        if kind == .gitChanges {
+    }
+
+    func toggleWorktreeGitChanges(_ explicitWorktreeID: UUID? = nil) {
+        guard let workspace, !session.isReadOnly else { return }
+        let worktreeID = explicitWorktreeID ?? selectedConfiguredWorktree?.id
+        guard let worktreeID, case .worktree(let topic) = session.board.nodes[worktreeID]?.content,
+            topic.location != nil
+        else { return }
+        finishEditing()
+        closeNodeForm()
+        let next = !topic.showsGitChanges
+        if workspace.setWorktreeShowsGitChanges(next, for: worktreeID, in: session) {
+            changed()
+            if next {
+                Task { [weak self] in
+                    guard let self, let workspace = self.workspace else { return }
+                    await workspace.syncGitChanges(in: self.session)
+                    if workspace.board(self.session.id) === self.session,
+                        !workspace.hasAnyGitChanges(under: worktreeID, in: self.session.board),
+                        self.actions?.hint == EditorActions.defaultHint
+                    {
+                        self.actions?.hint = "Git Changes enabled · No changes in this worktree yet"
+                    }
+                }
+            }
+        }
+    }
+
+    func chooseExternalGitChanges(under explicitWorktreeID: UUID? = nil) {
+        guard !session.isReadOnly else { return }
+        let worktreeID = explicitWorktreeID ?? selectedConfiguredWorktree?.id
+        guard let worktreeID, let node = session.board.nodes[worktreeID],
+            case .worktree(let tree) = node.content, tree.location != nil
+        else { return }
+        finishEditing()
+        closeNodeForm()
+        let panel = NSOpenPanel()
+        panel.title = "Track Git Repository or Worktree"
+        panel.prompt = "Track"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if let projectDir = session.board.context(above: worktreeID).project?.directory ?? tree.location?.directory {
+            panel.directoryURL = URL(fileURLWithPath: projectDir).deletingLastPathComponent()
+        }
+        panel.begin { [weak self] response in
+            guard response == .OK, let path = panel.url?.path, let self else { return }
+            Task { await self.attachExternalGitChanges(directory: path, under: worktreeID) }
+        }
+    }
+
+    func attachExternalGitChanges(directory path: String, under worktreeID: UUID) async {
+        guard let workspace else { return }
+        do {
+            let result = try await workspace.attachGitChanges(directory: path, under: worktreeID, in: session)
+            selected = [result.id]
+            revealAfterLayout = result.id
+            changed()
             actions?.showGitChanges(at: NodeAddress(boardID: session.id, nodeID: result.id))
+        } catch {
+            actions?.hint = error.localizedDescription
         }
     }
 
@@ -1894,6 +1992,13 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
     }
     @objc private func deriveAgentAction(_ sender: Any?) { deriveAgent() }
     @objc private func linkWorktreeAction(_ sender: Any?) { insertResource(.worktree, linkWorktree: true) }
+    @objc private func toggleWorktreeGitChangesAction(_ sender: Any?) { toggleWorktreeGitChanges() }
+    @objc private func chooseExternalGitChangesAction(_ sender: Any?) { chooseExternalGitChanges() }
+    @objc private func trackKnownGitDirectoryAction(_ item: NSMenuItem) {
+        guard let directory = item.representedObject as? String, let worktreeID = selectedConfiguredWorktree?.id
+        else { return }
+        Task { await attachExternalGitChanges(directory: directory, under: worktreeID) }
+    }
     @objc private func configureResourceAction(_ sender: Any?) {
         if let id = selected.first { configureNode(id) }
     }
@@ -1903,7 +2008,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         switch node.content {
         case .project(let project): path = project.location?.directory
         case .worktree(let tree): path = tree.location?.directory
-        case .agent, .gitChanges: path = session.board.context(above: id).worktree?.directory
+        case .agent: path = session.board.context(above: id).worktree?.directory
+        case .gitChanges(let topic): path = topic.directory ?? session.board.context(above: id).worktree?.directory
         case .text, .branch: path = nil
         }
         if let path { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
@@ -1945,7 +2051,8 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         let menu = NSMenu()
         func add(
             _ title: String, _ action: Selector, symbol: String, key: String = "",
-            modifiers: NSEvent.ModifierFlags = [], resource: NodeKind? = nil
+            modifiers: NSEvent.ModifierFlags = [], resource: NodeKind? = nil,
+            state: NSControl.StateValue = .off
         ) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
             item.keyEquivalentModifierMask = modifiers
@@ -1954,6 +2061,7 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 if #available(macOS 27.0, *) { item.preferredImageVisibility = .visible }
             #endif
             item.representedObject = resource?.rawValue
+            item.state = state
             item.target = self
             menu.addItem(item)
         }
@@ -1972,7 +2080,35 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
         if canAddProject { addResource(.project) }
         if canAddWorktree { addResource(.worktree) }
         if canLinkWorktree { add("Link Existing Worktree…", #selector(linkWorktreeAction(_:)), symbol: "link") }
-        if canAddGitChanges { addResource(.gitChanges) }
+        if canAddExternalGitChanges, let worktreeID = selectedConfiguredWorktree?.id {
+            let candidates = workspace?.untrackedKnownGitDirectories(for: worktreeID, in: session.board) ?? []
+            if candidates.isEmpty {
+                add(
+                    "Track Another Repository…", #selector(chooseExternalGitChangesAction(_:)),
+                    symbol: NodeKind.gitChanges.symbol)
+            } else {
+                let submenu = NSMenu()
+                for candidate in candidates {
+                    let item = NSMenuItem(
+                        title: candidate.label, action: #selector(trackKnownGitDirectoryAction(_:)), keyEquivalent: "")
+                    item.representedObject = candidate.directory
+                    item.target = self
+                    submenu.addItem(item)
+                }
+                submenu.addItem(.separator())
+                let choose = NSMenuItem(
+                    title: "Choose Folder…", action: #selector(chooseExternalGitChangesAction(_:)), keyEquivalent: "")
+                choose.target = self
+                submenu.addItem(choose)
+                let parentItem = NSMenuItem(title: "Track Another Repository", action: nil, keyEquivalent: "")
+                parentItem.image = CanvasStyle.contextMenuImage(named: NodeKind.gitChanges.symbol)
+                #if compiler(>=6.4)
+                    if #available(macOS 27.0, *) { parentItem.preferredImageVisibility = .visible }
+                #endif
+                parentItem.submenu = submenu
+                menu.addItem(parentItem)
+            }
+        }
         if let node, node.content.kind == .text, !node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             add(
                 "New Agent from Text", #selector(deriveAgentAction(_:)), symbol: NodeKind.agent.symbol, key: "\r",
@@ -1994,9 +2130,9 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                 add("Edit Text", #selector(editAction(_:)), symbol: "pencil", key: editKey)
             } else if node.worktreeCreationDraft != nil {
                 add("Edit Worktree Name", #selector(editAction(_:)), symbol: "pencil", key: editKey)
-            } else if kind == .gitChanges {
+            } else if case .gitChanges(let topic) = node.content {
                 add("Open Git Changes", #selector(editAction(_:)), symbol: NodeKind.gitChanges.symbol, key: editKey)
-                if session.board.context(above: node.id).worktree?.directory != nil {
+                if (topic.directory ?? session.board.context(above: node.id).worktree?.directory) != nil {
                     add("Show in Finder", #selector(showLocationAction(_:)), symbol: "arrow.up.right.square")
                 }
             } else {
@@ -2011,6 +2147,11 @@ final class MindMapCanvasView: NSView, NSTextViewDelegate, NSTextFieldDelegate, 
                         #selector(configureResourceAction(_:)),
                         symbol: "gearshape",
                         key: opensTerminal ? "" : editKey)
+                }
+                if case .worktree(let worktree) = node.content, worktree.location != nil, !session.isReadOnly {
+                    add(
+                        "Show Git Changes", #selector(toggleWorktreeGitChangesAction(_:)),
+                        symbol: NodeKind.gitChanges.symbol, state: worktree.showsGitChanges ? .on : .off)
                 }
                 if !node.content.isDraft {
                     add("Show in Finder", #selector(showLocationAction(_:)), symbol: "arrow.up.right.square")

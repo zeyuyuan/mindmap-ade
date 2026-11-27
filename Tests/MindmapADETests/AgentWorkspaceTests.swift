@@ -385,10 +385,7 @@ struct AgentWorkspaceTests {
         let repeated = try await request(connection, token: token, method: "tools/call", params: create)
         #expect(try toolResult(first)["nodeId"] as? String == toolResult(repeated)["nodeId"] as? String)
         #expect(session.agentEditedTopics[childID] == firstDeadline)
-        let agentChildren = try #require(session.board.nodes[agent.id]?.children)
-        #expect(agentChildren.count == 2)
-        #expect(session.board.nodes[agentChildren[0]]?.content.kind == .gitChanges)
-        #expect(agentChildren[1] == childID)
+        #expect(session.board.nodes[agent.id]?.children == [childID])
         func call(_ name: String, _ arguments: [String: Any] = [:]) async throws -> [String: Any] {
             try await request(
                 connection, token: token, method: "tools/call", params: ["name": name, "arguments": arguments])
@@ -602,7 +599,7 @@ struct AgentWorkspaceTests {
             #expect(session.agentEditedTopics[id] != nil)
         }
         #expect(session.board.context(above: agent.id).worktree?.directory == location.directory)
-        #expect(await disk.snapshot().boards[0].nodes.count == 9)
+        #expect(await disk.snapshot().boards[0].nodes.count == 8)
         try await workspace.interruptAllAgents()
         let ended = try await request(connection, token: token, method: "tools/list")
         #expect(ended["error"] != nil)
@@ -1093,6 +1090,258 @@ struct AgentWorkspaceTests {
         let commitDiff = try await git.commitFileDiff(
             commit: commit.hash, file: commitFile, in: fixture.repository.path)
         #expect(commitDiff.lines.contains { $0.kind == .addition && $0.text == "let answer = 42" })
+    }
+
+    @Test func registerGitChangesTracksExternalRepositoriesAndWorktreesWithDeduplication() async throws {
+        let primary = try ScratchRepository()
+        defer { primary.cleanUp() }
+        let secondary = try ScratchRepository()
+        defer { secondary.cleanUp() }
+        let nonGit = primary.home.appendingPathComponent("Plain Folder")
+        try FileManager.default.createDirectory(at: nonGit, withIntermediateDirectories: true)
+        let secondarySubdir = secondary.repository.appendingPathComponent("Packages/API")
+        try FileManager.default.createDirectory(at: secondarySubdir, withIntermediateDirectories: true)
+        let siblingWorktree = primary.home.appendingPathComponent("Sibling Checkout")
+        try primary.git(["worktree", "add", "-b", "sibling-branch", siblingWorktree.path, "HEAD"])
+
+        let git = GitWorkspace()
+        var project = ProjectTopic()
+        let projectLocation = try await git.project(at: primary.repository.path)
+        project.location = projectLocation
+        let worktreeLocation = try await git.existing(primary.repository.path, in: projectLocation)
+        var secondaryProject = ProjectTopic()
+        secondaryProject.location = try await git.project(at: secondary.repository.path)
+
+        let root = MapNode(content: .project(project))
+        let otherRoot = MapNode(content: .project(secondaryProject))
+        let tree = MapNode(content: .worktree(WorktreeTopic(location: worktreeLocation)))
+        var agentTopic = AgentTopic(task: "Cross-repo task", cli: .codex)
+        agentTopic.isConfigured = true
+        let agent = MapNode(content: .agent(agentTopic))
+        let defaultChanges = MapNode(content: .gitChanges(GitChangesTopic(baseCommit: worktreeLocation.commit)))
+
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(otherRoot, parent: nil, position: CGPoint(x: 0, y: 200))).edit)
+        board.apply(try #require(board.inserting(tree, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(defaultChanges, parent: tree.id, at: 0)).edit)
+        board.apply(try #require(board.inserting(agent, parent: tree.id)).edit)
+
+        let workspace = WorkspaceStore(disk: LaunchTestDisk(directory: primary.data, board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        var run = AgentRun(
+            address: NodeAddress(boardID: board.id, nodeID: agent.id), worktree: worktreeLocation, cli: .codex,
+            executable: "/usr/bin/true")
+        run.state = .running
+        let token = UUID().uuidString
+        workspace.agentRuns[run.address] = run
+        workspace.mcpGrants[token] = MCPGrant(run: run)
+
+        func call(_ arguments: [String: Any]) async throws -> [String: Any] {
+            try await workspaceMapCall(workspace, token: token, name: "register_git_changes", arguments: arguments)
+        }
+
+        // Known board repos not yet tracked under this Worktree should include the secondary project.
+        let candidatesBefore = workspace.untrackedKnownGitDirectories(for: tree.id, in: session.board)
+        #expect(candidatesBefore.map(\.directory) == [secondaryProject.location?.directory])
+
+        // Non-Git directory is rejected cleanly.
+        let denied = try await call(["directory": nonGit.path, "operationId": "bad-dir"])
+        #expect((denied["result"] as? [String: Any])?["isError"] as? Bool == true)
+
+        // Clean primary & secondary repos do not create empty Git Changes cards.
+        let cleanSecondary = try toolResult(
+            await call(["directory": secondarySubdir.path, "operationId": "clean-ext"]))
+        #expect(cleanSecondary["hasChanges"] as? Bool == false)
+        #expect(cleanSecondary["nodeId"] == nil)
+        #expect(session.board.nodes[tree.id]?.children == [defaultChanges.id, agent.id])
+
+        // Introduce actual changes in primary, secondary, and sibling worktree.
+        try "primary edit\n".write(
+            to: primary.repository.appendingPathComponent("primary.txt"), atomically: true, encoding: .utf8)
+        try "secondary edit\n".write(
+            to: secondarySubdir.appendingPathComponent("api.swift"), atomically: true, encoding: .utf8)
+        try "sibling edit\n".write(
+            to: siblingWorktree.appendingPathComponent("sibling.txt"), atomically: true, encoding: .utf8)
+
+        // Calling register_git_changes with the Agent's own worktree reuses the Worktree's default card.
+        let same = try toolResult(await call(["directory": worktreeLocation.directory, "operationId": "same-dir"]))
+        #expect(same["alreadyTracked"] as? Bool == true)
+        #expect(same["hasChanges"] as? Bool == true)
+        #expect(same["nodeId"] as? String == defaultChanges.id.uuidString)
+
+        // Passing a subdirectory inside another Git repo normalizes to the repo root, attaches under the Worktree
+        // right before its Agents, and highlights the new node.
+        let external = try toolResult(await call(["directory": secondarySubdir.path, "operationId": "ext-1"]))
+        #expect(external["alreadyTracked"] as? Bool == false)
+        #expect(external["hasChanges"] as? Bool == true)
+        let externalID = try #require((external["nodeId"] as? String).flatMap(UUID.init(uuidString:)))
+        let canonicalSecondary = try #require(secondaryProject.location?.directory)
+        #expect(external["directory"] as? String == canonicalSecondary)
+        #expect(session.board.parents[externalID] == tree.id)
+        #expect(session.board.nodes[tree.id]?.children == [defaultChanges.id, externalID, agent.id])
+        #expect(session.agentEditedTopics[externalID] != nil)
+        #expect(session.agentEditNotice?.change == .registeredGitChanges)
+        #expect(session.board.nodes[externalID]?.title == secondary.repository.lastPathComponent)
+        #expect(workspace.gitChangesTarget(for: externalID, in: session.board)?.directory == canonicalSecondary)
+
+        // Calling again with a new operationId deduplicates and returns the same node.
+        let duplicate = try toolResult(await call(["directory": canonicalSecondary, "operationId": "ext-dup"]))
+        #expect(duplicate["alreadyTracked"] as? Bool == true)
+        #expect(duplicate["nodeId"] as? String == externalID.uuidString)
+
+        // Manual attach supports a dirty sibling worktree under the Worktree and deduplicates on repeat.
+        let manual = try await workspace.attachGitChanges(directory: siblingWorktree.path, under: tree.id, in: session)
+        #expect(manual.created)
+        #expect(session.board.parents[manual.id] == tree.id)
+        #expect(session.board.nodes[tree.id]?.children == [defaultChanges.id, externalID, manual.id, agent.id])
+        #expect(session.board.nodes[manual.id]?.title == "Sibling Checkout")
+        let manualRepeat = try await workspace.attachGitChanges(
+            directory: siblingWorktree.path, under: tree.id, in: session)
+        #expect(!manualRepeat.created)
+        #expect(manualRepeat.id == manual.id)
+
+        // External cards include branch name in their runtime subtitle.
+        let siblingTarget = try #require(workspace.gitChangesTarget(for: manual.id, in: session.board))
+        let siblingSnapshot = try await git.changesSnapshot(in: siblingTarget.directory, baseCommit: nil)
+        workspace.recordGitChangesSnapshot(siblingSnapshot, for: siblingTarget)
+        #expect(workspace.runtimeDetails(in: session.id)[manual.id] == "sibling-branch · 1 file · +1")
+
+        // Untracked candidates no longer include the now-tracked secondary repo.
+        #expect(workspace.untrackedKnownGitDirectories(for: tree.id, in: session.board).isEmpty)
+
+        // Turning off Show Git Changes on the Worktree hides childless cards while preserving tracked external repos;
+        // MCP registration while hidden also remembers new external repos; turning Show Git Changes back on restores
+        // own + AI-registered + manually tracked dirty cards in order.
+        let third = try ScratchRepository()
+        defer { third.cleanUp() }
+        try "third edit\n".write(
+            to: third.repository.appendingPathComponent("third.txt"), atomically: true, encoding: .utf8)
+        let canonicalThird = try await git.project(at: third.repository.path).directory
+        let canonicalSibling = try await git.project(at: siblingWorktree.path).directory
+
+        #expect(workspace.setWorktreeShowsGitChanges(false, for: tree.id, in: session))
+        #expect(session.board.nodes[tree.id]?.children == [agent.id])
+        let hiddenExisting = try toolResult(
+            await call(["directory": secondarySubdir.path, "operationId": "ext-hidden"]))
+        #expect(hiddenExisting["hidden"] as? Bool == true)
+        #expect(hiddenExisting["nodeId"] == nil)
+        let hiddenNew = try toolResult(await call(["directory": third.repository.path, "operationId": "ext-hidden-3"]))
+        #expect(hiddenNew["hidden"] as? Bool == true)
+        #expect(hiddenNew["nodeId"] == nil)
+        #expect(session.board.nodes[tree.id]?.children == [agent.id])
+
+        // Re-enabling Show Git Changes restores own worktree + all dirty tracked external repositories!
+        #expect(workspace.setWorktreeShowsGitChanges(true, for: tree.id, in: session))
+        await workspace.syncGitChanges(in: session)
+        let restoredChildren = try #require(session.board.nodes[tree.id]?.children)
+        #expect(restoredChildren.count == 5)
+        #expect(restoredChildren.last == agent.id)
+        let restoredDirs = restoredChildren.dropLast().compactMap {
+            workspace.gitChangesTarget(for: $0, in: session.board)?.directory
+        }
+        #expect(
+            restoredDirs == [
+                worktreeLocation.directory, canonicalSecondary, canonicalSibling, canonicalThird,
+            ])
+
+        // Removing edits in an external repo hides its leaf card automatically, and editing it again restores it
+        // without requiring a new register_git_changes call.
+        try FileManager.default.removeItem(at: third.repository.appendingPathComponent("third.txt"))
+        await workspace.syncGitChanges(in: session)
+        #expect(!workspace.hasGitChanges(for: canonicalThird, under: tree.id, in: session.board))
+        try "third edit again\n".write(
+            to: third.repository.appendingPathComponent("third.txt"), atomically: true, encoding: .utf8)
+        await workspace.syncGitChanges(in: session)
+        #expect(workspace.hasGitChanges(for: canonicalThird, under: tree.id, in: session.board))
+    }
+
+    @Test func gitChangesNodeAppearsOnlyWhenChangesExistAndHidesWhenClean() async throws {
+        let fixture = try ScratchRepository()
+        defer { fixture.cleanUp() }
+        let author = [
+            "-c", "user.name=Mindmap Tests", "-c", "user.email=qa@example.invalid", "-c", "commit.gpgsign=false",
+        ]
+        let git = GitWorkspace()
+        var project = ProjectTopic()
+        let projectLocation = try await git.project(at: fixture.repository.path)
+        project.location = projectLocation
+        let worktreeLocation = try await git.existing(fixture.repository.path, in: projectLocation)
+        let baseCommit = worktreeLocation.commit
+
+        let root = MapNode(content: .project(project))
+        let tree = MapNode(
+            content: .worktree(WorktreeTopic(location: worktreeLocation, creationCommit: baseCommit)))
+        var agentTopic = AgentTopic(task: "Watch changes")
+        agentTopic.isConfigured = true
+        let agentA = MapNode(content: .agent(agentTopic))
+        let agentB = MapNode(content: .agent(agentTopic))
+        var board = MindMapBoard(root: root)
+        board.apply(try #require(board.inserting(tree, parent: root.id)).edit)
+        board.apply(try #require(board.inserting(agentA, parent: tree.id)).edit)
+        board.apply(try #require(board.inserting(agentB, parent: tree.id)).edit)
+
+        let workspace = WorkspaceStore(disk: LaunchTestDisk(directory: fixture.data, board: board))
+        await workspace.loadIfNeeded()
+        let session = try #require(workspace.boards.first)
+        for id in [agentA.id, agentB.id] {
+            let address = NodeAddress(boardID: board.id, nodeID: id)
+            workspace.agentRuns[address] = AgentRun(
+                address: address, worktree: worktreeLocation, cli: .commandCode, executable: "/usr/bin/true")
+        }
+
+        // 1. Clean worktree: no Git Changes node is created under the Worktree or either Agent.
+        await workspace.syncGitChanges(in: session)
+        #expect(session.board.nodes[tree.id]?.children == [agentA.id, agentB.id])
+        #expect(session.board.nodes[agentA.id]?.children.isEmpty == true)
+        #expect(session.board.nodes[agentB.id]?.children.isEmpty == true)
+
+        // 2. Uncommitted edit appears: exactly ONE Git Changes node appears at index 0 under the Worktree,
+        // shared by both Agents without duplication.
+        let file = fixture.repository.appendingPathComponent("draft.txt")
+        try "hello\n".write(to: file, atomically: true, encoding: .utf8)
+        await workspace.syncGitChanges(in: session)
+        let appearedID = try #require(session.board.nodes[tree.id]?.children.first)
+        #expect(session.board.nodes[tree.id]?.children == [appearedID, agentA.id, agentB.id])
+        #expect(session.board.nodes[appearedID]?.content.kind == .gitChanges)
+        #expect(workspace.runtimeDetails(in: session.id)[appearedID] == "1 file · +1")
+
+        // 3. Removing the edit makes the repo clean: childless Git Changes node hides automatically.
+        try FileManager.default.removeItem(at: file)
+        await workspace.syncGitChanges(in: session)
+        #expect(session.board.nodes[appearedID] == nil)
+        #expect(session.board.nodes[tree.id]?.children == [agentA.id, agentB.id])
+
+        // 4. A commit ahead of baseCommit still counts as changes even with a clean working tree.
+        try "committed\n".write(to: file, atomically: true, encoding: .utf8)
+        try fixture.git(["add", "draft.txt"])
+        try fixture.git(author + ["commit", "-m", "Add draft"])
+        await workspace.syncGitChanges(in: session)
+        let committedID = try #require(session.board.nodes[tree.id]?.children.first)
+        #expect(session.board.nodes[committedID]?.content.kind == .gitChanges)
+        #expect(workspace.runtimeDetails(in: session.id)[committedID] == "Clean · 1 commit")
+
+        // 5. A Git Changes node with user child notes is preserved even if the repo returns to clean or toggle is off.
+        let note = try #require(session.board.inserting(text: "Keep review note", parent: committedID))
+        #expect(session.apply(note.edit, named: "Add Child"))
+        try fixture.git(["reset", "--hard", baseCommit])
+        await workspace.syncGitChanges(in: session)
+        #expect(session.board.nodes[committedID] != nil)
+        #expect(session.board.nodes[note.id] != nil)
+
+        // 6. Toggling Show Git Changes OFF removes childless Git Changes and prevents background sync from showing it;
+        // toggling back ON brings the single Worktree card back immediately on sync.
+        #expect(session.apply(session.board.deleting([committedID]), named: "Delete"))
+        try "dirty again\n".write(to: file, atomically: true, encoding: .utf8)
+        #expect(workspace.setWorktreeShowsGitChanges(false, for: tree.id, in: session))
+        await workspace.syncGitChanges(in: session)
+        #expect(session.board.nodes[tree.id]?.children == [agentA.id, agentB.id])
+
+        #expect(workspace.setWorktreeShowsGitChanges(true, for: tree.id, in: session))
+        await workspace.syncGitChanges(in: session)
+        let restoredID = try #require(session.board.nodes[tree.id]?.children.first)
+        #expect(session.board.nodes[restoredID]?.content.kind == .gitChanges)
+        #expect(session.board.nodes[tree.id]?.children == [restoredID, agentA.id, agentB.id])
     }
 
     @Test func terminalOutputRemainsPendingUntilWritten() async throws {
